@@ -87,10 +87,12 @@ Artifact fields (typical):
 ## Operational notes
 
 - Prefer `start/wait` for long-running reasoning models.
+- Model choice: use `google/antigravity-gemini-3-flash` for quick probes/status checks; use `google/antigravity-claude-opus-4-5-thinking` for complex analysis and code changes.
 - For “is it stuck?” checks, use `status`/`wait` output `progress.idleForSeconds` plus the artifact files (`events.ndjson`, `assistant.txt`, `stderr.log`, `wrapper.log`) to see if anything is still advancing.
 - Result extraction prefers the strict sentinel-wrapped JSON block (`BEGIN_OC_SUBTASK_JSON` / `END_OC_SUBTASK_JSON`) and falls back to fenced/heuristic JSON extraction if needed.
 - Note: On OpenCode `1.1.25`, `opencode run --attach ... --agent <name>` can crash with “No context found for instance”. The wrapper therefore skips server attach when `--agent` is set (unless you pass an explicit `--attach` URL), and you can always force standalone mode with `--no-attach-server`.
 - If an auto-attached server run returns `BLOCKED` due to ruleset validation errors (e.g. invalid `action` values), the wrapper retries once in standalone mode and preserves the first attempt artifacts as `*.attempt1` plus `attempt1.json`.
+- Prompt hygiene (prevents “wandering” + reduces debug time): avoid unverified claims like “flag X exists” or “path Y exists”. Prefer a short capsule: **Facts** (verified), **Hypotheses** (need checking), **Constraints** (what must not change), **Acceptance** (how to validate; prefer small filtered tests before full gates).
 - Typical states:
   - **Finished**: `finish.json` exists and `status` returns `type=opencode-subtask-finish` with `ok/exitCode/timedOut`.
   - **Running**: `wait --timeout <small>` returns `type=opencode-subtask-status` with `status=running` and a live `progress` snapshot.

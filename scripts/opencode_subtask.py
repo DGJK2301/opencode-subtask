@@ -1186,6 +1186,14 @@ def _default_contract_prompt() -> str:
     # Keep it short and mechanical.
     return (
         "\n\n"
+        "EXECUTION RULES (avoid wasted time):\n"
+        "- Treat any prompt 'facts' as hypotheses; verify key ones quickly.\n"
+        "- Do not invent flags/paths/files; only reference paths you can `read`/`glob`.\n"
+        "- Do not assume labels/IDs map to filesystem paths unless verified.\n"
+        "- Prefer `rg`/`glob`/`read` over long shell pipelines.\n"
+        "- Keep diffs minimal; do not create extra files unless asked.\n"
+        "- If blocked by environment or contradictions, output JSON with summary starting \"BLOCKED:\".\n"
+        "\n"
         "SUBTASK OUTPUT CONTRACT (strict):\n"
         "Return your FINAL answer wrapped by these exact sentinel lines:\n"
         "BEGIN_OC_SUBTASK_JSON\n"
@@ -1661,24 +1669,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         summary_source = full_text
 
-    blocked_reason: str | None = None
     summary_source_stripped = summary_source.strip()
-    if summary_source_stripped.upper().startswith("BLOCKED"):
-        blocked_reason = summary_source_stripped
+    blocked_reason_attempt = summary_source_stripped if summary_source_stripped.upper().startswith("BLOCKED") else None
 
     # If we auto-attached to a shared server and hit a ruleset-config BLOCKED state, retry once
     # in standalone mode. This avoids disturbing other in-flight tasks using that server.
     if (
-        blocked_reason is not None
+        blocked_reason_attempt is not None
         and auto_attach_used
-        and _blocked_reason_looks_like_ruleset_config_error(blocked_reason)
+        and _blocked_reason_looks_like_ruleset_config_error(blocked_reason_attempt)
         and not timed_out
         and output_too_large_error is None
     ):
         # Preserve attempt-1 artifacts for diagnosis.
         attempt1_record: dict[str, Any] = {
             "mode": "attach",
-            "blockedReason": blocked_reason,
+            "blockedReason": blocked_reason_attempt,
             "exitCode": exit_code,
             "timedOut": timed_out,
             "server": server_state,
@@ -1767,12 +1773,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         else:
             summary_source = full_text
         summary_source_stripped = summary_source.strip()
-        blocked_reason = summary_source_stripped if summary_source_stripped.upper().startswith("BLOCKED") else None
-
-    summary, truncated = _truncate(summary_source.strip(), int(args.max_text_chars))
+        blocked_reason_attempt = summary_source_stripped if summary_source_stripped.upper().startswith("BLOCKED") else None
 
     # Capture patch (best-effort).
     patch_path, changed_files, untracked_files = _git_patch(workdir, artifacts_dir)
+
+    # Prefer stable summaries for failure modes (avoid partial/hallucinated analysis on timeout).
+    summary_source_final = summary_source.strip()
+    if timed_out:
+        summary_source_final = (
+            f"TIMEOUT: opencode run exceeded timeout={args.timeout}s. "
+            "Partial output (if any) is in artifacts/assistant.txt; "
+            "diff (if any) is in artifacts/changes.patch. "
+            f"changedFiles={len(changed_files)} untrackedFiles={len(untracked_files)}."
+        )
+    elif output_too_large_error is not None:
+        summary_source_final = (
+            f"OUTPUT_TOO_LARGE: artifact output exceeded max_artifact_bytes={args.max_artifact_bytes}. "
+            "Partial output (if any) is in artifacts; "
+            f"changedFiles={len(changed_files)} untrackedFiles={len(untracked_files)}."
+        )
+
+    blocked_reason: str | None = None
+    summary_source_final_stripped = summary_source_final.strip()
+    if summary_source_final_stripped.upper().startswith("BLOCKED"):
+        blocked_reason = summary_source_final_stripped
+
+    summary, truncated = _truncate(summary_source_final_stripped, int(args.max_text_chars))
 
     # Persist structured result to result.json (adapter writes the file; model only prints JSON).
     result_path: Path | None = artifacts_dir / "result.json"
