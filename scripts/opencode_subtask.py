@@ -77,7 +77,19 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             f.flush()
             with contextlib.suppress(Exception):
                 os.fsync(f.fileno())
-        os.replace(tmp, path)
+        if os.name == "nt":
+            # On Windows, rename/replace can transiently fail due to AV scanners or
+            # other readers briefly opening the target. Retry with a short backoff.
+            for i in range(8):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    time.sleep(0.02 * (i + 1))
+            else:
+                os.replace(tmp, path)
+        else:
+            os.replace(tmp, path)
     finally:
         with contextlib.suppress(Exception):
             if tmp.exists():
@@ -170,6 +182,34 @@ def _pid_running(pid: int) -> bool:
         return False
 
 
+def _pid_looks_like_opencode(pid: int) -> bool:
+    """Best-effort guard against PID reuse when killing stale server processes."""
+    if pid <= 0 or not _pid_running(pid):
+        return False
+    try:
+        if os.name == "nt":
+            cmd = (
+                f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\"; "
+                "if ($null -eq $p) { exit 1 }; "
+                "$s = ($p.Name + \" \" + $p.CommandLine); "
+                "Write-Output $s"
+            )
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="replace")
+            return "opencode" in out.lower()
+
+        # POSIX best-effort: /proc is common but not universal.
+        proc_cmdline = Path(f"/proc/{pid}/cmdline")
+        if proc_cmdline.exists():
+            data = proc_cmdline.read_bytes().decode("utf-8", errors="replace").replace("\x00", " ")
+            return "opencode" in data.lower()
+    except Exception:
+        return False
+    return False
+
+
 def _kill_tree(pid: int) -> None:
     if pid <= 0:
         return
@@ -205,6 +245,9 @@ def _merge_env(base: dict[str, str], set_vars: list[str], set_from_files: list[s
             raise ValueError(f"--env-file expects KEY=PATH, got: {item}")
         k, p = item.split("=", 1)
         env[k.strip()] = _read_text(Path(p).expanduser())
+    # Adapter stability defaults (caller may override via --env).
+    env.setdefault("OPENCODE_DISABLE_AUTOUPDATE", "1")
+    env.setdefault("OPENCODE_CLIENT", "opencode-subtask")
     return env
 
 
@@ -393,7 +436,23 @@ def ensure_server(
                 with contextlib.suppress(Exception):
                     self.path.unlink()
 
-    with _ServerLock(lock_path, timeout_s=min(10.0, max(0.5, wait_s))) as lock:
+    # Acquire a per-project lock so concurrent tasks don't race-start or clobber state.
+    with _ServerLock(lock_path, timeout_s=max(0.5, float(wait_s))) as lock:
+        if not lock.acquired:
+            # Another task is likely starting or reusing the server. Poll state until healthy.
+            deadline = time.monotonic() + max(0.1, float(wait_s))
+            while time.monotonic() < deadline:
+                st = _load_json(st_path) or {}
+                if isinstance(st, dict) and isinstance(st.get("url"), str):
+                    url = str(st["url"])
+                    health = _server_health(url, attempts=3, delay_s=0.25)
+                    if isinstance(health, dict) and health.get("healthy") is True:
+                        st["version"] = health.get("version")
+                        _write_json(st_path, st)
+                        return st
+                time.sleep(0.25)
+            raise RuntimeError(f"opencode serve lock busy and no healthy server observed: {st_path}")
+
         # 1) Reuse if healthy.
         st = _load_json(st_path) or {}
         if isinstance(st, dict) and isinstance(st.get("url"), str):
@@ -404,79 +463,99 @@ def ensure_server(
                 _write_json(st_path, st)
                 return st
 
-        # 2) If stale pid exists, try to kill (only while holding the lock).
-        if lock.acquired:
-            try:
-                old_pid = int(st.get("pid") or 0)
-                if old_pid and _pid_running(old_pid):
-                    _kill_tree(old_pid)
-            except Exception:
-                pass
-
-    # 3) Start new server.
-    if port == 0:
-        port = _pick_free_port(hostname)
-
-    cmd = [opencode_bin, "serve", "--hostname", hostname, "--port", str(port)]
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_fp = open(log_path, "ab", buffering=0)
-
-    popen_kwargs: dict[str, Any] = {}
-    if os.name == "nt":
-        creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-            | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-        )
-        popen_kwargs["creationflags"] = creationflags
-    else:
-        popen_kwargs["start_new_session"] = True
-
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=log_fp,
-        stderr=log_fp,
-        cwd=str(workdir),
-        env=env,
-        **popen_kwargs,
-    )
-
-    # Close the parent's handle; the child keeps its own fd for logging.
-    try:
-        log_fp.close()
-    except Exception:
-        pass
-
-    url = f"http://{hostname}:{port}"
-    deadline = time.monotonic() + max(wait_s, 0.1)
-    health: dict[str, Any] | None = None
-    while time.monotonic() < deadline:
-        health = _server_health(url)
-        if isinstance(health, dict) and health.get("healthy") is True:
-            break
-        time.sleep(0.25)
-
-    if not (isinstance(health, dict) and health.get("healthy") is True):
+        # 2) If stale pid exists, try to kill.
         try:
-            _kill_tree(proc.pid)
+            old_pid = int(st.get("pid") or 0)
+            if old_pid and _pid_looks_like_opencode(old_pid):
+                _kill_tree(old_pid)
         except Exception:
             pass
-        raise RuntimeError(f"opencode serve failed health check: {url}")
 
-    state = {
-        "pid": proc.pid,
-        "hostname": hostname,
-        "port": port,
-        "url": url,
-        "startedAt": _now_ms(),
-        "version": health.get("version"),
-        "projectRoot": str(_find_git_root(workdir)),
-        "logPath": str(log_path),
-        "command": cmd,
-    }
-    _write_json(st_path, state)
-    return state
+        # 3) Start new server (retry a few times when auto-picking a port).
+        port_auto = port == 0
+        attempts = 3 if port_auto else 1
+        last_err: Exception | None = None
+        proc: subprocess.Popen[Any] | None = None
+        health: dict[str, Any] | None = None
+        port_chosen: int | None = None
+
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+                | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+            )
+            popen_kwargs["creationflags"] = creationflags
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        for _ in range(attempts):
+            port_chosen = _pick_free_port(hostname) if port_auto else int(port)
+            cmd = [opencode_bin, "serve", "--hostname", hostname, "--port", str(port_chosen)]
+
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_fp = open(log_path, "ab", buffering=0)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_fp,
+                    stderr=log_fp,
+                    cwd=str(workdir),
+                    env=env,
+                    **popen_kwargs,
+                )
+            except Exception as e:
+                last_err = e
+                with contextlib.suppress(Exception):
+                    log_fp.close()
+                proc = None
+                continue
+            finally:
+                # Close the parent's handle; the child keeps its own fd for logging.
+                with contextlib.suppress(Exception):
+                    log_fp.close()
+
+            url = f"http://{hostname}:{port_chosen}"
+            deadline = time.monotonic() + max(wait_s, 0.1)
+            health = None
+            while time.monotonic() < deadline:
+                health = _server_health(url, attempts=1)
+                if isinstance(health, dict) and health.get("healthy") is True:
+                    break
+                # If the child died quickly, don't wait the full timeout.
+                if proc is not None and not _pid_running(int(proc.pid)):
+                    break
+                time.sleep(0.25)
+
+            if isinstance(health, dict) and health.get("healthy") is True:
+                break
+
+            # Failed to become healthy; kill and retry on a new port (auto mode only).
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    _kill_tree(int(proc.pid))
+            proc = None
+            health = None
+
+        if not (isinstance(health, dict) and health.get("healthy") is True and proc is not None and port_chosen is not None):
+            if last_err is not None:
+                raise RuntimeError(f"opencode serve failed to start: {last_err}") from last_err
+            raise RuntimeError("opencode serve failed health check")
+
+        state = {
+            "pid": proc.pid,
+            "hostname": hostname,
+            "port": port_chosen,
+            "url": f"http://{hostname}:{port_chosen}",
+            "startedAt": _now_ms(),
+            "version": health.get("version"),
+            "projectRoot": str(_find_git_root(workdir)),
+            "logPath": str(log_path),
+            "command": cmd,
+        }
+        _write_json(st_path, state)
+        return state
 
 
 # ============================
@@ -1170,7 +1249,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     server_state: dict[str, Any] | None = None
     attach_url = args.attach
     server_error: dict[str, Any] | None = None
-    if not attach_url and not args.no_attach:
+    # opencode v1.1.25 has a known crash path for `opencode run --attach ... --agent <name>`
+    # ("No context found for instance"). Prefer standalone mode when an explicit agent is requested.
+    attach_server = bool(args.attach_server and not args.agent)
+    if not attach_url and attach_server:
         try:
             server_state = ensure_server(
                 opencode_bin=opencode_bin,
@@ -1218,8 +1300,53 @@ def cmd_run(args: argparse.Namespace) -> int:
     agg = _Aggregator(text_sink=assistant_fp)
     timed_out = False
 
-    events_fp = open(events_path, "ab", buffering=0) if events_path else None
-    stderr_fp = open(stderr_path, "ab", buffering=0)
+    events_fp = None
+    stderr_fp = None
+    try:
+        events_fp = open(events_path, "ab", buffering=0) if events_path else None
+        stderr_fp = open(stderr_path, "ab", buffering=0)
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            if events_fp:
+                events_fp.close()
+        with contextlib.suppress(Exception):
+            if stderr_fp:
+                stderr_fp.close()
+        with contextlib.suppress(Exception):
+            if assistant_fp:
+                assistant_fp.close()
+        _write_job_state(job_path, "failed", {"error": {"name": type(e).__name__, "message": str(e)}})
+        out = _finish_obj(
+            ok=False,
+            exit_code=1,
+            timed_out=False,
+            run_id=run_id,
+            workdir=workdir,
+            session_id=None,
+            summary="",
+            truncated=False,
+            result=None,
+            changed_files=[],
+            artifacts_dir=artifacts_dir,
+            artifacts=_artifacts_obj(
+                jobPath=job_path.name,
+                finishPath=finish_path.name,
+                eventsPath=events_path.name if events_path else None,
+                assistantPath=assistant_path.name if assistant_path else None,
+                stderrPath=stderr_path.name,
+                wrapperLogPath=wrapper_log_path.name if wrapper_log_path else None,
+                patchPath=None,
+                promptPath=prompt_path.name if prompt_path else None,
+            ),
+            server=server_state,
+            metrics=None,
+            error={"name": "ArtifactOpenError", "message": str(e)},
+            include_debug=args.include_debug,
+            debug={"opencodeCommand": cmd, "serverError": server_error},
+        )
+        _write_json(finish_path, out)
+        sys.stdout.write(_json_line(out) + "\n")
+        return 1
 
     # wrapper.log is for background worker stdout/stderr redirection; in foreground we don't need it.
     if wrapper_log_path:
@@ -1236,11 +1363,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         _write_job_state(job_path, "running", {"opencodePid": proc.pid})
     except Exception as e:
-        if events_fp:
-            events_fp.close()
-        stderr_fp.close()
-        if assistant_fp:
-            assistant_fp.close()
+        with contextlib.suppress(Exception):
+            if events_fp:
+                events_fp.close()
+        with contextlib.suppress(Exception):
+            if stderr_fp:
+                stderr_fp.close()
+        with contextlib.suppress(Exception):
+            if assistant_fp:
+                assistant_fp.close()
         _write_job_state(job_path, "failed", {"error": {"name": type(e).__name__, "message": str(e)}})
         out = _finish_obj(
             ok=False,
@@ -1510,6 +1641,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--permission-mode",
         args.permission_mode,
     ]
+    attach_server = bool(args.attach_server and not args.agent)
 
     # Booleans.
     if args.quiet:
@@ -1544,8 +1676,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     # Attach settings.
     if args.attach:
         worker_cmd.extend(["--attach", args.attach])
-    if args.no_attach:
-        worker_cmd.append("--no-attach")
+    if not attach_server:
+        worker_cmd.append("--no-attach-server")
 
     worker_cmd.extend(["--server-hostname", args.server_hostname])
     worker_cmd.extend(["--server-port", str(args.server_port)])
@@ -1848,10 +1980,16 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
 
     p.add_argument("--attach", default=None, help="Attach to an existing opencode server URL")
     p.add_argument(
-        "--no-attach",
+        "--attach-server",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Disable ensure-server/attach and let opencode run Holden its own server",
+        default=True,
+        help="Reuse a per-project opencode serve via --attach (recommended for speed)",
+    )
+    p.add_argument(
+        "--no-attach",
+        dest="attach_server",
+        action="store_false",
+        help="(deprecated) Alias for --no-attach-server",
     )
 
     p.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME)

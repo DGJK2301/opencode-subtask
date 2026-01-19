@@ -42,7 +42,8 @@ Background job:
 - `--inline-result / --no-inline-result`:
   - Default: `--no-inline-result` (finish JSON returns pointers + summary only).
   - Enable `--inline-result` for debugging or when the caller explicitly wants the parsed JSON in-band.
-- `--no-attach`: do not reuse/attach to a shared `opencode serve` instance.
+- `--no-attach-server`: do not reuse/attach to a shared `opencode serve` instance (slower, but avoids shared-daemon edge cases). (`--no-attach` is accepted as a deprecated alias.)
+- `--permission-mode allow`: sets `OPENCODE_PERMISSION="allow"` (no prompts; maximum capability).
 - `--permission-mode noninteractive`: sets `OPENCODE_PERMISSION` to avoid headless hangs (denies `doom_loop`, `external_directory`, nested `task`, and nested `skill`).
 - `--opencode-print-logs` / `--opencode-log-level {DEBUG,INFO,WARN,ERROR}`: pass through OpenCode logging to help diagnose long hangs/retries (captured in `artifacts/stderr.log`).
 - On Windows, the default `--opencode` is `opencode.cmd`.
@@ -80,9 +81,10 @@ Artifact fields (typical):
 
 - Prefer `start/wait` for long-running reasoning models.
 - For “is it stuck?” checks, use `status`/`wait` output `progress.idleForSeconds` plus the artifact files (`events.ndjson`, `assistant.txt`, `stderr.log`, `wrapper.log`) to see if anything is still advancing.
+- Note: On OpenCode `1.1.25`, `opencode run --attach ... --agent <name>` can crash with “No context found for instance”. The wrapper therefore skips server attach when `--agent` is set (unless you pass an explicit `--attach` URL), and you can always force standalone mode with `--no-attach-server`.
 - Typical states:
   - **Finished**: `finish.json` exists and `status` returns `type=opencode-subtask-finish` with `ok/exitCode/timedOut`.
   - **Running**: `wait --timeout <small>` returns `type=opencode-subtask-status` with `status=running` and a live `progress` snapshot.
   - **Stuck/slow**: `status=running` but `progress.idleForSeconds` keeps increasing and artifact sizes stop changing; check `stderr.log` (and enable `--opencode-print-logs` for retry details).
-- For automation stability, consider setting `autoupdate` to `"notify"` (or `false`) in `opencode.json` so OpenCode doesn't change underneath the adapter unexpectedly.
+- For automation stability, this wrapper sets `OPENCODE_DISABLE_AUTOUPDATE=1` and `OPENCODE_CLIENT=opencode-subtask` by default (override with `--env OPENCODE_DISABLE_AUTOUPDATE=0` or `--env OPENCODE_CLIENT=...`). You may also set `autoupdate` to `"notify"`/`false` in `opencode.json` to avoid surprise upgrades.
 - For deterministic model selection, set `model` in `opencode.json` (or pass `--model` explicitly).
