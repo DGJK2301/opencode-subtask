@@ -42,6 +42,10 @@ Background job:
 - `--inline-result / --no-inline-result`:
   - Default: `--no-inline-result` (finish JSON returns pointers + summary only).
   - Enable `--inline-result` for debugging or when the caller explicitly wants the parsed JSON in-band.
+- `--max-artifact-bytes N`:
+  - Default: 50MB per artifact file.
+  - If any artifact file grows past `N` bytes, the wrapper kills the run and returns `error.name="OutputTooLarge"`.
+  - Use `--max-artifact-bytes 0` to disable this guardrail.
 - `--no-attach-server`: do not reuse/attach to a shared `opencode serve` instance (slower, but avoids shared-daemon edge cases). (`--no-attach` is accepted as a deprecated alias.)
 - `--permission-mode allow`: sets `OPENCODE_PERMISSION="allow"` (no prompts; maximum capability).
 - `--permission-mode noninteractive`: sets `OPENCODE_PERMISSION` to avoid headless hangs (denies `doom_loop`, `external_directory`, nested `task`, and nested `skill`).
@@ -59,11 +63,13 @@ For `run` / `wait`, the output includes:
 - `exitCode`: integer
 - `timedOut`: boolean
 - `summary`: string (truncated, bounded)
-- `changedFiles`: list of file paths (from `git diff --name-only`, best-effort)
+- `changedFiles`: list of file paths (tracked changes from `git status --porcelain -z`, best-effort)
+- `untrackedFiles`: list of untracked file paths (best-effort; not included in `patchPath`)
 - `result`: object OR null
   - null by default (see `--inline-result`)
 - `error`: object OR null
   - may include `stderrTail` (bounded) for fast diagnosis
+  - `error.name` may be `Timeout`, `OutputTooLarge`, `NonZeroExit`, etc.
 - `artifacts`: object with paths (relative to artifactsDir)
 
 Artifact fields (typical):
@@ -81,6 +87,7 @@ Artifact fields (typical):
 
 - Prefer `start/wait` for long-running reasoning models.
 - For “is it stuck?” checks, use `status`/`wait` output `progress.idleForSeconds` plus the artifact files (`events.ndjson`, `assistant.txt`, `stderr.log`, `wrapper.log`) to see if anything is still advancing.
+- Result extraction prefers the strict sentinel-wrapped JSON block (`BEGIN_OC_SUBTASK_JSON` / `END_OC_SUBTASK_JSON`) and falls back to fenced/heuristic JSON extraction if needed.
 - Note: On OpenCode `1.1.25`, `opencode run --attach ... --agent <name>` can crash with “No context found for instance”. The wrapper therefore skips server attach when `--agent` is set (unless you pass an explicit `--attach` URL), and you can always force standalone mode with `--no-attach-server`.
 - Typical states:
   - **Finished**: `finish.json` exists and `status` returns `type=opencode-subtask-finish` with `ok/exitCode/timedOut`.

@@ -44,6 +44,7 @@ DEFAULT_SERVER_WAIT_S: Final[float] = 10.0
 DEFAULT_RUN_TIMEOUT_S: Final[float] = 30 * 60.0  # 30 minutes
 DEFAULT_WAIT_TIMEOUT_S: Final[float] = 60 * 60.0  # 60 minutes
 DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
+DEFAULT_MAX_ARTIFACT_BYTES: Final[int] = 50 * 1024 * 1024  # 50MB
 
 DEFAULT_POLL_INTERVAL_S: Final[float] = 0.25
 
@@ -94,6 +95,11 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         with contextlib.suppress(Exception):
             if tmp.exists():
                 tmp.unlink()
+
+
+def _decode_fs_path(b: bytes) -> str:
+    # Git porcelain output is UTF-8 by default; fall back to replacement on bad bytes.
+    return b.decode("utf-8", errors="replace")
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -200,14 +206,20 @@ def _pid_looks_like_opencode(pid: int) -> bool:
             ).decode("utf-8", errors="replace")
             return "opencode" in out.lower()
 
-        # POSIX best-effort: /proc is common but not universal.
+        # POSIX best-effort: /proc is common, fallback to ps on macOS/others.
         proc_cmdline = Path(f"/proc/{pid}/cmdline")
         if proc_cmdline.exists():
             data = proc_cmdline.read_bytes().decode("utf-8", errors="replace").replace("\x00", " ")
             return "opencode" in data.lower()
+
+        # Fallback to ps
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "comm=", "-o", "args="],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        return "opencode" in out.lower()
     except Exception:
         return False
-    return False
 
 
 def _kill_tree(pid: int) -> None:
@@ -481,10 +493,9 @@ def ensure_server(
 
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            creationflags = (
-                subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-                | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-            )
+            # NOTE: Do NOT use DETACHED_PROCESS here; it can break stdout capture for some
+            # subprocess chains (notably `.cmd` shims), resulting in empty NDJSON output.
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
             popen_kwargs["creationflags"] = creationflags
         else:
             popen_kwargs["start_new_session"] = True
@@ -496,12 +507,13 @@ def ensure_server(
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_fp = open(log_path, "ab", buffering=0)
             try:
+                server_cwd = _find_git_root(workdir)
                 proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.DEVNULL,
                     stdout=log_fp,
                     stderr=log_fp,
-                    cwd=str(workdir),
+                    cwd=str(server_cwd),
                     env=env,
                     **popen_kwargs,
                 )
@@ -551,6 +563,7 @@ def ensure_server(
             "startedAt": _now_ms(),
             "version": health.get("version"),
             "projectRoot": str(_find_git_root(workdir)),
+            "workdir": str(_find_git_root(workdir)),
             "logPath": str(log_path),
             "command": cmd,
         }
@@ -726,6 +739,22 @@ def _extract_last_json_object(text: str, *, max_scan_chars: int = 50_000) -> dic
     if not text:
         return None
 
+    # 0) Sentinel-wrapped payload.
+    begin_tag = "BEGIN_OC_SUBTASK_JSON"
+    end_tag = "END_OC_SUBTASK_JSON"
+    b = text.rfind(begin_tag)
+    if b != -1:
+        e = text.find(end_tag, b + len(begin_tag))
+        if e != -1:
+            payload = text[b + len(begin_tag) : e].strip()
+            if payload:
+                try:
+                    obj = json.loads(payload)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    pass
+
     # 1) Fenced blocks.
     blocks = _JSON_FENCE_RE.findall(text)
     for blk in reversed(blocks):
@@ -771,9 +800,9 @@ def _extract_last_json_object(text: str, *, max_scan_chars: int = 50_000) -> dic
 # Git patch capture
 # ============================
 
-def _git_patch(workdir: Path, artifacts_dir: Path) -> tuple[str | None, list[str]]:
+def _git_patch(workdir: Path, artifacts_dir: Path) -> tuple[str | None, list[str], list[str]]:
     if which("git") is None:
-        return None, []
+        return None, [], []
 
     try:
         inside = (
@@ -785,33 +814,88 @@ def _git_patch(workdir: Path, artifacts_dir: Path) -> tuple[str | None, list[str
             .strip()
         )
         if inside != "true":
-            return None, []
+            return None, [], []
     except Exception:
-        return None, []
+        return None, [], []
 
-    changed: list[str] = []
+    changed: set[str] = set()
+    untracked: set[str] = set()
     try:
-        names = subprocess.check_output(
-            ["git", "-C", str(workdir), "diff", "--name-only"],
+        raw = subprocess.check_output(
+            ["git", "-C", str(workdir), "status", "--porcelain", "-z"],
             stderr=subprocess.DEVNULL,
-        ).decode("utf-8", errors="replace")
-        changed = [x.strip() for x in names.splitlines() if x.strip()]
+        )
+        parts = raw.split(b"\0")
+        i = 0
+        while i < len(parts):
+            rec = parts[i]
+            i += 1
+            if not rec:
+                continue
+            if len(rec) < 3 or rec[2:3] != b" ":
+                continue
+            status = _decode_fs_path(rec[:2])
+            path = _decode_fs_path(rec[3:])
+            if status == "??":
+                if path:
+                    untracked.add(path)
+                continue
+            if path:
+                changed.add(path)
+            if "R" in status or "C" in status:
+                if i < len(parts):
+                    new_path = _decode_fs_path(parts[i])
+                    i += 1
+                    if new_path:
+                        changed.add(new_path)
     except Exception:
         pass
 
     try:
-        diff = subprocess.check_output(
-            ["git", "-C", str(workdir), "diff"],
-            stderr=subprocess.DEVNULL,
-        ).decode("utf-8", errors="replace")
-        if diff.strip():
+        chunks: list[str] = []
+        for argv in (["git", "-C", str(workdir), "diff", "--cached"], ["git", "-C", str(workdir), "diff"]):
+            try:
+                diff = subprocess.check_output(argv, stderr=subprocess.DEVNULL).decode("utf-8", errors="replace")
+                if diff.strip():
+                    chunks.append(diff)
+            except Exception:
+                continue
+        combined = "".join(chunks)
+        if combined.strip():
             p = artifacts_dir / "changes.patch"
-            _write_text(p, diff)
-            return str(p), changed
+            _write_text(p, combined)
+            return str(p), sorted(changed), sorted(untracked)
     except Exception:
         pass
 
-    return None, changed
+    return None, sorted(changed), sorted(untracked)
+
+
+def _artifact_size_guard(artifacts_dir: Path, max_bytes: int) -> dict[str, Any] | None:
+    if max_bytes <= 0:
+        return None
+
+    offenders: list[dict[str, Any]] = []
+    for name in ("events.ndjson", "assistant.txt", "stderr.log", "wrapper.log"):
+        p = artifacts_dir / name
+        if not p.exists():
+            continue
+        try:
+            size = int(p.stat().st_size)
+        except Exception:
+            continue
+        if size > max_bytes:
+            offenders.append({"path": name, "bytes": size})
+
+    if not offenders:
+        return None
+
+    return {
+        "name": "OutputTooLarge",
+        "message": f"artifact exceeded max bytes ({max_bytes})",
+        "maxBytes": int(max_bytes),
+        "files": offenders,
+    }
 
 
 # ============================
@@ -883,6 +967,7 @@ def _finish_obj(
     truncated: bool,
     result: dict[str, Any] | None,
     changed_files: list[str],
+    untracked_files: list[str],
     artifacts_dir: Path,
     artifacts: dict[str, Any],
     server: dict[str, Any] | None,
@@ -905,6 +990,7 @@ def _finish_obj(
         "summaryTruncated": truncated,
         "result": result,
         "changedFiles": changed_files,
+        "untrackedFiles": untracked_files,
         "artifacts": {"dir": str(artifacts_dir), **artifacts},
         "server": (
             {
@@ -1097,7 +1183,11 @@ def _default_contract_prompt() -> str:
     return (
         "\n\n"
         "SUBTASK OUTPUT CONTRACT (strict):\n"
-        "Return your FINAL answer as a single JSON object (no markdown, no code fences).\n"
+        "Return your FINAL answer wrapped by these exact sentinel lines:\n"
+        "BEGIN_OC_SUBTASK_JSON\n"
+        "<one JSON object>\n"
+        "END_OC_SUBTASK_JSON\n"
+        "No other text outside the sentinels.\n"
         "Schema:\n"
         "{\n"
         "  \"summary\": string (<= 800 chars),\n"
@@ -1105,7 +1195,7 @@ def _default_contract_prompt() -> str:
         "  \"changes\": string[] (what you changed, <= 10 items),\n"
         "  \"next_steps\": string[] (<= 10 items)\n"
         "}\n"
-        "If you cannot comply, output {\"summary\": \"...\", \"evidence\": [], \"changes\": [], \"next_steps\": []}.\n"
+        "If you cannot comply, output a minimal object with empty arrays, still wrapped in sentinels.\n"
         "Keep it concise.\n"
     )
 
@@ -1144,6 +1234,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             truncated=False,
             result=None,
             changed_files=[],
+            untracked_files=[],
             artifacts_dir=artifacts_dir,
             artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name),
             server=None,
@@ -1212,6 +1303,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             truncated=False,
             result=None,
             changed_files=[],
+            untracked_files=[],
             artifacts_dir=artifacts_dir,
             artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name),
             server=None,
@@ -1327,6 +1419,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             truncated=False,
             result=None,
             changed_files=[],
+            untracked_files=[],
             artifacts_dir=artifacts_dir,
             artifacts=_artifacts_obj(
                 jobPath=job_path.name,
@@ -1353,6 +1446,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         _write_text(wrapper_log_path, "")
 
     try:
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            # NOTE: Do NOT use DETACHED_PROCESS here; it can break stdout capture for some
+            # subprocess chains (notably `.cmd` shims), resulting in empty NDJSON output.
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            popen_kwargs["creationflags"] = creationflags
+        else:
+            popen_kwargs["start_new_session"] = True
+
         proc = subprocess.Popen(
             cmd,
             cwd=str(workdir),
@@ -1360,6 +1462,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             stdout=subprocess.PIPE,
             stderr=stderr_fp,
             env=env,
+            **popen_kwargs,
         )
         _write_job_state(job_path, "running", {"opencodePid": proc.pid})
     except Exception as e:
@@ -1384,6 +1487,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             truncated=False,
             result=None,
             changed_files=[],
+            untracked_files=[],
             artifacts_dir=artifacts_dir,
             artifacts=_artifacts_obj(
                 jobPath=job_path.name,
@@ -1431,18 +1535,37 @@ def cmd_run(args: argparse.Namespace) -> int:
     t = threading.Thread(target=reader, daemon=True)
     t.start()
 
-    try:
-        proc.wait(timeout=float(args.timeout))
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        try:
-            _kill_tree(proc.pid) if os.name == "nt" else proc.kill()
-        except Exception:
-            pass
-        try:
+    output_too_large_error: dict[str, Any] | None = None
+    deadline: float | None = None
+    if float(args.timeout) > 0:
+        deadline = time.monotonic() + float(args.timeout)
+
+    while True:
+        if proc.poll() is not None:
+            break
+
+        # Guardrail: prevent runaway stdout/stderr/events from consuming disk/time.
+        output_too_large_error = _artifact_size_guard(artifacts_dir, int(args.max_artifact_bytes))
+        if output_too_large_error is not None:
+            try:
+                _kill_tree(proc.pid)
+            except Exception:
+                pass
+            break
+
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            try:
+                _kill_tree(proc.pid)
+            except Exception:
+                pass
+            break
+
+        time.sleep(0.25)
+
+    if timed_out or output_too_large_error is not None:
+        with contextlib.suppress(Exception):
             proc.wait(timeout=5)
-        except Exception:
-            pass
 
     t.join(timeout=5)
 
@@ -1454,6 +1577,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             assistant_fp.close()
         except Exception:
             pass
+
+    # Final size guard after file handles are closed/drained (covers cases where the
+    # process exits between polling ticks, producing a large final burst of output).
+    output_too_large_error = output_too_large_error or _artifact_size_guard(artifacts_dir, int(args.max_artifact_bytes))
 
     exit_code = int(proc.returncode or 0)
 
@@ -1478,7 +1605,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     summary, truncated = _truncate(summary_source.strip(), int(args.max_text_chars))
 
     # Capture patch (best-effort).
-    patch_path, changed_files = _git_patch(workdir, artifacts_dir)
+    patch_path, changed_files, untracked_files = _git_patch(workdir, artifacts_dir)
 
     # Persist structured result to result.json (adapter writes the file; model only prints JSON).
     result_path: Path | None = artifacts_dir / "result.json"
@@ -1489,11 +1616,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Enrich with changed_files if the model didn't include it.
         if "changed_files" not in result_record and "changedFiles" not in result_record:
             result_record["changed_files"] = changed_files
+        if "untracked_files" not in result_record and "untrackedFiles" not in result_record:
+            result_record["untracked_files"] = untracked_files
     else:
         result_record = {
             "summary": summary,
             "evidence": [],
             "changed_files": changed_files,
+            "untracked_files": untracked_files,
             "next_steps": [],
             "raw": result_obj,
         }
@@ -1504,11 +1634,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         result_path = None
         result_digest = None
 
-    ok = (not timed_out) and exit_code == 0 and agg.error_event is None
+    ok = (not timed_out) and (output_too_large_error is None) and exit_code == 0 and agg.error_event is None
 
     error_obj: dict[str, Any] | None = None
     if not ok:
-        if timed_out:
+        if output_too_large_error is not None:
+            error_obj = output_too_large_error
+        elif timed_out:
             error_obj = {"name": "Timeout", "message": f"opencode run exceeded timeout={args.timeout}s"}
         elif agg.error_event is not None:
             error_obj = {"name": "OpenCodeErrorEvent", "message": "error event observed", "event": agg.error_event}
@@ -1536,6 +1668,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         truncated=truncated,
         result=(result_record if args.inline_result else None),
         changed_files=changed_files,
+        untracked_files=untracked_files,
         artifacts_dir=artifacts_dir,
         artifacts=_artifacts_obj(
             jobPath=job_path.name,
@@ -1638,6 +1771,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         str(args.timeout),
         "--max-text-chars",
         str(args.max_text_chars),
+        "--max-artifact-bytes",
+        str(args.max_artifact_bytes),
         "--permission-mode",
         args.permission_mode,
     ]
@@ -1938,6 +2073,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             truncated=False,
             result=None,
             changed_files=[],
+            untracked_files=[],
             artifacts_dir=artifacts_dir,
             artifacts=_artifacts_obj(
                 jobPath=job_path.name,
@@ -2037,6 +2173,12 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_MAX_TEXT_CHARS,
         help="Max characters of summary returned in finish JSON (full text is still saved)",
+    )
+    p.add_argument(
+        "--max-artifact-bytes",
+        type=int,
+        default=DEFAULT_MAX_ARTIFACT_BYTES,
+        help="Kill opencode if any artifact file exceeds this size in bytes (0 disables)",
     )
     p.add_argument(
         "--inline-result",
