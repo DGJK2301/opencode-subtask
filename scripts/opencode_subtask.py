@@ -257,8 +257,7 @@ def _merge_env(base: dict[str, str], set_vars: list[str], set_from_files: list[s
             raise ValueError(f"--env-file expects KEY=PATH, got: {item}")
         k, p = item.split("=", 1)
         env[k.strip()] = _read_text(Path(p).expanduser())
-    # Adapter stability defaults (caller may override via --env).
-    env.setdefault("OPENCODE_DISABLE_AUTOUPDATE", "1")
+    # Adapter identification (caller may override via --env).
     env.setdefault("OPENCODE_CLIENT", "opencode-subtask")
     return env
 
@@ -935,10 +934,15 @@ def _apply_permission_mode(env: dict[str, str], mode: str) -> None:
     if mode == "inherit":
         return
     if mode == "allow":
-        env.setdefault("OPENCODE_PERMISSION", json.dumps("allow"))
+        # Override any inherited/broken value to ensure a deterministic boundary.
+        # NOTE: Use an object form here (not a bare string), because `opencode serve`
+        # + `opencode run --attach` can fail with "Session not found" when
+        # OPENCODE_PERMISSION is set to the string "allow" on Windows.
+        env["OPENCODE_PERMISSION"] = json.dumps({"*": "allow"})
         return
     if mode == "noninteractive":
-        env.setdefault("OPENCODE_PERMISSION", json.dumps(_permission_noninteractive_preset()))
+        # Override any inherited/broken value to ensure a deterministic boundary.
+        env["OPENCODE_PERMISSION"] = json.dumps(_permission_noninteractive_preset())
         return
     raise ValueError(f"Unknown permission mode: {mode}")
 
@@ -1200,6 +1204,215 @@ def _default_contract_prompt() -> str:
     )
 
 
+def _blocked_reason_looks_like_ruleset_config_error(blocked_reason: str) -> bool:
+    s = blocked_reason.lower()
+    return ("ruleset" in s) and (
+        ("invalid_value" in s)
+        or ("validation" in s)
+        or ("configuration" in s)
+        or ("invalid" in s)
+        or ("expected allow|deny|ask" in s)
+        or ("expected allow/deny/ask" in s)
+        or ("allow|deny|ask" in s)
+    )
+
+
+def _rotate_attempt_artifacts(artifacts_dir: Path, attempt: int) -> dict[str, str]:
+    """Rename attempt artifacts to preserve them before a retry.
+
+    Returns a map of {old_name: new_name} for files that were moved.
+    """
+
+    moved: dict[str, str] = {}
+
+    def move(name: str) -> None:
+        src = artifacts_dir / name
+        if not src.exists():
+            return
+        base = f"{name}.attempt{attempt}"
+        dst = artifacts_dir / base
+        if dst.exists():
+            for i in range(2, 50):
+                cand = artifacts_dir / f"{base}.{i}"
+                if not cand.exists():
+                    dst = cand
+                    break
+        try:
+            src.replace(dst)
+            moved[name] = dst.name
+        except Exception:
+            # Best-effort; failing to rotate shouldn't prevent a retry.
+            return
+
+    # Files produced by opencode runs and wrapper post-processing.
+    move("events.ndjson")
+    move("assistant.txt")
+    move("stderr.log")
+    move("result.json")
+    move("changes.patch")
+
+    return moved
+
+
+def _run_opencode_process(
+    *,
+    cmd: list[str],
+    workdir: Path,
+    env: dict[str, str],
+    artifacts_dir: Path,
+    events_path: Path | None,
+    assistant_path: Path | None,
+    stderr_path: Path,
+    job_path: Path,
+    quiet: bool,
+    timeout_s: float,
+    max_artifact_bytes: int,
+) -> tuple[_Aggregator | None, str, int, bool, dict[str, Any] | None, dict[str, Any] | None]:
+    """Run opencode and capture NDJSON/text to artifacts.
+
+    Returns: (aggregator|None, full_text, exit_code, timed_out, output_too_large_error, fatal_error)
+    """
+
+    assistant_fp = None
+    if assistant_path:
+        try:
+            assistant_fp = open(assistant_path, "w", encoding="utf-8")
+        except Exception:
+            assistant_fp = None
+
+    agg = _Aggregator(text_sink=assistant_fp)
+    timed_out = False
+
+    events_fp = None
+    stderr_fp = None
+    try:
+        events_fp = open(events_path, "ab", buffering=0) if events_path else None
+        stderr_fp = open(stderr_path, "ab", buffering=0)
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            if events_fp:
+                events_fp.close()
+        with contextlib.suppress(Exception):
+            if stderr_fp:
+                stderr_fp.close()
+        with contextlib.suppress(Exception):
+            if assistant_fp:
+                assistant_fp.close()
+        return None, "", 1, False, None, {"name": "ArtifactOpenError", "message": str(e)}
+
+    try:
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            # NOTE: Do NOT use DETACHED_PROCESS here; it can break stdout capture for some
+            # subprocess chains (notably `.cmd` shims), resulting in empty NDJSON output.
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            popen_kwargs["creationflags"] = creationflags
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(workdir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr_fp,
+            env=env,
+            **popen_kwargs,
+        )
+        _write_job_state(job_path, "running", {"opencodePid": proc.pid})
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            if events_fp:
+                events_fp.close()
+        with contextlib.suppress(Exception):
+            if stderr_fp:
+                stderr_fp.close()
+        with contextlib.suppress(Exception):
+            if assistant_fp:
+                assistant_fp.close()
+        return None, "", 127, False, None, {"name": type(e).__name__, "message": str(e)}
+
+    def reader() -> None:
+        assert proc.stdout is not None
+        for raw in iter(proc.stdout.readline, b""):
+            if not raw:
+                break
+            if events_fp:
+                try:
+                    events_fp.write(raw)
+                except Exception:
+                    pass
+            if not quiet:
+                # debugging only: forward raw NDJSON
+                try:
+                    sys.stderr.buffer.write(raw)
+                    sys.stderr.buffer.flush()
+                except Exception:
+                    pass
+            try:
+                evt = json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            agg.ingest(evt)
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    output_too_large_error: dict[str, Any] | None = None
+    deadline: float | None = None
+    if float(timeout_s) > 0:
+        deadline = time.monotonic() + float(timeout_s)
+
+    while True:
+        if proc.poll() is not None:
+            break
+
+        # Guardrail: prevent runaway stdout/stderr/events from consuming disk/time.
+        output_too_large_error = _artifact_size_guard(artifacts_dir, int(max_artifact_bytes))
+        if output_too_large_error is not None:
+            try:
+                _kill_tree(proc.pid)
+            except Exception:
+                pass
+            break
+
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            try:
+                _kill_tree(proc.pid)
+            except Exception:
+                pass
+            break
+
+        time.sleep(0.25)
+
+    if timed_out or output_too_large_error is not None:
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+    t.join(timeout=5)
+
+    if events_fp:
+        events_fp.close()
+    stderr_fp.close()
+    if assistant_fp:
+        with contextlib.suppress(Exception):
+            assistant_fp.close()
+
+    # Final size guard after file handles are closed/drained (covers cases where the
+    # process exits between polling ticks, producing a large final burst of output).
+    output_too_large_error = output_too_large_error or _artifact_size_guard(artifacts_dir, int(max_artifact_bytes))
+
+    exit_code = int(proc.returncode or 0)
+
+    full_text = agg.full_text()
+    if assistant_path and assistant_fp is None:
+        with contextlib.suppress(Exception):
+            _write_text(assistant_path, full_text)
+
+    return agg, full_text, exit_code, timed_out, output_too_large_error, None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
 
@@ -1382,36 +1595,33 @@ def cmd_run(args: argparse.Namespace) -> int:
     cmd.append("--")
     cmd.append("Follow the instructions in the attached prompt.txt.")
 
-    assistant_fp = None
-    if assistant_path:
-        try:
-            assistant_fp = open(assistant_path, "w", encoding="utf-8")
-        except Exception:
-            assistant_fp = None
+    # wrapper.log is for background worker stdout/stderr redirection; in foreground we don't need it.
+    if wrapper_log_path:
+        _write_text(wrapper_log_path, "")
 
-    agg = _Aggregator(text_sink=assistant_fp)
-    timed_out = False
+    retry_info: dict[str, Any] | None = None
+    auto_attach_used = bool(attach_url and args.attach is None and attach_server)
 
-    events_fp = None
-    stderr_fp = None
-    try:
-        events_fp = open(events_path, "ab", buffering=0) if events_path else None
-        stderr_fp = open(stderr_path, "ab", buffering=0)
-    except Exception as e:
-        with contextlib.suppress(Exception):
-            if events_fp:
-                events_fp.close()
-        with contextlib.suppress(Exception):
-            if stderr_fp:
-                stderr_fp.close()
-        with contextlib.suppress(Exception):
-            if assistant_fp:
-                assistant_fp.close()
-        _write_job_state(job_path, "failed", {"error": {"name": type(e).__name__, "message": str(e)}})
+    agg, full_text, exit_code, timed_out, output_too_large_error, fatal_error = _run_opencode_process(
+        cmd=cmd,
+        workdir=workdir,
+        env=env,
+        artifacts_dir=artifacts_dir,
+        events_path=events_path,
+        assistant_path=assistant_path,
+        stderr_path=stderr_path,
+        job_path=job_path,
+        quiet=bool(args.quiet),
+        timeout_s=float(args.timeout),
+        max_artifact_bytes=int(args.max_artifact_bytes),
+    )
+
+    if fatal_error is not None or agg is None:
+        _write_job_state(job_path, "failed", {"error": fatal_error})
         out = _finish_obj(
             ok=False,
-            exit_code=1,
-            timed_out=False,
+            exit_code=exit_code,
+            timed_out=timed_out,
             run_id=run_id,
             workdir=workdir,
             session_id=None,
@@ -1433,164 +1643,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             ),
             server=server_state,
             metrics=None,
-            error={"name": "ArtifactOpenError", "message": str(e)},
+            error=fatal_error or {"name": "UnknownError", "message": "opencode process failed"},
             include_debug=args.include_debug,
             debug={"opencodeCommand": cmd, "serverError": server_error},
         )
         _write_json(finish_path, out)
         sys.stdout.write(_json_line(out) + "\n")
         return 1
-
-    # wrapper.log is for background worker stdout/stderr redirection; in foreground we don't need it.
-    if wrapper_log_path:
-        _write_text(wrapper_log_path, "")
-
-    try:
-        popen_kwargs: dict[str, Any] = {}
-        if os.name == "nt":
-            # NOTE: Do NOT use DETACHED_PROCESS here; it can break stdout capture for some
-            # subprocess chains (notably `.cmd` shims), resulting in empty NDJSON output.
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-            popen_kwargs["creationflags"] = creationflags
-        else:
-            popen_kwargs["start_new_session"] = True
-
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(workdir),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=stderr_fp,
-            env=env,
-            **popen_kwargs,
-        )
-        _write_job_state(job_path, "running", {"opencodePid": proc.pid})
-    except Exception as e:
-        with contextlib.suppress(Exception):
-            if events_fp:
-                events_fp.close()
-        with contextlib.suppress(Exception):
-            if stderr_fp:
-                stderr_fp.close()
-        with contextlib.suppress(Exception):
-            if assistant_fp:
-                assistant_fp.close()
-        _write_job_state(job_path, "failed", {"error": {"name": type(e).__name__, "message": str(e)}})
-        out = _finish_obj(
-            ok=False,
-            exit_code=127,
-            timed_out=False,
-            run_id=run_id,
-            workdir=workdir,
-            session_id=None,
-            summary="",
-            truncated=False,
-            result=None,
-            changed_files=[],
-            untracked_files=[],
-            artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(
-                jobPath=job_path.name,
-                finishPath=finish_path.name,
-                eventsPath=events_path.name if events_path else None,
-                assistantPath=assistant_path.name if assistant_path else None,
-                stderrPath=stderr_path.name,
-                wrapperLogPath=wrapper_log_path.name if wrapper_log_path else None,
-                patchPath=None,
-                promptPath=prompt_path.name if prompt_path else None,
-            ),
-            server=server_state,
-            metrics=None,
-            error={"name": type(e).__name__, "message": str(e)},
-            include_debug=args.include_debug,
-            debug={"opencodeCommand": cmd, "serverError": server_error},
-        )
-        _write_json(finish_path, out)
-        sys.stdout.write(_json_line(out) + "\n")
-        return 127
-
-    def reader() -> None:
-        assert proc.stdout is not None
-        for raw in iter(proc.stdout.readline, b""):
-            if not raw:
-                break
-            if events_fp:
-                try:
-                    events_fp.write(raw)
-                except Exception:
-                    pass
-            if not args.quiet:
-                # debugging only: forward raw NDJSON
-                try:
-                    sys.stderr.buffer.write(raw)
-                    sys.stderr.buffer.flush()
-                except Exception:
-                    pass
-            try:
-                evt = json.loads(raw.decode("utf-8", errors="replace"))
-            except Exception:
-                continue
-            agg.ingest(evt)
-
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
-
-    output_too_large_error: dict[str, Any] | None = None
-    deadline: float | None = None
-    if float(args.timeout) > 0:
-        deadline = time.monotonic() + float(args.timeout)
-
-    while True:
-        if proc.poll() is not None:
-            break
-
-        # Guardrail: prevent runaway stdout/stderr/events from consuming disk/time.
-        output_too_large_error = _artifact_size_guard(artifacts_dir, int(args.max_artifact_bytes))
-        if output_too_large_error is not None:
-            try:
-                _kill_tree(proc.pid)
-            except Exception:
-                pass
-            break
-
-        if deadline is not None and time.monotonic() >= deadline:
-            timed_out = True
-            try:
-                _kill_tree(proc.pid)
-            except Exception:
-                pass
-            break
-
-        time.sleep(0.25)
-
-    if timed_out or output_too_large_error is not None:
-        with contextlib.suppress(Exception):
-            proc.wait(timeout=5)
-
-    t.join(timeout=5)
-
-    if events_fp:
-        events_fp.close()
-    stderr_fp.close()
-    if assistant_fp:
-        try:
-            assistant_fp.close()
-        except Exception:
-            pass
-
-    # Final size guard after file handles are closed/drained (covers cases where the
-    # process exits between polling ticks, producing a large final burst of output).
-    output_too_large_error = output_too_large_error or _artifact_size_guard(artifacts_dir, int(args.max_artifact_bytes))
-
-    exit_code = int(proc.returncode or 0)
-
-    # Assistant tail (full transcript, if enabled, is streamed to assistant.txt).
-    full_text = agg.full_text()
-    if args.save_text and assistant_path and assistant_fp is None:
-        try:
-            _write_text(assistant_path, full_text)
-        except Exception:
-            assistant_path = None
 
     # Extract structured result if present.
     result_obj = _extract_last_json_object(full_text)
@@ -1601,6 +1660,114 @@ def cmd_run(args: argparse.Namespace) -> int:
         summary_source = str(result_obj.get("summary"))
     else:
         summary_source = full_text
+
+    blocked_reason: str | None = None
+    summary_source_stripped = summary_source.strip()
+    if summary_source_stripped.upper().startswith("BLOCKED"):
+        blocked_reason = summary_source_stripped
+
+    # If we auto-attached to a shared server and hit a ruleset-config BLOCKED state, retry once
+    # in standalone mode. This avoids disturbing other in-flight tasks using that server.
+    if (
+        blocked_reason is not None
+        and auto_attach_used
+        and _blocked_reason_looks_like_ruleset_config_error(blocked_reason)
+        and not timed_out
+        and output_too_large_error is None
+    ):
+        # Preserve attempt-1 artifacts for diagnosis.
+        attempt1_record: dict[str, Any] = {
+            "mode": "attach",
+            "blockedReason": blocked_reason,
+            "exitCode": exit_code,
+            "timedOut": timed_out,
+            "server": server_state,
+            "opencodeCommand": cmd,
+        }
+        with contextlib.suppress(Exception):
+            _write_json(artifacts_dir / "attempt1.json", attempt1_record)
+        moved = _rotate_attempt_artifacts(artifacts_dir, attempt=1)
+
+        retry_info = {"attempted": True, "reason": "ruleset-config", "movedArtifacts": moved}
+
+        # Standalone retry: drop --attach.
+        attach_url = None
+        server_state = None
+        cmd2: list[str] = [opencode_bin, "run", "--format", "json"]
+        if getattr(args, "opencode_print_logs", False):
+            cmd2.append("--print-logs")
+        if getattr(args, "opencode_log_level", None):
+            cmd2.extend(["--log-level", str(args.opencode_log_level)])
+        if args.agent:
+            cmd2.extend(["--agent", args.agent])
+        if args.model:
+            cmd2.extend(["--model", args.model])
+        for f in args.file:
+            cmd2.extend(["--file", f])
+        cmd2.extend(["--file", str(prompt_path)])
+        cmd2.append("--")
+        cmd2.append("Follow the instructions in the attached prompt.txt.")
+
+        agg, full_text, exit_code, timed_out, output_too_large_error, fatal_error = _run_opencode_process(
+            cmd=cmd2,
+            workdir=workdir,
+            env=env,
+            artifacts_dir=artifacts_dir,
+            events_path=events_path,
+            assistant_path=assistant_path,
+            stderr_path=stderr_path,
+            job_path=job_path,
+            quiet=bool(args.quiet),
+            timeout_s=float(args.timeout),
+            max_artifact_bytes=int(args.max_artifact_bytes),
+        )
+
+        if fatal_error is not None or agg is None:
+            _write_job_state(job_path, "failed", {"error": fatal_error})
+            out = _finish_obj(
+                ok=False,
+                exit_code=exit_code,
+                timed_out=timed_out,
+                run_id=run_id,
+                workdir=workdir,
+                session_id=None,
+                summary="",
+                truncated=False,
+                result=None,
+                changed_files=[],
+                untracked_files=[],
+                artifacts_dir=artifacts_dir,
+                artifacts=_artifacts_obj(
+                    jobPath=job_path.name,
+                    finishPath=finish_path.name,
+                    eventsPath=events_path.name if events_path else None,
+                    assistantPath=assistant_path.name if assistant_path else None,
+                    stderrPath=stderr_path.name,
+                    wrapperLogPath=wrapper_log_path.name if wrapper_log_path else None,
+                    patchPath=None,
+                    promptPath=prompt_path.name if prompt_path else None,
+                ),
+                server=None,
+                metrics=None,
+                error=fatal_error or {"name": "UnknownError", "message": "opencode process failed"},
+                include_debug=args.include_debug,
+                debug={"opencodeCommand": cmd2, "retry": retry_info, "serverError": server_error},
+            )
+            if retry_info:
+                out["retry"] = retry_info
+            _write_json(finish_path, out)
+            sys.stdout.write(_json_line(out) + "\n")
+            return 1
+
+        # Recompute result/blocked for attempt-2.
+        cmd = cmd2
+        result_obj = _extract_last_json_object(full_text)
+        if isinstance(result_obj, dict) and isinstance(result_obj.get("summary"), str):
+            summary_source = str(result_obj.get("summary"))
+        else:
+            summary_source = full_text
+        summary_source_stripped = summary_source.strip()
+        blocked_reason = summary_source_stripped if summary_source_stripped.upper().startswith("BLOCKED") else None
 
     summary, truncated = _truncate(summary_source.strip(), int(args.max_text_chars))
 
@@ -1634,7 +1801,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         result_path = None
         result_digest = None
 
-    ok = (not timed_out) and (output_too_large_error is None) and exit_code == 0 and agg.error_event is None
+    ok = (
+        (not timed_out)
+        and (output_too_large_error is None)
+        and (blocked_reason is None)
+        and exit_code == 0
+        and agg.error_event is None
+    )
 
     error_obj: dict[str, Any] | None = None
     if not ok:
@@ -1642,6 +1815,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             error_obj = output_too_large_error
         elif timed_out:
             error_obj = {"name": "Timeout", "message": f"opencode run exceeded timeout={args.timeout}s"}
+        elif blocked_reason is not None:
+            error_obj = {"name": "Blocked", "message": blocked_reason}
         elif agg.error_event is not None:
             error_obj = {"name": "OpenCodeErrorEvent", "message": "error event observed", "event": agg.error_event}
         elif exit_code != 0:
@@ -1689,10 +1864,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         debug={
             "opencodeCommand": cmd,
             "serverError": server_error,
+            "retry": retry_info,
             "exitCode": exit_code,
             "timedOut": timed_out,
         },
     )
+
+    if retry_info:
+        out["retry"] = retry_info
 
     _write_json(finish_path, out)
     sys.stdout.write(_json_line(out) + "\n")
@@ -2203,7 +2382,7 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--permission-mode",
         choices=["inherit", "allow", "noninteractive"],
-        default="inherit",
+        default="allow",
         help="Permission policy override via OPENCODE_PERMISSION (use noninteractive to avoid ask deadlocks)",
     )
 

@@ -47,8 +47,9 @@ Background job:
   - If any artifact file grows past `N` bytes, the wrapper kills the run and returns `error.name="OutputTooLarge"`.
   - Use `--max-artifact-bytes 0` to disable this guardrail.
 - `--no-attach-server`: do not reuse/attach to a shared `opencode serve` instance (slower, but avoids shared-daemon edge cases). (`--no-attach` is accepted as a deprecated alias.)
-- `--permission-mode allow`: sets `OPENCODE_PERMISSION="allow"` (no prompts; maximum capability).
+- `--permission-mode allow`: sets `OPENCODE_PERMISSION={"*":"allow"}` (no prompts; maximum capability).
 - `--permission-mode noninteractive`: sets `OPENCODE_PERMISSION` to avoid headless hangs (denies `doom_loop`, `external_directory`, nested `task`, and nested `skill`).
+- Default: `--permission-mode allow` (override with `--permission-mode inherit` to respect your existing OpenCode permissions).
 - `--opencode-print-logs` / `--opencode-log-level {DEBUG,INFO,WARN,ERROR}`: pass through OpenCode logging to help diagnose long hangs/retries (captured in `artifacts/stderr.log`).
 - On Windows, the default `--opencode` is `opencode.cmd`.
 
@@ -69,7 +70,7 @@ For `run` / `wait`, the output includes:
   - null by default (see `--inline-result`)
 - `error`: object OR null
   - may include `stderrTail` (bounded) for fast diagnosis
-  - `error.name` may be `Timeout`, `OutputTooLarge`, `NonZeroExit`, etc.
+  - `error.name` may be `Timeout`, `OutputTooLarge`, `Blocked`, `NonZeroExit`, etc.
 - `artifacts`: object with paths (relative to artifactsDir)
 
 Artifact fields (typical):
@@ -89,9 +90,10 @@ Artifact fields (typical):
 - For “is it stuck?” checks, use `status`/`wait` output `progress.idleForSeconds` plus the artifact files (`events.ndjson`, `assistant.txt`, `stderr.log`, `wrapper.log`) to see if anything is still advancing.
 - Result extraction prefers the strict sentinel-wrapped JSON block (`BEGIN_OC_SUBTASK_JSON` / `END_OC_SUBTASK_JSON`) and falls back to fenced/heuristic JSON extraction if needed.
 - Note: On OpenCode `1.1.25`, `opencode run --attach ... --agent <name>` can crash with “No context found for instance”. The wrapper therefore skips server attach when `--agent` is set (unless you pass an explicit `--attach` URL), and you can always force standalone mode with `--no-attach-server`.
+- If an auto-attached server run returns `BLOCKED` due to ruleset validation errors (e.g. invalid `action` values), the wrapper retries once in standalone mode and preserves the first attempt artifacts as `*.attempt1` plus `attempt1.json`.
 - Typical states:
   - **Finished**: `finish.json` exists and `status` returns `type=opencode-subtask-finish` with `ok/exitCode/timedOut`.
   - **Running**: `wait --timeout <small>` returns `type=opencode-subtask-status` with `status=running` and a live `progress` snapshot.
   - **Stuck/slow**: `status=running` but `progress.idleForSeconds` keeps increasing and artifact sizes stop changing; check `stderr.log` (and enable `--opencode-print-logs` for retry details).
-- For automation stability, this wrapper sets `OPENCODE_DISABLE_AUTOUPDATE=1` and `OPENCODE_CLIENT=opencode-subtask` by default (override with `--env OPENCODE_DISABLE_AUTOUPDATE=0` or `--env OPENCODE_CLIENT=...`). You may also set `autoupdate` to `"notify"`/`false` in `opencode.json` to avoid surprise upgrades.
+- This wrapper sets `OPENCODE_CLIENT=opencode-subtask` by default (override with `--env OPENCODE_CLIENT=...`). It does not disable OpenCode auto-update; control updates via `opencode.json`.
 - For deterministic model selection, set `model` in `opencode.json` (or pass `--model` explicitly).
