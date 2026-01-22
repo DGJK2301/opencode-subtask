@@ -47,6 +47,9 @@ Background job:
   - If any artifact file grows past `N` bytes, the wrapper kills the run and returns `error.name="OutputTooLarge"`.
   - Use `--max-artifact-bytes 0` to disable this guardrail.
 - `--no-attach-server`: do not reuse/attach to a shared `opencode serve` instance (slower, but avoids shared-daemon edge cases). (`--no-attach` is accepted as a deprecated alias.)
+- `--disable-claude-code / --no-disable-claude-code`:
+  - Default: `--disable-claude-code` (sets `OPENCODE_DISABLE_CLAUDE_CODE=1` for isolation when running OpenCode under another agent/executor).
+  - Use `--no-disable-claude-code` if you explicitly want OpenCode’s built-in Claude Code integrations enabled.
 - `--permission-mode allow`: sets `OPENCODE_PERMISSION={"*":"allow"}` (no prompts; maximum capability).
 - `--permission-mode noninteractive`: sets `OPENCODE_PERMISSION` to avoid headless hangs (denies `doom_loop`, `external_directory`, nested `task`, and nested `skill`).
 - Default: `--permission-mode allow` (override with `--permission-mode inherit` to respect your existing OpenCode permissions).
@@ -87,7 +90,18 @@ Artifact fields (typical):
 ## Operational notes
 
 - Prefer `start/wait` for long-running reasoning models.
-- Model choice: use `google/antigravity-gemini-3-flash` for quick probes/status checks; use `google/antigravity-claude-opus-4-5-thinking` for complex analysis and code changes.
+- Model choice (Antigravity / Google):
+  - Quick probes / connectivity checks / shallow triage (strictly for connection confirmation):
+    Use `google/antigravity-gemini-3-flash` (variants: `minimal` | `low` | `medium` | `high`).
+  - Routine analysis and code review (moderate complexity, limited edits):
+    Use `google/antigravity-claude-sonnet-4-5-thinking` (variants: `low` | `max`).
+  - Complex analysis + correctness-critical code changes (multi-step refactors, tricky debugging):
+    Use `google/antigravity-claude-opus-4-5-thinking` (variants: `low` | `max`).
+  - Pure formatting / rewriting with minimal reasoning:
+    Use `google/antigravity-claude-sonnet-4-5` (no thinking; no variants).
+  - Simple, isolated tasks with short context (basic queries, straightforward code snippets):
+	Use `google/antigravity-gemini-3-pro` (variants: `low` | `high`).
+	⚠️ Avoid for: complex reasoning, long context (>50k tokens), multi-step logic, or mission-critical tasks.
 - For “is it stuck?” checks, use `status`/`wait` output `progress.idleForSeconds` plus the artifact files (`events.ndjson`, `assistant.txt`, `stderr.log`, `wrapper.log`) to see if anything is still advancing.
 - For writing reliable subtask prompts (role profiles, Facts/Hypotheses/Constraints/Acceptance capsule), see the `subtask-orchestrator` skill templates.
 - Result extraction prefers the strict sentinel-wrapped JSON block (`BEGIN_OC_SUBTASK_JSON` / `END_OC_SUBTASK_JSON`) and falls back to fenced/heuristic JSON extraction if needed.
