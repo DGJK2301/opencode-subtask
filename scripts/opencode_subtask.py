@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""opencode_subtask.py
+"""
+opencode_subtask.py
 
-A small, stable adapter around OpenCode's CLI for "subagent"-style delegation.
-
-Design goals:
-- Upstream agents (e.g., Codex) consume ONLY this adapter's stable JSON events.
-- Hide OpenCode's NDJSON event stream and CLI quirks behind a versioned contract.
-- Support both foreground (run) and background (start/wait) execution.
-- Persist full artifacts (events, stderr, full text, patch) to disk, while returning
-  only a short, bounded summary to stdout.
+A Codex-friendly adapter around OpenCode that provides:
+- Stable one-line JSON output (ASCII-only) with schemaVersion.
+- Artifacts-first logging (events/stderr/assistant/result/patch) to avoid caller context bloat.
+- Job semantics: start -> wait (background) and run (foreground).
+- Engine abstraction: HTTP server API preferred; CLI fallback.
 
 Python: 3.10+
+No third-party deps.
 """
-
 from __future__ import annotations
 
 import argparse
-import contextlib
+import base64
 import hashlib
 import json
 import os
@@ -27,29 +25,33 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
-from typing import Any, Final
+from typing import Any, Final, Iterable
 
 # ============================
-# Stable contract
+# Constants / schema
 # ============================
 
 ADAPTER_SCHEMA_VERSION: Final[int] = 1
+
+DEFAULT_TIMEOUT_S: Final[float] = 900.0
+DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
+
+# 0 means "no hard cap"
+DEFAULT_MAX_ARTIFACT_BYTES: Final[int] = 20_000_000
 
 DEFAULT_SERVER_HOSTNAME: Final[str] = "127.0.0.1"
 DEFAULT_SERVER_PORT: Final[int] = 0  # 0 => pick a free port
 DEFAULT_SERVER_WAIT_S: Final[float] = 10.0
 
-DEFAULT_RUN_TIMEOUT_S: Final[float] = 30 * 60.0  # 30 minutes
-DEFAULT_WAIT_TIMEOUT_S: Final[float] = 60 * 60.0  # 60 minutes
-DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
-DEFAULT_MAX_ARTIFACT_BYTES: Final[int] = 50 * 1024 * 1024  # 50MB
+SENTINEL_BEGIN: Final[str] = "BEGIN_OC_SUBTASK_JSON"
+SENTINEL_END: Final[str] = "END_OC_SUBTASK_JSON"
 
-DEFAULT_POLL_INTERVAL_S: Final[float] = 0.25
-
-DEFAULT_OPENCODE_BIN: Final[str] = "opencode.cmd" if os.name == "nt" else "opencode"
-
+JSON_FENCE_RE: Final[re.Pattern[str]] = re.compile(r"```(?:json)?\s*({[\s\S]*?})\s*```", re.IGNORECASE)
 
 # ============================
 # Small utilities
@@ -58,57 +60,53 @@ DEFAULT_OPENCODE_BIN: Final[str] = "opencode.cmd" if os.name == "nt" else "openc
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
-
 def _json_line(obj: dict[str, Any]) -> str:
-    # Robust stdout across Windows codepages (e.g. GBK): emit ASCII-only JSON
-    # (non-ASCII escaped as \\uXXXX). Full-fidelity UTF-8 is still written to artifacts.
+    # ASCII-only JSON to survive GBK/CP1252 stdout encodings.
     return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
+    if max_chars <= 0:
+        return "", True
+    if len(text) <= max_chars:
+        return text, False
+    return text[: max_chars - 1] + "…", True
 
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
+def _atomic_write_bytes(path: Path, data: bytes, *, retries: int = 5, sleep_s: float = 0.05) -> None:
+    """
+    Atomic-ish write: write temp then os.replace.
+    On Windows, os.replace may fail transiently due to AV/indexers locking files.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{_now_ms()}")
-    try:
-        with tmp.open("wb") as f:
-            f.write(data)
-            f.flush()
-            with contextlib.suppress(Exception):
-                os.fsync(f.fileno())
-        if os.name == "nt":
-            # On Windows, rename/replace can transiently fail due to AV scanners or
-            # other readers briefly opening the target. Retry with a short backoff.
-            for i in range(8):
-                try:
-                    os.replace(tmp, path)
-                    break
-                except PermissionError:
-                    time.sleep(0.02 * (i + 1))
-            else:
-                os.replace(tmp, path)
-        else:
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{_now_ms()}")
+    tmp.write_bytes(data)
+    last_err: Exception | None = None
+    for i in range(max(retries, 1)):
+        try:
             os.replace(tmp, path)
-    finally:
-        with contextlib.suppress(Exception):
-            if tmp.exists():
-                tmp.unlink()
-
-
-def _decode_fs_path(b: bytes) -> str:
-    # Git porcelain output is UTF-8 by default; fall back to replacement on bad bytes.
-    return b.decode("utf-8", errors="replace")
-
+            return
+        except Exception as e:  # pragma: no cover
+            last_err = e
+            time.sleep(sleep_s * (i + 1))
+    # final attempt without swallowing
+    if last_err:
+        raise last_err
 
 def _write_text(path: Path, text: str) -> None:
     _atomic_write_bytes(path, text.encode("utf-8"))
 
-
 def _write_json(path: Path, obj: dict[str, Any]) -> None:
-    _atomic_write_bytes(path, json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"))
-
+    data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+    _atomic_write_bytes(path, data)
 
 def _load_json(path: Path) -> dict[str, Any] | None:
     try:
@@ -116,134 +114,26 @@ def _load_json(path: Path) -> dict[str, Any] | None:
     except Exception:
         return None
 
-
-def _cache_root() -> Path:
-    """User cache root for this adapter.
-
-    - Linux/macOS: $XDG_CACHE_HOME or ~/.cache
-    - Windows: %LOCALAPPDATA% or ~/AppData/Local
-    """
-    home = Path.home()
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
-    else:
-        base = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
-    return base / "opencode-subtask"
-
-
-def _runs_dir() -> Path:
-    return _cache_root() / "runs"
-
-
-def _servers_dir() -> Path:
-    return _cache_root() / "servers"
-
-
-def _find_git_root(start: Path) -> Path:
-    cur = start.resolve()
-    for p in [cur, *cur.parents]:
-        if (p / ".git").exists():
-            return p
-    return cur
-
-
-def _project_key(workdir: Path) -> str:
-    root = _find_git_root(workdir)
-    h = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
-    return h[:12]
-
-
-def _server_state_path(workdir: Path) -> Path:
-    return _servers_dir() / f"{_project_key(workdir)}.json"
-
-
-def _server_log_path(workdir: Path) -> Path:
-    return _servers_dir() / f"{_project_key(workdir)}.log"
-
-
-def _pick_free_port(host: str) -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((host, 0))
-        return int(s.getsockname()[1])
-
-
-def _pid_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name != "nt":
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-
-    # Windows: tasklist check
+def _tail_bytes(path: Path, max_bytes: int = 2048) -> str:
     try:
-        out = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            stderr=subprocess.DEVNULL,
-        ).decode("utf-8", errors="replace")
-        return str(pid) in out
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(size - max_bytes, 0))
+            data = f.read(max_bytes)
+        return data.decode("utf-8", errors="replace")
     except Exception:
-        return False
+        return ""
 
-
-def _pid_looks_like_opencode(pid: int) -> bool:
-    """Best-effort guard against PID reuse when killing stale server processes."""
-    if pid <= 0 or not _pid_running(pid):
-        return False
-    try:
-        if os.name == "nt":
-            cmd = (
-                f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\"; "
-                "if ($null -eq $p) { exit 1 }; "
-                "$s = ($p.Name + \" \" + $p.CommandLine); "
-                "Write-Output $s"
-            )
-            out = subprocess.check_output(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                stderr=subprocess.DEVNULL,
-            ).decode("utf-8", errors="replace")
-            return "opencode" in out.lower()
-
-        # POSIX best-effort: /proc is common, fallback to ps on macOS/others.
-        proc_cmdline = Path(f"/proc/{pid}/cmdline")
-        if proc_cmdline.exists():
-            data = proc_cmdline.read_bytes().decode("utf-8", errors="replace").replace("\x00", " ")
-            return "opencode" in data.lower()
-
-        # Fallback to ps
-        out = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", "comm=", "-o", "args="],
-            stderr=subprocess.DEVNULL,
-        ).decode("utf-8", errors="replace")
-        return "opencode" in out.lower()
-    except Exception:
-        return False
-
-
-def _kill_tree(pid: int) -> None:
-    if pid <= 0:
-        return
-
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        return
-
-    # POSIX
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except Exception:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except Exception:
-            pass
-
+def _join_prompt(args_prompt: list[str]) -> str:
+    prompt = " ".join(args_prompt).strip()
+    if prompt:
+        return prompt
+    if not sys.stdin.isatty():
+        data = sys.stdin.read().strip()
+        if data:
+            return data
+    raise SystemExit("Missing prompt. Pass it as arguments after `--` or via stdin.")
 
 def _merge_env(base: dict[str, str], set_vars: list[str], set_from_files: list[str]) -> dict[str, str]:
     env = dict(base)
@@ -256,141 +146,321 @@ def _merge_env(base: dict[str, str], set_vars: list[str], set_from_files: list[s
         if "=" not in item:
             raise ValueError(f"--env-file expects KEY=PATH, got: {item}")
         k, p = item.split("=", 1)
-        env[k.strip()] = _read_text(Path(p).expanduser())
-    # Adapter identification (caller may override via --env).
-    env.setdefault("OPENCODE_CLIENT", "opencode-subtask")
+        env[k.strip()] = _read_text(Path(p).expanduser().resolve())
     return env
 
+# ============================
+# Paths
+# ============================
 
+def _cache_root() -> Path:
+    home = Path.home()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
+    return base / "opencode-subtask"
 
-def _resolve_executable(exe: str) -> str | None:
-    """Resolve an executable to an absolute path for subprocess.
+def _runs_dir() -> Path:
+    return _cache_root() / "runs"
 
-    Motivation: on Windows, Node-installed CLIs are often .cmd shims. Resolving
-    up-front avoids CreateProcess/PATHEXT edge cases and makes start/wait more
-    reliable.
-    """
-    if not exe:
-        return None
+def _servers_dir() -> Path:
+    return _cache_root() / "servers"
 
-    # If it already looks like a path, respect it.
-    if any(sep in exe for sep in (os.sep, "/", "\\")) or (os.name == "nt" and len(exe) >= 2 and exe[1] == ":"):
-        p = Path(exe).expanduser()
-        return str(p) if p.exists() else None
+def _find_git_root(start: Path) -> Path:
+    cur = start.resolve()
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            return p
+    return cur
 
-    found = which(exe)
-    if found:
-        return found
+def _project_key(workdir: Path) -> str:
+    root = _find_git_root(workdir)
+    h = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+    return h[:12]
 
-    # On Windows, try common shim extensions explicitly.
-    if os.name == "nt" and not Path(exe).suffix:
-        for ext in (".cmd", ".exe", ".bat", ".com", ".ps1"):
-            found = which(exe + ext)
-            if found:
-                return found
+def _server_state_path(workdir: Path) -> Path:
+    return _servers_dir() / f"{_project_key(workdir)}.json"
 
-    return None
+def _server_log_path(workdir: Path) -> Path:
+    return _servers_dir() / f"{_project_key(workdir)}.log"
 
-
-def _sha256_file(path: Path) -> str | None:
-    try:
-        h = hashlib.sha256()
-        with path.open("rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 64), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
-
-
-def _read_tail(path: Path, max_bytes: int) -> str | None:
-    if max_bytes <= 0:
-        return None
-    try:
-        with path.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            start = max(0, size - max_bytes)
-            f.seek(start, os.SEEK_SET)
-            data = f.read()
-        return data.decode("utf-8", errors="replace")
-    except Exception:
-        return None
-
-
-def _progress_snapshot(artifacts_dir: Path) -> dict[str, Any] | None:
-    files: dict[str, Any] = {}
-    last_activity_ms: int | None = None
-    for name in ("events.ndjson", "assistant.txt", "stderr.log", "wrapper.log"):
-        p = artifacts_dir / name
-        if not p.exists():
-            continue
-        try:
-            st = p.stat()
-            m = int(st.st_mtime * 1000)
-            files[name] = {"bytes": int(st.st_size), "mtimeMs": m}
-            last_activity_ms = m if last_activity_ms is None else max(last_activity_ms, m)
-        except Exception:
-            continue
-
-    if not files:
-        return None
-
-    now_ms = _now_ms()
-    idle_s = max(0.0, (now_ms - (last_activity_ms or now_ms)) / 1000.0)
-    return {"files": files, "lastActivityMs": last_activity_ms, "idleForSeconds": idle_s}
-
-def _http_get_json(url: str, timeout_s: float = 1.0) -> dict[str, Any] | None:
-    try:
-        import urllib.request
-
-        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
-            if getattr(resp, "status", 200) != 200:
-                return None
-            return json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
-        return None
-
-
-def _server_health(url_base: str, *, attempts: int = 1, delay_s: float = 0.0) -> dict[str, Any] | None:
-    attempts = max(1, int(attempts))
-    for i in range(attempts):
-        res = _http_get_json(f"{url_base}/global/health", timeout_s=1.0)
-        if isinstance(res, dict):
-            return res
-        if i + 1 < attempts:
-            time.sleep(max(0.0, float(delay_s)))
-    return None
-
+def _server_lock_path(workdir: Path) -> Path:
+    return _servers_dir() / f"{_project_key(workdir)}.lock"
 
 def _make_run_id() -> str:
     return f"run_{_now_ms()}_{os.getpid()}"
 
-
-def _join_prompt(prompt_parts: list[str]) -> str:
-    prompt = " ".join(prompt_parts).strip()
-    if prompt:
-        return prompt
-    if not sys.stdin.isatty():
-        data = sys.stdin.read()
-        if data.strip():
-            return data
-    raise SystemExit("Missing prompt. Provide as args or via stdin.")
-
-
-def _truncate(s: str, max_chars: int) -> tuple[str, bool]:
-    if max_chars < 0:
-        return s, False
-    if max_chars == 0:
-        return "", bool(s)
-    if len(s) <= max_chars:
-        return s, False
-    return s[:max_chars], True
-
+def _resolve_artifacts_dir(run_id: str | None, artifacts_dir: str | None) -> tuple[str, Path]:
+    rid = run_id or _make_run_id()
+    if artifacts_dir:
+        ad = Path(artifacts_dir).expanduser().resolve()
+    else:
+        ad = (_runs_dir() / rid).resolve()
+    return rid, ad
 
 # ============================
-# OpenCode server management
+# Process helpers
 # ============================
+
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        return str(pid) in out
+    except Exception:
+        return False
+
+def _kill_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+
+def _proc_cmdline(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    if os.name != "nt":
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    # Windows: wmic is deprecated but still common; fall back to tasklist if needed.
+    try:
+        out = subprocess.check_output(
+            ["wmic", "process", "where", f"processid={pid}", "get", "CommandLine", "/VALUE"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        return out
+    except Exception:
+        return ""
+
+def _pick_free_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
+
+# ============================
+# Executable resolution (Windows-safe)
+# ============================
+
+def _resolve_executable(cmd: str) -> str | None:
+    """
+    Resolve a runnable executable path.
+    On Windows, `opencode` is often a .cmd shim; passing "opencode" to CreateProcess may fail.
+    """
+    # If it's a path already.
+    p = Path(cmd)
+    if p.is_file():
+        resolved = p.resolve()
+        if os.name == "nt" and resolved.suffix.lower() in (".cmd", ".bat"):
+            # If a sibling .exe exists, prefer it (avoids cmd.exe windows/popups).
+            sibling_exe = resolved.with_suffix(".exe")
+            if sibling_exe.is_file():
+                return str(sibling_exe.resolve())
+        return str(resolved)
+
+    # Try direct which lookup.
+    found = which(cmd)
+    if found:
+        resolved = Path(found).resolve()
+        if os.name == "nt" and resolved.suffix.lower() in (".cmd", ".bat"):
+            sibling_exe = resolved.with_suffix(".exe")
+            if sibling_exe.is_file():
+                return str(sibling_exe.resolve())
+        return str(resolved)
+
+    # Windows: try common suffixes explicitly.
+    if os.name == "nt":
+        # Prefer .exe first to avoid cmd.exe spawning and extra console noise.
+        for candidate in [cmd + ".exe", cmd + ".cmd", cmd + ".bat"]:
+            found2 = which(candidate)
+            if found2:
+                return str(Path(found2).resolve())
+    return None
+
+# ============================
+# HTTP client (stdlib)
+# ============================
+
+@dataclass(frozen=True)
+class HttpAuth:
+    username: str
+    password: str
+
+class OpencodeHttpClient:
+    def __init__(self, base_url: str, auth: HttpAuth | None = None, timeout_s: float = 10.0):
+        self.base_url = base_url.rstrip("/")
+        self.auth = auth
+        self.timeout_s = timeout_s
+
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        h = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.auth:
+            token = f"{self.auth.username}:{self.auth.password}".encode("utf-8")
+            h["Authorization"] = "Basic " + base64.b64encode(token).decode("ascii")
+        if extra:
+            h.update(extra)
+        return h
+
+    def _request_json(self, method: str, path: str, body: dict[str, Any] | None = None, timeout_s: float | None = None) -> tuple[int, dict[str, Any] | None]:
+        url = self.base_url + path
+        data = None
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method=method, headers=self._headers())
+        try:
+            with urllib.request.urlopen(req, timeout=float(timeout_s or self.timeout_s)) as resp:
+                raw = resp.read()
+                if not raw:
+                    return resp.status, None
+                return resp.status, json.loads(raw.decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            # Try to capture server error body.
+            try:
+                raw = e.read()
+                msg = raw.decode("utf-8", errors="replace")
+            except Exception:
+                msg = ""
+            raise RuntimeError(f"HTTP {e.code} {e.reason} for {path}: {msg[:500]}") from e
+        except Exception as e:
+            raise RuntimeError(f"HTTP request failed for {path}: {e}") from e
+
+    def health(self) -> dict[str, Any] | None:
+        try:
+            _, js = self._request_json("GET", "/global/health", None, timeout_s=2.0)
+            return js
+        except Exception:
+            return None
+
+    def create_session(self) -> dict[str, Any]:
+        # Server docs: POST /session -> Session
+        _, js = self._request_json("POST", "/session", {}, timeout_s=self.timeout_s)
+        if not isinstance(js, dict):
+            raise RuntimeError("Invalid /session response (expected JSON object)")
+        return js
+
+    def send_message_sync(
+        self,
+        session_id: str,
+        *,
+        prompt: str,
+        model: str | None,
+        variant: str | None,
+        agent: str | None,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"parts": [{"type": "text", "text": prompt}]}
+        if model:
+            body["model"] = model
+        if variant:
+            body["variant"] = variant
+        if agent:
+            body["agent"] = agent
+        # Server docs: POST /session/:id/message -> Message
+        _, js = self._request_json("POST", f"/session/{session_id}/message", body, timeout_s=timeout_s)
+        if not isinstance(js, dict):
+            raise RuntimeError("Invalid /message response (expected JSON object)")
+        return js
+
+    def abort(self, session_id: str) -> None:
+        # Server docs: POST /session/:id/abort
+        try:
+            self._request_json("POST", f"/session/{session_id}/abort", {}, timeout_s=5.0)
+        except Exception:
+            pass
+
+    def reply_permission(self, session_id: str, permission_id: str, *, response: str, remember: bool = False) -> None:
+        # Server docs: POST /session/:id/permissions/:permissionID
+        body = {"response": response, "remember": remember}
+        try:
+            self._request_json("POST", f"/session/{session_id}/permissions/{permission_id}", body, timeout_s=5.0)
+        except Exception:
+            pass
+
+    def open_sse(self, path: str, *, timeout_s: float = 30.0) -> urllib.request.addinfourl:
+        """
+        Open an SSE stream endpoint (returns a file-like HTTP response).
+        Note: stdlib doesn't have native SSE parsing; we do manual line parsing.
+        """
+        url = self.base_url + path
+        req = urllib.request.Request(url, method="GET", headers=self._headers({"Accept": "text/event-stream"}))
+        return urllib.request.urlopen(req, timeout=timeout_s)  # type: ignore[return-value]
+
+# ============================
+# Server lifecycle
+# ============================
+
+def _server_health(url_base: str, auth: HttpAuth | None) -> dict[str, Any] | None:
+    c = OpencodeHttpClient(url_base, auth=auth, timeout_s=2.0)
+    js = c.health()
+    if isinstance(js, dict) and js.get("healthy") is True:
+        return js
+    return None
+
+class _FileLock:
+    """
+    Minimal cross-platform advisory lock on a file.
+    - Unix: fcntl.flock
+    - Windows: msvcrt.locking
+    """
+    def __init__(self, path: Path):
+        self.path = path
+        self.fp = None
+
+    def __enter__(self) -> "_FileLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fp = open(self.path, "a+b")
+        if os.name == "nt":
+            import msvcrt  # type: ignore
+            # lock 1 byte
+            msvcrt.locking(self.fp.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl  # type: ignore
+            fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not self.fp:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt  # type: ignore
+                self.fp.seek(0)
+                msvcrt.locking(self.fp.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl  # type: ignore
+                fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
+        finally:
+            try:
+                self.fp.close()
+            except Exception:
+                pass
+            self.fp = None
 
 def ensure_server(
     *,
@@ -400,362 +470,217 @@ def ensure_server(
     port: int,
     wait_s: float,
     env: dict[str, str],
+    auth: HttpAuth | None,
 ) -> dict[str, Any]:
-    """Ensure a per-project opencode serve instance is running and healthy.
-
-    Uses /global/health to validate that the port really hosts an OpenCode server.
-    """
     st_path = _server_state_path(workdir)
     log_path = _server_log_path(workdir)
-    st_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _server_lock_path(workdir)
 
-    lock_path = _servers_dir() / f"{_project_key(workdir)}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    class _ServerLock:
-        def __init__(self, path: Path, timeout_s: float) -> None:
-            self.path = path
-            self.timeout_s = timeout_s
-            self.acquired = False
-
-        def __enter__(self) -> "_ServerLock":
-            deadline = time.monotonic() + max(0.0, float(self.timeout_s))
-            while True:
-                try:
-                    fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    try:
-                        os.write(fd, f"{os.getpid()} {_now_ms()}\n".encode("utf-8"))
-                    finally:
-                        os.close(fd)
-                    self.acquired = True
-                    return self
-                except FileExistsError:
-                    # Best-effort stale lock cleanup.
-                    try:
-                        age_s = time.time() - self.path.stat().st_mtime
-                        if age_s > 300:
-                            self.path.unlink()
-                            continue
-                    except Exception:
-                        pass
-                    if time.monotonic() >= deadline:
-                        return self
-                    time.sleep(0.05)
-
-        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-            if self.acquired:
-                with contextlib.suppress(Exception):
-                    self.path.unlink()
-
-    # Acquire a per-project lock so concurrent tasks don't race-start or clobber state.
-    with _ServerLock(lock_path, timeout_s=max(0.5, float(wait_s))) as lock:
-        if not lock.acquired:
-            # Another task is likely starting or reusing the server. Poll state until healthy.
-            deadline = time.monotonic() + max(0.1, float(wait_s))
-            while time.monotonic() < deadline:
-                st = _load_json(st_path) or {}
-                if isinstance(st, dict) and isinstance(st.get("url"), str):
-                    url = str(st["url"])
-                    health = _server_health(url, attempts=3, delay_s=0.25)
-                    if isinstance(health, dict) and health.get("healthy") is True:
-                        st["version"] = health.get("version")
-                        _write_json(st_path, st)
-                        return st
-                time.sleep(0.25)
-            raise RuntimeError(f"opencode serve lock busy and no healthy server observed: {st_path}")
-
-        # 1) Reuse if healthy.
+    with _FileLock(lock_path):
         st = _load_json(st_path) or {}
         if isinstance(st, dict) and isinstance(st.get("url"), str):
             url = str(st["url"])
-            health = _server_health(url, attempts=3, delay_s=0.25)
-            if isinstance(health, dict) and health.get("healthy") is True:
+            health = _server_health(url, auth)
+            if health:
                 st["version"] = health.get("version")
                 _write_json(st_path, st)
                 return st
 
-        # 2) If stale pid exists, try to kill.
-        try:
-            old_pid = int(st.get("pid") or 0)
-            if old_pid and _pid_looks_like_opencode(old_pid):
-                _kill_tree(old_pid)
-        except Exception:
-            pass
+        # Do NOT auto-kill a stale PID here.
+        # OpenCode may be running other work; killing aggressively can disrupt unrelated tasks.
 
-        # 3) Start new server (retry a few times when auto-picking a port).
-        port_auto = port == 0
-        attempts = 3 if port_auto else 1
-        last_err: Exception | None = None
-        proc: subprocess.Popen[Any] | None = None
-        health: dict[str, Any] | None = None
-        port_chosen: int | None = None
+        if port == 0:
+            port = _pick_free_port(hostname)
+
+        cmd = [opencode_bin, "serve", "--hostname", hostname, "--port", str(port)]
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fp = open(log_path, "ab", buffering=0)
 
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            # NOTE: Do NOT use DETACHED_PROCESS here; it can break stdout capture for some
-            # subprocess chains (notably `.cmd` shims), resulting in empty NDJSON output.
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+                | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
             popen_kwargs["creationflags"] = creationflags
         else:
             popen_kwargs["start_new_session"] = True
 
-        for _ in range(attempts):
-            port_chosen = _pick_free_port(hostname) if port_auto else int(port)
-            cmd = [opencode_bin, "serve", "--hostname", hostname, "--port", str(port_chosen)]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fp,
+            stderr=log_fp,
+            cwd=str(workdir),
+            env=env,
+            **popen_kwargs,
+        )
 
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_fp = open(log_path, "ab", buffering=0)
-            try:
-                server_cwd = _find_git_root(workdir)
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_fp,
-                    stderr=log_fp,
-                    cwd=str(server_cwd),
-                    env=env,
-                    **popen_kwargs,
-                )
-            except Exception as e:
-                last_err = e
-                with contextlib.suppress(Exception):
-                    log_fp.close()
-                proc = None
-                continue
-            finally:
-                # Close the parent's handle; the child keeps its own fd for logging.
-                with contextlib.suppress(Exception):
-                    log_fp.close()
-
-            url = f"http://{hostname}:{port_chosen}"
-            deadline = time.monotonic() + max(wait_s, 0.1)
-            health = None
-            while time.monotonic() < deadline:
-                health = _server_health(url, attempts=1)
-                if isinstance(health, dict) and health.get("healthy") is True:
-                    break
-                # If the child died quickly, don't wait the full timeout.
-                if proc is not None and not _pid_running(int(proc.pid)):
-                    break
-                time.sleep(0.25)
-
-            if isinstance(health, dict) and health.get("healthy") is True:
+        url = f"http://{hostname}:{port}"
+        deadline = time.monotonic() + max(wait_s, 0.1)
+        health: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            health = _server_health(url, auth)
+            if health:
                 break
+            time.sleep(0.25)
 
-            # Failed to become healthy; kill and retry on a new port (auto mode only).
-            if proc is not None:
-                with contextlib.suppress(Exception):
-                    _kill_tree(int(proc.pid))
-            proc = None
-            health = None
-
-        if not (isinstance(health, dict) and health.get("healthy") is True and proc is not None and port_chosen is not None):
-            if last_err is not None:
-                raise RuntimeError(f"opencode serve failed to start: {last_err}") from last_err
-            raise RuntimeError("opencode serve failed health check")
+        if not health:
+            try:
+                _kill_tree(proc.pid)
+            except Exception:
+                pass
+            raise RuntimeError(f"opencode serve failed health check: {url}")
 
         state = {
             "pid": proc.pid,
             "hostname": hostname,
-            "port": port_chosen,
-            "url": f"http://{hostname}:{port_chosen}",
+            "port": port,
+            "url": url,
             "startedAt": _now_ms(),
             "version": health.get("version"),
             "projectRoot": str(_find_git_root(workdir)),
-            "workdir": str(_find_git_root(workdir)),
             "logPath": str(log_path),
             "command": cmd,
         }
         _write_json(st_path, state)
         return state
 
+def attach_existing_server(
+    *,
+    workdir: Path,
+    auth: HttpAuth | None,
+) -> dict[str, Any] | None:
+    """
+    Attach to an already-running per-project server if we have state and it is healthy.
+    Never starts or kills processes.
+    """
+    st_path = _server_state_path(workdir)
+    lock_path = _server_lock_path(workdir)
+    with _FileLock(lock_path):
+        st = _load_json(st_path) or {}
+        if not (isinstance(st, dict) and isinstance(st.get("url"), str)):
+            return None
+        url = str(st["url"])
+        health = _server_health(url, auth)
+        if not health:
+            return None
+        st["version"] = health.get("version")
+        _write_json(st_path, st)
+        return st
+
+def stop_server(workdir: Path) -> dict[str, Any]:
+    st_path = _server_state_path(workdir)
+    st = _load_json(st_path) or {}
+    pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
+    ok = False
+    if pid and _pid_running(pid):
+        _kill_tree(pid)
+        ok = True
+    try:
+        st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return {"ok": ok, "pid": pid, "statePath": str(st_path)}
 
 # ============================
-# NDJSON aggregation
+# Event aggregation (CLI NDJSON)
 # ============================
 
-def _extract_text_from_message_content(content: Any) -> str | None:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                t = item.get("text")
-                if isinstance(t, str):
-                    parts.append(t)
-        joined = "".join(parts).strip()
-        return joined or None
-    return None
-
-
-def _extract_text(event: dict[str, Any]) -> str | None:
-    # Common direct fields.
-    for key in ("text", "delta", "content"):
-        val = event.get(key)
-        if isinstance(val, str) and val:
-            return val
-
-    # part: {type, text/delta/content, role?}
-    part = event.get("part")
-    if isinstance(part, dict):
-        for key in ("text", "delta", "content"):
-            val = part.get(key)
-            if isinstance(val, str) and val:
-                return val
-
-    # data payload.
-    data = event.get("data")
-    if isinstance(data, dict):
-        for key in ("text", "delta", "content"):
-            val = data.get(key)
-            if isinstance(val, str) and val:
-                return val
-
-    # message object.
-    msg = event.get("message")
-    if isinstance(msg, dict):
-        content = msg.get("content")
-        t = _extract_text_from_message_content(content)
-        if t:
-            return t
-
-    return None
-
-
-def _event_role(event: dict[str, Any]) -> str | None:
-    # Prefer explicit role.
-    role = event.get("role")
-    if isinstance(role, str) and role:
-        return role
-    part = event.get("part")
-    if isinstance(part, dict) and isinstance(part.get("role"), str):
-        return str(part.get("role"))
-    msg = event.get("message")
-    if isinstance(msg, dict) and isinstance(msg.get("role"), str):
-        return str(msg.get("role"))
-    return None
-
-
-class _Aggregator:
-    def __init__(self, *, text_sink: Any | None = None, tail_max_chars: int = 200_000) -> None:
-        self.session_id: str | None = None
-        self.error_event: dict[str, Any] | None = None
-        self.last_step_finish: dict[str, Any] | None = None
-        self.metrics: dict[str, Any] | None = None
-
-        self._text_sink = text_sink
-        self._tail_max_chars = max(1024, int(tail_max_chars))
-        self._tail: str = ""
+class _TailText:
+    def __init__(self, max_chars: int = 200_000):
+        self._max = max_chars
+        self._buf = ""
         self._lock = threading.Lock()
 
-    def _append_text(self, t: str) -> None:
+    def append(self, t: str) -> None:
         if not t:
             return
-        if self._text_sink is not None:
-            try:
-                self._text_sink.write(t)
-                # Flush aggressively: this is a long-running subprocess and we want partial text persisted.
-                self._text_sink.flush()
-            except Exception:
-                pass
-
-        self._tail += t
-        if len(self._tail) > self._tail_max_chars:
-            self._tail = self._tail[-self._tail_max_chars :]
-
-    def ingest(self, event: Any) -> None:
-        if not isinstance(event, dict):
-            return
-
         with self._lock:
-            sid = event.get("sessionID") or event.get("sessionId")
-            if isinstance(sid, str) and sid and not self.session_id:
-                self.session_id = sid
+            self._buf += t
+            if len(self._buf) > self._max:
+                self._buf = self._buf[-self._max :]
 
-            typ = event.get("type")
-            if typ == "error":
-                self.error_event = event
-                return
-
-            if typ in ("step-finish", "step_finish", "step-finished"):
-                self.last_step_finish = event
-                # best-effort metrics extraction
-                payload: Any = event.get("part") if isinstance(event.get("part"), dict) else event
-                if isinstance(payload, dict):
-                    tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else None
-                    self.metrics = {
-                        "reason": payload.get("reason"),
-                        "cost": payload.get("cost"),
-                        "tokens": tokens,
-                    }
-
-            # Collect assistant-facing text. Be conservative to avoid echoing prompt/tool logs.
-            role = _event_role(event)
-            if role and role != "assistant":
-                return
-
-            # Typical OpenCode NDJSON: type "text" with part.type "text".
-            part = event.get("part")
-            if isinstance(part, dict):
-                ptyp = part.get("type")
-                if ptyp in ("text", "delta"):
-                    t = _extract_text(event)
-                    if t:
-                        self._append_text(t)
-                    return
-
-            if typ in ("text", "delta", "assistant", "assistant-message", "message"):
-                t = _extract_text(event)
-                if t:
-                    self._append_text(t)
-
-    def full_text(self) -> str:
+    def get(self) -> str:
         with self._lock:
-            return self._tail
+            return self._buf
 
+def _extract_text_from_event(evt: dict[str, Any]) -> str | None:
+    # Best-effort for OpenCode event shapes.
+    for k in ("text", "delta", "content"):
+        v = evt.get(k)
+        if isinstance(v, str) and v:
+            return v
+    part = evt.get("part")
+    if isinstance(part, dict):
+        for k in ("text", "delta", "content"):
+            v = part.get(k)
+            if isinstance(v, str) and v:
+                return v
+    msg = evt.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, str) and content:
+            return content
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    chunks.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    chunks.append(str(item["text"]))
+            out = "".join(chunks).strip()
+            return out or None
+    data = evt.get("data")
+    if isinstance(data, dict):
+        for k in ("text", "delta", "content"):
+            v = data.get(k)
+            if isinstance(v, str) and v:
+                return v
+    return None
+
+@dataclass
+class RunOutcome:
+    ok: bool
+    exit_code: int
+    timed_out: bool
+    engine: str
+    fallback_from: str | None
+    session_id: str | None
+    full_text: str
+    metrics: dict[str, Any] | None
+    error: dict[str, Any] | None
 
 # ============================
-
 # Structured result extraction
 # ============================
 
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*({[\s\S]*?})\s*```", re.IGNORECASE)
-
-
-def _extract_last_json_object(text: str, *, max_scan_chars: int = 50_000) -> dict[str, Any] | None:
-    """Best-effort extraction of a JSON object from assistant text.
-
-    Strategy:
-    1) Prefer the last fenced block (```json ... ```).
-    2) Else, scan backwards for a '{' and attempt json.loads on slices.
-
-    This deliberately avoids being too strict; upstream should rely on adapter schema,
-    not the model's internal output.
+def _extract_structured_json(text: str, *, max_scan_chars: int = 80_000) -> dict[str, Any] | None:
+    """
+    Extraction order:
+    1) Sentinel block between BEGIN_OC_SUBTASK_JSON and END_OC_SUBTASK_JSON.
+    2) Last fenced JSON block.
+    3) Backward scan for a JSON object.
     """
     if not text:
         return None
 
-    # 0) Sentinel-wrapped payload.
-    begin_tag = "BEGIN_OC_SUBTASK_JSON"
-    end_tag = "END_OC_SUBTASK_JSON"
-    b = text.rfind(begin_tag)
+    # 1) Sentinel.
+    b = text.rfind(SENTINEL_BEGIN)
     if b != -1:
-        e = text.find(end_tag, b + len(begin_tag))
+        e = text.find(SENTINEL_END, b + len(SENTINEL_BEGIN))
         if e != -1:
-            payload = text[b + len(begin_tag) : e].strip()
-            if payload:
-                try:
-                    obj = json.loads(payload)
-                    if isinstance(obj, dict):
-                        return obj
-                except Exception:
-                    pass
+            payload = text[b + len(SENTINEL_BEGIN) : e].strip()
+            try:
+                obj = json.loads(payload)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
 
-    # 1) Fenced blocks.
-    blocks = _JSON_FENCE_RE.findall(text)
+    # 2) Fenced blocks.
+    blocks = JSON_FENCE_RE.findall(text)
     for blk in reversed(blocks):
         blk = blk.strip()
         if not blk:
@@ -767,197 +692,145 @@ def _extract_last_json_object(text: str, *, max_scan_chars: int = 50_000) -> dic
         except Exception:
             continue
 
-    # 2) Backward scan. Limit scan window.
+    # 3) Backward scan.
     window = text[-max_scan_chars:] if len(text) > max_scan_chars else text
-    # To avoid O(n^2) on huge strings, cap attempts.
-    attempts = 0
+    # scan back for '{'
     for i in range(len(window) - 1, -1, -1):
         if window[i] != "{":
             continue
-        attempts += 1
-        if attempts > 200:
-            break
-        candidate = window[i:].strip()
-        if len(candidate) > 30_000:
-            continue
-        # Try trimming trailing junk by cutting at the last '}'
-        j = candidate.rfind("}")
-        if j == -1:
-            continue
-        candidate2 = candidate[: j + 1]
+        candidate = window[i:]
+        # trim trailing noise
+        candidate = candidate.strip()
         try:
-            obj = json.loads(candidate2)
+            obj = json.loads(candidate)
             if isinstance(obj, dict):
                 return obj
         except Exception:
             continue
-
     return None
 
+def _default_contract_prompt() -> str:
+    return (
+        "\n\n"
+        "SUBTASK OUTPUT CONTRACT (strict):\n"
+        f"At the very end, output exactly:\n"
+        f"{SENTINEL_BEGIN}\n"
+        "{...one JSON object...}\n"
+        f"{SENTINEL_END}\n"
+        "No markdown, no code fences, no extra text after the END marker.\n"
+        "Schema:\n"
+        "{\n"
+        '  "summary": string (<= 800 chars),\n'
+        '  "evidence": string[] (each: "path:line - fact", <= 10 items),\n'
+        '  "changes": string[] (<= 10 items),\n'
+        '  "next_steps": string[] (<= 10 items)\n'
+        "}\n"
+        "If you cannot comply, output an object with empty arrays.\n"
+    )
 
 # ============================
-# Git patch capture
+# Git diff / status
 # ============================
 
-def _git_patch(workdir: Path, artifacts_dir: Path) -> tuple[str | None, list[str], list[str]]:
+def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
+    """
+    Returns:
+      changed_tracked: tracked files with changes (staged/unstaged)
+      untracked: untracked files
+    """
     if which("git") is None:
-        return None, [], []
-
+        return [], []
     try:
-        inside = (
-            subprocess.check_output(
-                ["git", "-C", str(workdir), "rev-parse", "--is-inside-work-tree"],
-                stderr=subprocess.DEVNULL,
-            )
-            .decode("utf-8", errors="replace")
-            .strip()
-        )
+        inside = subprocess.check_output(
+            ["git", "-C", str(workdir), "rev-parse", "--is-inside-work-tree"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace").strip()
         if inside != "true":
-            return None, [], []
+            return [], []
     except Exception:
-        return None, [], []
+        return [], []
 
-    changed: set[str] = set()
-    untracked: set[str] = set()
     try:
         raw = subprocess.check_output(
             ["git", "-C", str(workdir), "status", "--porcelain", "-z"],
             stderr=subprocess.DEVNULL,
         )
-        parts = raw.split(b"\0")
-        i = 0
-        while i < len(parts):
-            rec = parts[i]
-            i += 1
-            if not rec:
+        parts = raw.split(b"\x00")
+        changed: list[str] = []
+        untracked: list[str] = []
+        for entry in parts:
+            if not entry:
                 continue
-            if len(rec) < 3 or rec[2:3] != b" ":
-                continue
-            status = _decode_fs_path(rec[:2])
-            path = _decode_fs_path(rec[3:])
-            if status == "??":
-                if path:
-                    untracked.add(path)
-                continue
-            if path:
-                changed.add(path)
-            if "R" in status or "C" in status:
-                if i < len(parts):
-                    new_path = _decode_fs_path(parts[i])
-                    i += 1
-                    if new_path:
-                        changed.add(new_path)
-    except Exception:
-        pass
-
-    try:
-        chunks: list[str] = []
-        for argv in (["git", "-C", str(workdir), "diff", "--cached"], ["git", "-C", str(workdir), "diff"]):
             try:
-                diff = subprocess.check_output(argv, stderr=subprocess.DEVNULL).decode("utf-8", errors="replace")
-                if diff.strip():
-                    chunks.append(diff)
+                line = entry.decode("utf-8", errors="replace")
             except Exception:
                 continue
-        combined = "".join(chunks)
-        if combined.strip():
-            p = artifacts_dir / "changes.patch"
-            _write_text(p, combined)
-            return str(p), sorted(changed), sorted(untracked)
+            if len(line) < 4:
+                continue
+            code = line[:2]
+            path = line[3:]
+            if code == "??":
+                untracked.append(path)
+            else:
+                changed.append(path)
+        return sorted(set(changed)), sorted(set(untracked))
     except Exception:
-        pass
-
-    return None, sorted(changed), sorted(untracked)
-
-
-def _artifact_size_guard(artifacts_dir: Path, max_bytes: int) -> dict[str, Any] | None:
-    if max_bytes <= 0:
-        return None
-
-    offenders: list[dict[str, Any]] = []
-    for name in ("events.ndjson", "assistant.txt", "stderr.log", "wrapper.log"):
-        p = artifacts_dir / name
-        if not p.exists():
-            continue
+        # fallback
         try:
-            size = int(p.stat().st_size)
+            names = subprocess.check_output(
+                ["git", "-C", str(workdir), "diff", "--name-only"],
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="replace")
+            changed = [x.strip() for x in names.splitlines() if x.strip()]
+            return sorted(set(changed)), []
         except Exception:
-            continue
-        if size > max_bytes:
-            offenders.append({"path": name, "bytes": size})
+            return [], []
 
-    if not offenders:
+def _git_patch(workdir: Path, artifacts_dir: Path) -> str | None:
+    if which("git") is None:
+        return None
+    try:
+        diff = subprocess.check_output(
+            ["git", "-C", str(workdir), "diff"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        if not diff.strip():
+            return None
+        p = artifacts_dir / "changes.patch"
+        _write_text(p, diff)
+        return p.name
+    except Exception:
         return None
 
+# ============================
+# Output objects (stable contract)
+# ============================
+
+def _artifacts_obj(
+    *,
+    dir_path: Path,
+    job_path: Path,
+    finish_path: Path,
+    prompt_path: Path,
+    events_path: Path | None,
+    stderr_path: Path | None,
+    assistant_path: Path | None,
+    wrapper_log_path: Path | None,
+    result_path: Path | None,
+    patch_path: str | None,
+) -> dict[str, Any]:
     return {
-        "name": "OutputTooLarge",
-        "message": f"artifact exceeded max bytes ({max_bytes})",
-        "maxBytes": int(max_bytes),
-        "files": offenders,
+        "dir": str(dir_path),
+        "jobPath": job_path.name,
+        "finishPath": finish_path.name,
+        "promptPath": prompt_path.name,
+        "eventsPath": events_path.name if events_path else None,
+        "stderrPath": stderr_path.name if stderr_path else None,
+        "assistantPath": assistant_path.name if assistant_path else None,
+        "wrapperLogPath": wrapper_log_path.name if wrapper_log_path else None,
+        "resultPath": result_path.name if result_path else None,
+        "patchPath": patch_path,
     }
-
-
-# ============================
-# Permission presets (optional)
-# ============================
-
-
-def _permission_noninteractive_preset() -> dict[str, Any]:
-    """A safe-ish preset that avoids interactive 'ask' deadlocks.
-
-    Based on OpenCode docs: default permissions are permissive, but external_directory
-    and doom_loop often require confirmation. In non-interactive mode, we prefer
-    deterministic deny instead of hanging.
-
-    Note: This is a best-effort adapter policy; users may override.
-    """
-    return {
-        "edit": "allow",
-        "bash": "allow",
-        "webfetch": "allow",
-        "mcp": "allow",
-        "write": "allow",
-        "task": "deny",
-        "skill": "deny",
-        "read": {
-            "*": "allow",
-            "*.env": "deny",
-            "*.env.*": "deny",
-            "*.env.example": "allow",
-        },
-        "external_directory": "deny",
-        "doom_loop": "deny",
-    }
-
-
-def _apply_permission_mode(env: dict[str, str], mode: str) -> None:
-    if mode == "inherit":
-        return
-    if mode == "allow":
-        # Override any inherited/broken value to ensure a deterministic boundary.
-        # NOTE: Use an object form here (not a bare string), because `opencode serve`
-        # + `opencode run --attach` can fail with "Session not found" when
-        # OPENCODE_PERMISSION is set to the string "allow" on Windows.
-        env["OPENCODE_PERMISSION"] = json.dumps({"*": "allow"})
-        return
-    if mode == "noninteractive":
-        # Override any inherited/broken value to ensure a deterministic boundary.
-        env["OPENCODE_PERMISSION"] = json.dumps(_permission_noninteractive_preset())
-        return
-    raise ValueError(f"Unknown permission mode: {mode}")
-
-
-# ============================
-# Stable output builders
-# ============================
-
-
-def _artifacts_obj(**paths: str | None) -> dict[str, Any]:
-    obj: dict[str, Any] = {}
-    for k, v in paths.items():
-        obj[k] = v
-    return obj
-
 
 def _finish_obj(
     *,
@@ -966,15 +839,17 @@ def _finish_obj(
     timed_out: bool,
     run_id: str,
     workdir: Path,
+    engine: str,
+    fallback_from: str | None,
+    server: dict[str, Any] | None,
     session_id: str | None,
     summary: str,
-    truncated: bool,
-    result: dict[str, Any] | None,
+    summary_truncated: bool,
+    result_digest: str | None,
     changed_files: list[str],
     untracked_files: list[str],
     artifacts_dir: Path,
     artifacts: dict[str, Any],
-    server: dict[str, Any] | None,
     metrics: dict[str, Any] | None,
     error: dict[str, Any] | None,
     include_debug: bool,
@@ -989,54 +864,25 @@ def _finish_obj(
         "timedOut": timed_out,
         "runId": run_id,
         "workdir": str(workdir),
+        "engine": {"selected": engine, "fallbackFrom": fallback_from},
         "sessionId": session_id,
         "summary": summary,
-        "summaryTruncated": truncated,
-        "result": result,
+        "summaryTruncated": summary_truncated,
+        "resultDigest": result_digest,
         "changedFiles": changed_files,
         "untrackedFiles": untracked_files,
-        "artifacts": {"dir": str(artifacts_dir), **artifacts},
-        "server": (
-            {
-                "url": (server or {}).get("url"),
-                "version": (server or {}).get("version"),
-                "logPath": (server or {}).get("logPath"),
-            }
-            if server
-            else None
-        ),
+        "artifacts": artifacts,
+        "server": {
+            "url": (server or {}).get("url"),
+            "version": (server or {}).get("version"),
+            "logPath": (server or {}).get("logPath"),
+        } if server else None,
         "metrics": metrics,
         "error": error,
     }
     if include_debug and isinstance(debug, dict):
         obj["debug"] = debug
     return obj
-
-
-def _status_obj(
-    *,
-    run_id: str,
-    status: str,
-    workdir: Path | None,
-    pid: int | None,
-    artifacts_dir: Path,
-    artifacts: dict[str, Any],
-    progress: dict[str, Any] | None,
-    error: dict[str, Any] | None,
-) -> dict[str, Any]:
-    return {
-        "type": "opencode-subtask-status",
-        "schemaVersion": ADAPTER_SCHEMA_VERSION,
-        "timestamp": _now_ms(),
-        "runId": run_id,
-        "status": status,
-        "pid": pid,
-        "workdir": str(workdir) if workdir else None,
-        "artifacts": {"dir": str(artifacts_dir), **artifacts},
-        "progress": progress,
-        "error": error,
-    }
-
 
 def _start_obj(
     *,
@@ -1050,274 +896,150 @@ def _start_obj(
         "type": "opencode-subtask-start",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "timestamp": _now_ms(),
+        "ok": True,
         "runId": run_id,
         "pid": pid,
         "workdir": str(workdir),
-        "artifacts": {"dir": str(artifacts_dir), **artifacts},
+        "artifacts": artifacts,
     }
 
-
-# ============================
-# Commands
-# ============================
-
-
-def cmd_ensure_server(args: argparse.Namespace) -> int:
-    workdir = Path(args.workdir).expanduser().resolve()
-    opencode_bin = _resolve_executable(args.opencode)
-    if not opencode_bin:
-        out = {
-            "type": "opencode-subtask-server",
-            "schemaVersion": ADAPTER_SCHEMA_VERSION,
-            "timestamp": _now_ms(),
-            "ok": False,
-            "error": {
-                "name": "OpencodeNotFound",
-                "message": f"Could not find opencode executable: {args.opencode}",
-            },
-        }
-        sys.stdout.write(_json_line(out) + "\n")
-        return 127
-
-    env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
-    if args.disable_claude_code:
-        env.setdefault("OPENCODE_DISABLE_CLAUDE_CODE", "1")
-
-    try:
-        st = ensure_server(
-            opencode_bin=opencode_bin,
-            workdir=workdir,
-            hostname=args.server_hostname,
-            port=args.server_port,
-            wait_s=args.server_wait,
-            env=env,
-        )
-        out = {
-            "type": "opencode-subtask-server",
-            "schemaVersion": ADAPTER_SCHEMA_VERSION,
-            "timestamp": _now_ms(),
-            "ok": True,
-            "server": {
-                "url": st.get("url"),
-                "version": st.get("version"),
-                "pid": st.get("pid"),
-                "logPath": st.get("logPath"),
-            },
-        }
-        sys.stdout.write(_json_line(out) + "\n")
-        return 0
-    except Exception as e:
-        out = {
-            "type": "opencode-subtask-server",
-            "schemaVersion": ADAPTER_SCHEMA_VERSION,
-            "timestamp": _now_ms(),
-            "ok": False,
-            "error": {"name": type(e).__name__, "message": str(e)},
-        }
-        sys.stdout.write(_json_line(out) + "\n")
-        return 1
-
-
-def cmd_stop_server(args: argparse.Namespace) -> int:
-    workdir = Path(args.workdir).expanduser().resolve()
-    st_path = _server_state_path(workdir)
-    st = _load_json(st_path) or {}
-
-    pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
-    ok = False
-    if pid and _pid_running(pid):
-        try:
-            _kill_tree(pid)
-            ok = True
-        except Exception:
-            ok = False
-
-    try:
-        if st_path.exists():
-            st_path.unlink()
-    except Exception:
-        pass
-
-    out = {
-        "type": "opencode-subtask-server-stop",
+def _status_obj(
+    *,
+    run_id: str,
+    status: str,
+    pid: int | None,
+    workdir: str | None,
+    artifacts_dir: Path,
+    artifacts: dict[str, Any],
+    progress: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": "opencode-subtask-status",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "timestamp": _now_ms(),
-        "ok": ok,
-        "pid": pid or None,
+        "runId": run_id,
+        "status": status,
+        "pid": pid,
+        "workdir": workdir,
+        "artifacts": artifacts,
+        "progress": progress,
+        "error": error,
     }
-    sys.stdout.write(_json_line(out) + "\n")
-    return 0 if ok else 1
 
+# ============================
+# Permission mode
+# ============================
 
-def _resolve_artifacts_dir(run_id: str | None, artifacts_dir: str | None) -> tuple[str, Path]:
-    if artifacts_dir:
-        ad = Path(artifacts_dir).expanduser().resolve()
-        rid = run_id or ad.name
-        return rid, ad
-    rid = run_id or _make_run_id()
-    ad = _runs_dir() / rid
-    return rid, ad
+def _apply_permission_mode(env: dict[str, str], mode: str) -> None:
+    """
+    CLI env mode:
+      - inherit: no override
+      - allow: OPENCODE_PERMISSION={"*":"allow"}
+      - noninteractive: OPENCODE_PERMISSION=<no-ask preset> (deny some risky classes; avoid hangs)
+    """
+    if mode == "inherit":
+        return
+    if mode == "allow":
+        env["OPENCODE_PERMISSION"] = json.dumps({"*": "allow"})
+    elif mode == "noninteractive":
+        # "noninteractive" means: do not hang on ask prompts; prefer deterministic allow/deny.
+        # Keep this preset conservative but usable.
+        env["OPENCODE_PERMISSION"] = json.dumps(
+            {
+                "*": "allow",
+                "task": "deny",
+                "skill": "deny",
+                "external_directory": "deny",
+                "doom_loop": "deny",
+                "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+            }
+        )
+    else:
+        env["OPENCODE_PERMISSION"] = mode
 
-
-def _write_job_state(job_path: Path, state: str, extra: dict[str, Any] | None = None) -> None:
-    obj = _load_json(job_path) or {}
-    if not isinstance(obj, dict):
-        obj = {}
-    obj["state"] = state
-    obj["updatedAt"] = _now_ms()
-    if isinstance(extra, dict):
-        obj.update(extra)
-    _write_json(job_path, obj)
-
-
-def _read_job_pid(job_path: Path) -> int | None:
-    obj = _load_json(job_path)
-    if not isinstance(obj, dict):
-        return None
-    pid = obj.get("pid")
-    if isinstance(pid, int):
-        return pid
-    if isinstance(pid, str) and pid.isdigit():
-        return int(pid)
+def _get_http_auth_from_env(env: dict[str, str]) -> HttpAuth | None:
+    # Server docs: OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD for Basic Auth.
+    u = env.get("OPENCODE_SERVER_USERNAME")
+    p = env.get("OPENCODE_SERVER_PASSWORD")
+    if u and p:
+        return HttpAuth(username=u, password=p)
     return None
 
+# ============================
+# Engines
+# ============================
 
-def _default_contract_prompt() -> str:
-    # Keep it short and mechanical.
-    return (
-        "\n\n"
-        "EXECUTION RULES (avoid wasted time):\n"
-        "- Treat any prompt 'facts' as hypotheses; verify key ones quickly.\n"
-        "- Do not invent flags/paths/files; only reference paths you can `read`/`glob`.\n"
-        "- Do not assume labels/IDs map to filesystem paths unless verified.\n"
-        "- Prefer `rg`/`glob`/`read` over long shell pipelines.\n"
-        "- Keep diffs minimal; do not create extra files unless asked.\n"
-        "- If blocked by environment or contradictions, output JSON with summary starting \"BLOCKED:\".\n"
-        "\n"
-        "SUBTASK OUTPUT CONTRACT (strict):\n"
-        "Return your FINAL answer wrapped by these exact sentinel lines:\n"
-        "BEGIN_OC_SUBTASK_JSON\n"
-        "<one JSON object>\n"
-        "END_OC_SUBTASK_JSON\n"
-        "No other text outside the sentinels.\n"
-        "Schema:\n"
-        "{\n"
-        "  \"summary\": string (<= 800 chars),\n"
-        "  \"evidence\": string[] (each item: \"path:line - fact\", <= 10 items),\n"
-        "  \"changes\": string[] (what you changed, <= 10 items),\n"
-        "  \"next_steps\": string[] (<= 10 items)\n"
-        "}\n"
-        "If you cannot comply, output a minimal object with empty arrays, still wrapped in sentinels.\n"
-        "Keep it concise.\n"
-    )
-
-
-def _blocked_reason_looks_like_ruleset_config_error(blocked_reason: str) -> bool:
-    s = blocked_reason.lower()
-    return ("ruleset" in s) and (
-        ("invalid_value" in s)
-        or ("validation" in s)
-        or ("configuration" in s)
-        or ("invalid" in s)
-        or ("expected allow|deny|ask" in s)
-        or ("expected allow/deny/ask" in s)
-        or ("allow|deny|ask" in s)
-    )
-
-
-def _rotate_attempt_artifacts(artifacts_dir: Path, attempt: int) -> dict[str, str]:
-    """Rename attempt artifacts to preserve them before a retry.
-
-    Returns a map of {old_name: new_name} for files that were moved.
-    """
-
-    moved: dict[str, str] = {}
-
-    def move(name: str) -> None:
-        src = artifacts_dir / name
-        if not src.exists():
-            return
-        base = f"{name}.attempt{attempt}"
-        dst = artifacts_dir / base
-        if dst.exists():
-            for i in range(2, 50):
-                cand = artifacts_dir / f"{base}.{i}"
-                if not cand.exists():
-                    dst = cand
-                    break
+def _enforce_artifact_cap(paths: Iterable[Path], max_bytes: int) -> tuple[bool, str | None]:
+    if max_bytes <= 0:
+        return True, None
+    for p in paths:
         try:
-            src.replace(dst)
-            moved[name] = dst.name
+            if p.exists() and p.stat().st_size > max_bytes:
+                return False, p.name
         except Exception:
-            # Best-effort; failing to rotate shouldn't prevent a retry.
-            return
+            continue
+    return True, None
 
-    # Files produced by opencode runs and wrapper post-processing.
-    move("events.ndjson")
-    move("assistant.txt")
-    move("stderr.log")
-    move("result.json")
-    move("changes.patch")
-
-    return moved
-
-
-def _run_opencode_process(
+def _run_cli(
     *,
-    cmd: list[str],
+    opencode_bin: str,
     workdir: Path,
     env: dict[str, str],
-    artifacts_dir: Path,
-    events_path: Path | None,
-    assistant_path: Path | None,
-    stderr_path: Path,
-    job_path: Path,
-    quiet: bool,
+    attach_url: str | None,
+    prompt_path: Path,
+    continue_last: bool,
+    session_id: str | None,
+    title: str | None,
+    agent: str | None,
+    model: str | None,
+    variant: str | None,
+    files: list[str],
     timeout_s: float,
+    quiet: bool,
+    save_events: bool,
+    save_text: bool,
     max_artifact_bytes: int,
-) -> tuple[_Aggregator | None, str, int, bool, dict[str, Any] | None, dict[str, Any] | None]:
-    """Run opencode and capture NDJSON/text to artifacts.
+    events_path: Path | None,
+    stderr_path: Path,
+    assistant_path: Path | None,
+    on_session_id: Any | None,
+) -> RunOutcome:
+    cmd: list[str] = [opencode_bin, "run", "--format", "json"]
+    if attach_url:
+        cmd.extend(["--attach", attach_url])
+    if continue_last:
+        cmd.append("--continue")
+    if session_id:
+        cmd.extend(["--session", session_id])
+    if title:
+        cmd.extend(["--title", title])
+    if agent:
+        cmd.extend(["--agent", agent])
+    if model:
+        cmd.extend(["--model", model])
+    if variant:
+        cmd.extend(["--variant", variant])
+    for f in files:
+        cmd.extend(["--file", f])
+    # Always attach the prompt as a file; avoid shell quoting issues.
+    cmd.extend(["--file", str(prompt_path)])
+    cmd.append("--")
+    cmd.append("Follow the instructions in the attached prompt.txt.")
 
-    Returns: (aggregator|None, full_text, exit_code, timed_out, output_too_large_error, fatal_error)
-    """
+    events_fp = open(events_path, "ab", buffering=0) if (save_events and events_path) else None
+    assistant_fp = open(assistant_path, "ab", buffering=0) if (save_text and assistant_path) else None
+    stderr_fp = open(stderr_path, "ab", buffering=0)
 
-    assistant_fp = None
-    if assistant_path:
-        try:
-            assistant_fp = open(assistant_path, "w", encoding="utf-8")
-        except Exception:
-            assistant_fp = None
-
-    agg = _Aggregator(text_sink=assistant_fp)
-    timed_out = False
-
-    events_fp = None
-    stderr_fp = None
-    try:
-        events_fp = open(events_path, "ab", buffering=0) if events_path else None
-        stderr_fp = open(stderr_path, "ab", buffering=0)
-    except Exception as e:
-        with contextlib.suppress(Exception):
-            if events_fp:
-                events_fp.close()
-        with contextlib.suppress(Exception):
-            if stderr_fp:
-                stderr_fp.close()
-        with contextlib.suppress(Exception):
-            if assistant_fp:
-                assistant_fp.close()
-        return None, "", 1, False, None, {"name": "ArtifactOpenError", "message": str(e)}
+    tail = _TailText()
+    session_id: str | None = None
+    error_event: dict[str, Any] | None = None
+    metrics: dict[str, Any] | None = None
 
     try:
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            # NOTE: Do NOT use DETACHED_PROCESS here; it can break stdout capture for some
-            # subprocess chains (notably `.cmd` shims), resulting in empty NDJSON output.
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-            popen_kwargs["creationflags"] = creationflags
-        else:
-            popen_kwargs["start_new_session"] = True
-
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = subprocess.Popen(
             cmd,
             cwd=str(workdir),
@@ -1327,155 +1049,484 @@ def _run_opencode_process(
             env=env,
             **popen_kwargs,
         )
-        _write_job_state(job_path, "running", {"opencodePid": proc.pid})
     except Exception as e:
-        with contextlib.suppress(Exception):
-            if events_fp:
-                events_fp.close()
-        with contextlib.suppress(Exception):
-            if stderr_fp:
-                stderr_fp.close()
-        with contextlib.suppress(Exception):
-            if assistant_fp:
-                assistant_fp.close()
-        return None, "", 127, False, None, {"name": type(e).__name__, "message": str(e)}
+        if events_fp:
+            events_fp.close()
+        if assistant_fp:
+            assistant_fp.close()
+        stderr_fp.close()
+        return RunOutcome(
+            ok=False,
+            exit_code=127,
+            timed_out=False,
+            engine="cli",
+            fallback_from=None,
+            session_id=None,
+            full_text="",
+            metrics=None,
+            error={"name": type(e).__name__, "message": str(e)},
+        )
+
+    timed_out = False
+    killed_for_size = False
+    killed_file: str | None = None
 
     def reader() -> None:
+        nonlocal session_id, error_event, metrics, killed_for_size, killed_file
         assert proc.stdout is not None
         for raw in iter(proc.stdout.readline, b""):
             if not raw:
                 break
+            # Write events log
             if events_fp:
                 try:
                     events_fp.write(raw)
                 except Exception:
                     pass
             if not quiet:
-                # debugging only: forward raw NDJSON
                 try:
-                    sys.stderr.buffer.write(raw)
-                    sys.stderr.buffer.flush()
+                    sys.stdout.buffer.write(raw)
+                    sys.stdout.buffer.flush()
                 except Exception:
                     pass
+            # Parse JSON event
             try:
                 evt = json.loads(raw.decode("utf-8", errors="replace"))
             except Exception:
                 continue
-            agg.ingest(evt)
+            if not isinstance(evt, dict):
+                continue
+            sid = evt.get("sessionID") or evt.get("sessionId")
+            if isinstance(sid, str) and sid and not session_id:
+                session_id = sid
+                if on_session_id:
+                    try:
+                        on_session_id(session_id)
+                    except Exception:
+                        pass
+            if evt.get("type") == "error":
+                error_event = evt
+            # Metrics from step-finish-ish events (best-effort)
+            if evt.get("type") in ("step-finish", "step_finish", "step-finished"):
+                part = evt.get("part") if isinstance(evt.get("part"), dict) else evt
+                if isinstance(part, dict):
+                    tok = part.get("tokens") if isinstance(part.get("tokens"), dict) else None
+                    metrics = {"reason": part.get("reason"), "cost": part.get("cost"), "tokens": tok}
+            # Collect assistant-ish text
+            t = _extract_text_from_event(evt)
+            if isinstance(t, str) and t:
+                tail.append(t)
+                if assistant_fp:
+                    try:
+                        assistant_fp.write(t.encode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+            # Artifact cap: check during streaming (events/stderr/assistant)
+            ok_cap, which_file = _enforce_artifact_cap(
+                [p for p in [events_path, stderr_path, assistant_path] if p],
+                max_artifact_bytes,
+            )
+            if not ok_cap and which_file:
+                killed_for_size = True
+                killed_file = which_file
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
 
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
 
-    output_too_large_error: dict[str, Any] | None = None
-    deadline: float | None = None
-    if float(timeout_s) > 0:
-        deadline = time.monotonic() + float(timeout_s)
-
-    while True:
-        if proc.poll() is not None:
-            break
-
-        # Guardrail: prevent runaway stdout/stderr/events from consuming disk/time.
-        output_too_large_error = _artifact_size_guard(artifacts_dir, int(max_artifact_bytes))
-        if output_too_large_error is not None:
-            try:
-                _kill_tree(proc.pid)
-            except Exception:
-                pass
-            break
-
-        if deadline is not None and time.monotonic() >= deadline:
-            timed_out = True
-            try:
-                _kill_tree(proc.pid)
-            except Exception:
-                pass
-            break
-
-        time.sleep(0.25)
-
-    if timed_out or output_too_large_error is not None:
-        with contextlib.suppress(Exception):
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
             proc.wait(timeout=5)
+        except Exception:
+            pass
 
-    t.join(timeout=5)
+    th.join(timeout=5)
 
     if events_fp:
         events_fp.close()
-    stderr_fp.close()
     if assistant_fp:
-        with contextlib.suppress(Exception):
+        assistant_fp.close()
+    stderr_fp.close()
+
+    exit_code = proc.returncode if proc.returncode is not None else 1
+    full_text = tail.get()
+
+    ok = (not timed_out) and (not killed_for_size) and exit_code == 0 and error_event is None
+
+    err: dict[str, Any] | None = None
+    if not ok:
+        if killed_for_size:
+            err = {"name": "OutputTooLarge", "message": f"artifact {killed_file} exceeded max-artifact-bytes={max_artifact_bytes}"}
+        elif timed_out:
+            err = {"name": "Timeout", "message": f"opencode run exceeded timeout={timeout_s}s"}
+        elif error_event:
+            err = {"name": "OpencodeErrorEvent", "message": json.dumps(error_event, ensure_ascii=False)[:5000]}
+        else:
+            err = {"name": "NonZeroExit", "message": f"opencode exit_code={exit_code}"}
+
+    return RunOutcome(
+        ok=ok,
+        exit_code=exit_code,
+        timed_out=timed_out,
+        engine="cli",
+        fallback_from=None,
+        session_id=session_id,
+        full_text=full_text,
+        metrics=metrics,
+        error=err,
+    )
+
+def _extract_text_from_message_obj(msg: dict[str, Any]) -> str:
+    # /message response is documented as Message, typically has parts[]
+    parts = msg.get("parts")
+    if isinstance(parts, list):
+        out: list[str] = []
+        for p in parts:
+            if isinstance(p, dict):
+                if p.get("type") == "text" and isinstance(p.get("text"), str):
+                    out.append(p["text"])
+                # tolerate other shapes
+                elif isinstance(p.get("text"), str):
+                    out.append(p["text"])
+                elif isinstance(p.get("content"), str):
+                    out.append(p["content"])
+            elif isinstance(p, str):
+                out.append(p)
+        return "".join(out)
+    # fallback
+    if isinstance(msg.get("text"), str):
+        return str(msg["text"])
+    return json.dumps(msg, ensure_ascii=False)
+
+def _run_http(
+    *,
+    server_url: str,
+    workdir: Path,
+    env: dict[str, str],
+    prompt: str,
+    agent: str | None,
+    model: str | None,
+    variant: str | None,
+    timeout_s: float,
+    save_events: bool,
+    save_text: bool,
+    max_artifact_bytes: int,
+    events_path: Path | None,
+    stderr_path: Path,
+    assistant_path: Path | None,
+    permission_mode: str,
+    include_debug: bool,
+    on_session_id: Any | None,
+) -> RunOutcome:
+    auth = _get_http_auth_from_env(env)
+    client = OpencodeHttpClient(server_url, auth=auth, timeout_s=10.0)
+
+    # Verify server health (fast) but don't fail hard; we'll report.
+    health = client.health()
+    if not (isinstance(health, dict) and health.get("healthy") is True):
+        return RunOutcome(
+            ok=False,
+            exit_code=2,
+            timed_out=False,
+            engine="http",
+            fallback_from=None,
+            session_id=None,
+            full_text="",
+            metrics=None,
+            error={"name": "ServerUnhealthy", "message": f"/global/health not healthy for {server_url}"},
+        )
+
+    events_fp = open(events_path, "ab", buffering=0) if (save_events and events_path) else None
+    assistant_fp = open(assistant_path, "ab", buffering=0) if (save_text and assistant_path) else None
+    stderr_fp = open(stderr_path, "ab", buffering=0)
+
+    responded_permissions: set[str] = set()
+    stop_evt = threading.Event()
+    sse_connected = threading.Event()
+    sse_open_error: list[str] = []
+
+    def maybe_permission_id(evt: dict[str, Any]) -> str | None:
+        # Heuristic extraction: permissionID / permissionId / permission.id / data.permission.id
+        for k in ("permissionID", "permissionId"):
+            v = evt.get(k)
+            if isinstance(v, str) and v:
+                return v
+        perm = evt.get("permission")
+        if isinstance(perm, dict):
+            v = perm.get("id") or perm.get("permissionID") or perm.get("permissionId")
+            if isinstance(v, str) and v:
+                return v
+        data = evt.get("data")
+        if isinstance(data, dict):
+            perm2 = data.get("permission")
+            if isinstance(perm2, dict):
+                v = perm2.get("id") or perm2.get("permissionID") or perm2.get("permissionId")
+                if isinstance(v, str) and v:
+                    return v
+        return None
+
+    def sse_worker(session_id: str) -> None:
+        nonlocal responded_permissions
+        # Prefer /event; if unavailable, try /global/event.
+        paths = ["/event", "/global/event"]
+        resp = None
+        last_open_err: str | None = None
+
+        for p in paths:
+            try:
+                # Use a small socket timeout so we can periodically check stop_evt.
+                resp = client.open_sse(p, timeout_s=2.0)
+                sse_connected.set()
+                break
+            except Exception as e:
+                last_open_err = str(e)
+                resp = None
+
+        if resp is None:
+            if last_open_err:
+                sse_open_error.append(last_open_err)
+            return
+
+        data_lines: list[str] = []
+        try:
+            while not stop_evt.is_set():
+                try:
+                    line = resp.readline()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+
+                if not line:
+                    break  # EOF
+
+                try:
+                    s = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                except Exception:
+                    continue
+
+                if s.startswith(":"):
+                    # comment/keepalive
+                    continue
+
+                if s == "":
+                    # end of event
+                    if not data_lines:
+                        continue
+                    payload = "\n".join(data_lines).strip()
+                    data_lines.clear()
+                    if not payload:
+                        continue
+                    try:
+                        evt = json.loads(payload)
+                    except Exception:
+                        continue
+                    if not isinstance(evt, dict):
+                        continue
+
+                    # Filter by sessionID when present; keep server.connected even without sessionID.
+                    sid = evt.get("sessionID") or evt.get("sessionId")
+                    if isinstance(sid, str) and sid and sid != session_id:
+                        continue
+                    if not sid and evt.get("type") not in ("server.connected", "server_connected"):
+                        continue
+
+                    # Write NDJSON
+                    if events_fp:
+                        try:
+                            events_fp.write((json.dumps(evt, ensure_ascii=False) + "\n").encode("utf-8"))
+                        except Exception:
+                            pass
+
+                    # Auto permission replies (best-effort)
+                    if permission_mode in ("allow", "noninteractive"):
+                        et = evt.get("type")
+                        if isinstance(et, str) and "permission" in et:
+                            pid = maybe_permission_id(evt)
+                            if pid and pid not in responded_permissions:
+                                responded_permissions.add(pid)
+                                client.reply_permission(
+                                    session_id,
+                                    pid,
+                                    response=("allow" if permission_mode == "allow" else "deny"),
+                                    remember=False,
+                                )
+
+                    # Artifact cap
+                    ok_cap, which_file = _enforce_artifact_cap(
+                        [p for p in [events_path, stderr_path, assistant_path] if p],
+                        max_artifact_bytes,
+                    )
+                    if not ok_cap and which_file:
+                        try:
+                            stderr_fp.write(f"OutputTooLarge: {which_file}\n".encode("utf-8"))
+                            stderr_fp.flush()
+                        except Exception:
+                            pass
+                        stop_evt.set()
+                        break
+
+                    continue  # done processing one event
+
+                if s.startswith("data:"):
+                    data_lines.append(s[5:].lstrip())
+                else:
+                    # ignore other SSE fields (event:, id:, retry:)
+                    continue
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    session: dict[str, Any] | None = None
+    session_id: str | None = None
+    try:
+        session = client.create_session()
+        sid = session.get("id") if isinstance(session.get("id"), str) else None
+        if not sid:
+            raise RuntimeError("Session created but missing id")
+        session_id = sid
+        if on_session_id:
+            try:
+                on_session_id(session_id)
+            except Exception:
+                pass
+    except Exception as e:
+        if events_fp:
+            events_fp.close()
+        if assistant_fp:
             assistant_fp.close()
+        stderr_fp.write((str(e) + "\n").encode("utf-8", errors="replace"))
+        stderr_fp.close()
+        return RunOutcome(
+            ok=False,
+            exit_code=2,
+            timed_out=False,
+            engine="http",
+            fallback_from=None,
+            session_id=None,
+            full_text="",
+            metrics=None,
+            error={"name": "SessionCreateFailed", "message": str(e)},
+        )
 
-    # Final size guard after file handles are closed/drained (covers cases where the
-    # process exits between polling ticks, producing a large final burst of output).
-    output_too_large_error = output_too_large_error or _artifact_size_guard(artifacts_dir, int(max_artifact_bytes))
+    # Start SSE thread (for diagnostics and auto-permissions).
+    t = threading.Thread(target=sse_worker, args=(session_id,), daemon=True)
+    t.start()
+    # Require SSE when saving events and/or when we must auto-handle permissions.
+    if not sse_connected.wait(timeout=2.0):
+        if save_events or permission_mode in ("allow", "noninteractive"):
+            client.abort(session_id)
+            stop_evt.set()
+            if events_fp:
+                events_fp.close()
+            if assistant_fp:
+                assistant_fp.close()
+            stderr_fp.write(("SSE unavailable; cannot stream events for diagnostics/permissions.\n").encode("utf-8"))
+            stderr_fp.close()
+            return RunOutcome(
+                ok=False,
+                exit_code=2,
+                timed_out=False,
+                engine="http",
+                fallback_from=None,
+                session_id=session_id,
+                full_text="",
+                metrics=None,
+                error={"name": "SseUnavailable", "message": (sse_open_error[-1] if sse_open_error else "SSE stream not connected")},
+            )
 
-    exit_code = int(proc.returncode or 0)
+    timed_out = False
+    err: dict[str, Any] | None = None
+    msg_obj: dict[str, Any] | None = None
 
-    full_text = agg.full_text()
-    if assistant_path and assistant_fp is None:
-        with contextlib.suppress(Exception):
-            _write_text(assistant_path, full_text)
+    try:
+        msg_obj = client.send_message_sync(
+            session_id,
+            prompt=prompt,
+            model=model,
+            variant=variant,
+            agent=agent,
+            timeout_s=timeout_s,
+        )
+    except Exception as e:
+        # If it's a timeout at HTTP layer, abort session.
+        if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+            timed_out = True
+            client.abort(session_id)
+            err = {"name": "Timeout", "message": f"HTTP message exceeded timeout={timeout_s}s"}
+        else:
+            err = {"name": "HttpError", "message": str(e)}
+    finally:
+        stop_evt.set()
+        # best-effort join
+        t.join(timeout=2.0)
 
-    return agg, full_text, exit_code, timed_out, output_too_large_error, None
+    if err is None and isinstance(msg_obj, dict):
+        text = _extract_text_from_message_obj(msg_obj)
+        if assistant_fp:
+            try:
+                assistant_fp.write(text.encode("utf-8", errors="replace"))
+            except Exception:
+                pass
+        # Artifact cap: also check response size indirectly (assistant file size)
+        ok_cap, which_file = _enforce_artifact_cap(
+            [p for p in [events_path, stderr_path, assistant_path] if p],
+            max_artifact_bytes,
+        )
+        if not ok_cap and which_file:
+            client.abort(session_id)
+            err = {"name": "OutputTooLarge", "message": f"artifact {which_file} exceeded max-artifact-bytes={max_artifact_bytes}"}
+        full_text = text
+    else:
+        full_text = ""
 
+    if events_fp:
+        events_fp.close()
+    if assistant_fp:
+        assistant_fp.close()
+    stderr_fp.close()
+
+    ok = (err is None) and (not timed_out)
+
+    return RunOutcome(
+        ok=ok,
+        exit_code=0 if ok else (124 if timed_out else 1),
+        timed_out=timed_out,
+        engine="http",
+        fallback_from=None,
+        session_id=session_id,
+        full_text=full_text,
+        metrics=None,
+        error=err,
+    )
+
+# ============================
+# Commands
+# ============================
 
 def cmd_run(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
 
-    # Preflight: opencode binary (resolve to a concrete path; important on Windows where opencode is often a .cmd shim)
-    opencode_bin = _resolve_executable(args.opencode)
-    if not opencode_bin:
-        run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        job_path = artifacts_dir / "job.json"
-        finish_path = artifacts_dir / "finish.json"
+    run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        _write_json(
-            job_path,
-            {
-                "runId": run_id,
-                "workdir": str(workdir),
-                "state": "failed",
-                "createdAt": _now_ms(),
-                "updatedAt": _now_ms(),
-                "pid": os.getpid(),
-            },
-        )
-
-        out = _finish_obj(
-            ok=False,
-            exit_code=127,
-            timed_out=False,
-            run_id=run_id,
-            workdir=workdir,
-            session_id=None,
-            summary="",
-            truncated=False,
-            result=None,
-            changed_files=[],
-            untracked_files=[],
-            artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name),
-            server=None,
-            metrics=None,
-            error={
-                "name": "OpencodeNotFound",
-                "message": f"Could not find opencode executable: {args.opencode}",
-            },
-            include_debug=args.include_debug,
-            debug=None,
-        )
-        _write_json(finish_path, out)
-        sys.stdout.write(_json_line(out) + "\n")
-        return 127
-
-    # Prepare prompt.
-    prompt: str
+    # Prompt
     if args.prompt_file:
         prompt = _read_text(Path(args.prompt_file).expanduser().resolve())
-    elif getattr(args, "prompt_text", None) is not None:
+    elif args.prompt_text is not None:
         if args.prompt:
             raise SystemExit("Use either --prompt or positional prompt args, not both.")
         prompt = str(args.prompt_text)
@@ -1485,59 +1536,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.no_contract:
         prompt = prompt + _default_contract_prompt()
 
-    # Environment.
-    env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
-    if args.disable_claude_code:
-        env.setdefault("OPENCODE_DISABLE_CLAUDE_CODE", "1")
-    _apply_permission_mode(env, args.permission_mode)
-
-    # Run identity.
-    run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-    # Persist the effective prompt (including any appended contract) for reproducibility.
     prompt_path = artifacts_dir / "prompt.txt"
-    try:
-        _write_text(prompt_path, prompt)
-    except Exception as e:
-        job_path = artifacts_dir / "job.json"
-        finish_path = artifacts_dir / "finish.json"
-        _write_json(
-            job_path,
-            {
-                "runId": run_id,
-                "workdir": str(workdir),
-                "state": "failed",
-                "createdAt": _now_ms(),
-                "updatedAt": _now_ms(),
-                "pid": os.getpid(),
-            },
-        )
-        out = _finish_obj(
-            ok=False,
-            exit_code=1,
-            timed_out=False,
-            run_id=run_id,
-            workdir=workdir,
-            session_id=None,
-            summary="",
-            truncated=False,
-            result=None,
-            changed_files=[],
-            untracked_files=[],
-            artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name),
-            server=None,
-            metrics=None,
-            error={"name": "PromptWriteError", "message": str(e)},
-            include_debug=args.include_debug,
-            debug=None,
-        )
-        _write_json(finish_path, out)
-        sys.stdout.write(_json_line(out) + "\n")
-        return 1
+    _write_text(prompt_path, prompt)
 
-    # Artifacts paths.
+    # Artifacts paths
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
     events_path = artifacts_dir / "events.ndjson" if args.save_events else None
@@ -1545,398 +1547,316 @@ def cmd_run(args: argparse.Namespace) -> int:
     stderr_path = artifacts_dir / "stderr.log"
     wrapper_log_path = artifacts_dir / "wrapper.log" if args.wrapper_log else None
 
-    # Initialize job record.
-    _write_json(
-        job_path,
-        {
-            "runId": run_id,
-            "workdir": str(workdir),
-            "state": "running",
-            "createdAt": _now_ms(),
-            "updatedAt": _now_ms(),
-            "pid": os.getpid(),
-        },
-    )
+    # Job init
+    job_obj = {
+        "runId": run_id,
+        "workdir": str(workdir),
+        "state": "running",
+        "createdAt": _now_ms(),
+        "updatedAt": _now_ms(),
+        "pid": os.getpid(),
+        "engine": args.engine,
+    }
+    _write_json(job_path, job_obj)
 
-    # Ensure/attach server (best-effort).
+    def _update_job(fields: dict[str, Any]) -> None:
+        try:
+            job = _load_json(job_path) or {}
+            if isinstance(job, dict):
+                job.update(fields)
+                job["updatedAt"] = _now_ms()
+                _write_json(job_path, job)
+        except Exception:
+            pass
+
+    # Env
+    env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+    # Defensive defaults (no-op if ignored by OpenCode)
+    env.setdefault("OPENCODE_CLIENT", "opencode-subtask")
+    if args.disable_claude_code:
+        env.setdefault("OPENCODE_DISABLE_CLAUDE_CODE", "1")
+    _apply_permission_mode(env, args.permission_mode)
+
+    auth = _get_http_auth_from_env(env)
+
+    # Server attach/ensure
     server_state: dict[str, Any] | None = None
     attach_url = args.attach
     server_error: dict[str, Any] | None = None
-    # opencode v1.1.25 has a known crash path for `opencode run --attach ... --agent <name>`
-    # ("No context found for instance"). Prefer standalone mode when an explicit agent is requested.
-    attach_server = bool(args.attach_server and not args.agent)
-    if not attach_url and attach_server:
-        try:
-            server_state = ensure_server(
-                opencode_bin=opencode_bin,
-                workdir=workdir,
-                hostname=args.server_hostname,
-                port=args.server_port,
-                wait_s=args.server_wait,
-                env=env,
-            )
-            attach_url = str(server_state.get("url"))
-        except Exception as e:
-            # Don't fail the whole task; fall back to standalone run.
-            server_error = {"name": type(e).__name__, "message": str(e)}
-            server_state = None
-            attach_url = None
 
-    # Build opencode command.
-    cmd: list[str] = [opencode_bin, "run", "--format", "json"]
-    if getattr(args, "opencode_print_logs", False):
-        cmd.append("--print-logs")
-    if getattr(args, "opencode_log_level", None):
-        cmd.extend(["--log-level", str(args.opencode_log_level)])
-    if attach_url:
-        cmd.extend(["--attach", attach_url])
-    if args.agent:
-        cmd.extend(["--agent", args.agent])
-    if args.model:
-        cmd.extend(["--model", args.model])
-    for f in args.file:
-        cmd.extend(["--file", f])
-    # Always attach the prompt as a file to avoid shell quoting and Windows command-line limits.
-    cmd.extend(["--file", str(prompt_path)])
-    # Yargs-style parsers may treat trailing args as additional values for an array option.
-    # Use `--` to terminate options so the message is not mis-parsed as another --file.
-    cmd.append("--")
-    cmd.append("Follow the instructions in the attached prompt.txt.")
-
-    # wrapper.log is for background worker stdout/stderr redirection; in foreground we don't need it.
-    if wrapper_log_path:
-        _write_text(wrapper_log_path, "")
-
-    retry_info: dict[str, Any] | None = None
-    auto_attach_used = bool(attach_url and args.attach is None and attach_server)
-
-    agg, full_text, exit_code, timed_out, output_too_large_error, fatal_error = _run_opencode_process(
-        cmd=cmd,
-        workdir=workdir,
-        env=env,
-        artifacts_dir=artifacts_dir,
-        events_path=events_path,
-        assistant_path=assistant_path,
-        stderr_path=stderr_path,
-        job_path=job_path,
-        quiet=bool(args.quiet),
-        timeout_s=float(args.timeout),
-        max_artifact_bytes=int(args.max_artifact_bytes),
-    )
-
-    if fatal_error is not None or agg is None:
-        _write_job_state(job_path, "failed", {"error": fatal_error})
-        out = _finish_obj(
-            ok=False,
-            exit_code=exit_code,
-            timed_out=timed_out,
-            run_id=run_id,
-            workdir=workdir,
-            session_id=None,
-            summary="",
-            truncated=False,
-            result=None,
-            changed_files=[],
-            untracked_files=[],
-            artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(
-                jobPath=job_path.name,
-                finishPath=finish_path.name,
-                eventsPath=events_path.name if events_path else None,
-                assistantPath=assistant_path.name if assistant_path else None,
-                stderrPath=stderr_path.name,
-                wrapperLogPath=wrapper_log_path.name if wrapper_log_path else None,
-                patchPath=None,
-                promptPath=prompt_path.name if prompt_path else None,
-            ),
-            server=server_state,
-            metrics=None,
-            error=fatal_error or {"name": "UnknownError", "message": "opencode process failed"},
-            include_debug=args.include_debug,
-            debug={"opencodeCommand": cmd, "serverError": server_error},
-        )
-        _write_json(finish_path, out)
-        sys.stdout.write(_json_line(out) + "\n")
-        return 1
-
-    # Extract structured result if present.
-    result_obj = _extract_last_json_object(full_text)
-
-    # Choose summary.
-    summary_source: str = ""
-    if isinstance(result_obj, dict) and isinstance(result_obj.get("summary"), str):
-        summary_source = str(result_obj.get("summary"))
-    else:
-        summary_source = full_text
-
-    summary_source_stripped = summary_source.strip()
-    blocked_reason_attempt = summary_source_stripped if summary_source_stripped.upper().startswith("BLOCKED") else None
-
-    # If we auto-attached to a shared server and hit a ruleset-config BLOCKED state, retry once
-    # in standalone mode. This avoids disturbing other in-flight tasks using that server.
-    if (
-        blocked_reason_attempt is not None
-        and auto_attach_used
-        and _blocked_reason_looks_like_ruleset_config_error(blocked_reason_attempt)
-        and not timed_out
-        and output_too_large_error is None
-    ):
-        # Preserve attempt-1 artifacts for diagnosis.
-        attempt1_record: dict[str, Any] = {
-            "mode": "attach",
-            "blockedReason": blocked_reason_attempt,
-            "exitCode": exit_code,
-            "timedOut": timed_out,
-            "server": server_state,
-            "opencodeCommand": cmd,
-        }
-        with contextlib.suppress(Exception):
-            _write_json(artifacts_dir / "attempt1.json", attempt1_record)
-        moved = _rotate_attempt_artifacts(artifacts_dir, attempt=1)
-
-        retry_info = {"attempted": True, "reason": "ruleset-config", "movedArtifacts": moved}
-
-        # Standalone retry: drop --attach.
-        attach_url = None
-        server_state = None
-        cmd2: list[str] = [opencode_bin, "run", "--format", "json"]
-        if getattr(args, "opencode_print_logs", False):
-            cmd2.append("--print-logs")
-        if getattr(args, "opencode_log_level", None):
-            cmd2.extend(["--log-level", str(args.opencode_log_level)])
-        if args.agent:
-            cmd2.extend(["--agent", args.agent])
-        if args.model:
-            cmd2.extend(["--model", args.model])
-        for f in args.file:
-            cmd2.extend(["--file", f])
-        cmd2.extend(["--file", str(prompt_path)])
-        cmd2.append("--")
-        cmd2.append("Follow the instructions in the attached prompt.txt.")
-
-        agg, full_text, exit_code, timed_out, output_too_large_error, fatal_error = _run_opencode_process(
-            cmd=cmd2,
-            workdir=workdir,
-            env=env,
-            artifacts_dir=artifacts_dir,
-            events_path=events_path,
-            assistant_path=assistant_path,
-            stderr_path=stderr_path,
-            job_path=job_path,
-            quiet=bool(args.quiet),
-            timeout_s=float(args.timeout),
-            max_artifact_bytes=int(args.max_artifact_bytes),
-        )
-
-        if fatal_error is not None or agg is None:
-            _write_job_state(job_path, "failed", {"error": fatal_error})
+    # Need opencode binary if we might call CLI engine OR we need to start a server.
+    opencode_bin: str | None = None
+    need_opencode_bin = (args.engine in ("cli", "auto")) or (not attach_url and args.attach_server)
+    if need_opencode_bin:
+        default_cmd = args.opencode
+        opencode_bin = _resolve_executable(default_cmd)
+        if not opencode_bin:
             out = _finish_obj(
                 ok=False,
-                exit_code=exit_code,
-                timed_out=timed_out,
+                exit_code=127,
+                timed_out=False,
                 run_id=run_id,
                 workdir=workdir,
+                engine="none",
+                fallback_from=None,
+                server=None,
                 session_id=None,
                 summary="",
-                truncated=False,
-                result=None,
+                summary_truncated=False,
+                result_digest=None,
                 changed_files=[],
                 untracked_files=[],
                 artifacts_dir=artifacts_dir,
                 artifacts=_artifacts_obj(
-                    jobPath=job_path.name,
-                    finishPath=finish_path.name,
-                    eventsPath=events_path.name if events_path else None,
-                    assistantPath=assistant_path.name if assistant_path else None,
-                    stderrPath=stderr_path.name,
-                    wrapperLogPath=wrapper_log_path.name if wrapper_log_path else None,
-                    patchPath=None,
-                    promptPath=prompt_path.name if prompt_path else None,
+                    dir_path=artifacts_dir,
+                    job_path=job_path,
+                    finish_path=finish_path,
+                    prompt_path=prompt_path,
+                    events_path=events_path,
+                    stderr_path=stderr_path,
+                    assistant_path=assistant_path,
+                    wrapper_log_path=wrapper_log_path,
+                    result_path=None,
+                    patch_path=None,
                 ),
-                server=None,
                 metrics=None,
-                error=fatal_error or {"name": "UnknownError", "message": "opencode process failed"},
+                error={"name": "OpencodeNotFound", "message": f"Could not find opencode executable: {default_cmd}"},
                 include_debug=args.include_debug,
-                debug={"opencodeCommand": cmd2, "retry": retry_info, "serverError": server_error},
+                debug=None,
             )
-            if retry_info:
-                out["retry"] = retry_info
             _write_json(finish_path, out)
             sys.stdout.write(_json_line(out) + "\n")
-            return 1
+            return 127
 
-        # Recompute result/blocked for attempt-2.
-        cmd = cmd2
-        result_obj = _extract_last_json_object(full_text)
-        if isinstance(result_obj, dict) and isinstance(result_obj.get("summary"), str):
-            summary_source = str(result_obj.get("summary"))
-        else:
-            summary_source = full_text
-        summary_source_stripped = summary_source.strip()
-        blocked_reason_attempt = summary_source_stripped if summary_source_stripped.upper().startswith("BLOCKED") else None
+    if not attach_url and args.attach_server:
+        # Engine policy:
+        # - http: ensure/start a server if needed.
+        # - auto: attach to an already-running server if present; do not start a new one.
+        # - cli: ignore attach_server unless user provided an explicit --attach.
+        if args.engine == "http":
+            try:
+                assert opencode_bin is not None
+                server_state = ensure_server(
+                    opencode_bin=opencode_bin,
+                    workdir=workdir,
+                    hostname=args.server_hostname,
+                    port=args.server_port,
+                    wait_s=args.server_wait,
+                    env=env,
+                    auth=auth,
+                )
+                attach_url = str(server_state.get("url"))
+            except Exception as e:
+                server_error = {"name": type(e).__name__, "message": str(e)}
+                server_state = None
+                attach_url = None
+        elif args.engine == "auto":
+            try:
+                server_state = attach_existing_server(workdir=workdir, auth=auth)
+                if server_state:
+                    attach_url = str(server_state.get("url"))
+            except Exception as e:
+                server_error = {"name": type(e).__name__, "message": str(e)}
+                server_state = None
+                attach_url = None
 
-    # Capture patch (best-effort).
-    patch_path, changed_files, untracked_files = _git_patch(workdir, artifacts_dir)
+    if attach_url:
+        _update_job({"serverUrl": attach_url})
 
-    # Prefer stable summaries for failure modes (avoid partial/hallucinated analysis on timeout).
-    summary_source_final = summary_source.strip()
-    if timed_out:
-        summary_source_final = (
-            f"TIMEOUT: opencode run exceeded timeout={args.timeout}s. "
-            "Partial output (if any) is in artifacts/assistant.txt; "
-            "diff (if any) is in artifacts/changes.patch. "
-            f"changedFiles={len(changed_files)} untrackedFiles={len(untracked_files)}."
+    # Decide engine
+    chosen = args.engine
+    fallback_from: str | None = None
+    outcome: RunOutcome | None = None
+
+    # CLI workaround: in some OpenCode versions, "opencode run --attach ... --agent <name>" can fail.
+    # If attach was auto-created (not user-provided) and agent is set, prefer standalone CLI (no attach).
+    cli_attach_url = attach_url
+    if args.agent and cli_attach_url and (args.attach is None) and args.workaround_agent_attach:
+        cli_attach_url = None
+
+    def run_cli() -> RunOutcome:
+        assert opencode_bin is not None
+        return _run_cli(
+            opencode_bin=opencode_bin,
+            workdir=workdir,
+            env=env,
+            attach_url=cli_attach_url,
+            prompt_path=prompt_path,
+            continue_last=bool(getattr(args, "continue_last", False)),
+            session_id=getattr(args, "session", None),
+            title=getattr(args, "title", None),
+            agent=args.agent,
+            model=args.model,
+            variant=getattr(args, "variant", None),
+            files=list(args.file),
+            timeout_s=float(args.timeout),
+            quiet=args.quiet,
+            save_events=args.save_events,
+            save_text=args.save_text,
+            max_artifact_bytes=int(args.max_artifact_bytes),
+            events_path=events_path,
+            stderr_path=stderr_path,
+            assistant_path=assistant_path,
+            on_session_id=lambda sid: _update_job({"sessionId": sid}),
         )
-    elif output_too_large_error is not None:
-        summary_source_final = (
-            f"OUTPUT_TOO_LARGE: artifact output exceeded max_artifact_bytes={args.max_artifact_bytes}. "
-            "Partial output (if any) is in artifacts; "
-            f"changedFiles={len(changed_files)} untrackedFiles={len(untracked_files)}."
+
+    def run_http() -> RunOutcome:
+        if not attach_url:
+            return RunOutcome(
+                ok=False,
+                exit_code=2,
+                timed_out=False,
+                engine="http",
+                fallback_from=None,
+                session_id=None,
+                full_text="",
+                metrics=None,
+                error={"name": "NoServer", "message": "HTTP engine requires --attach or --attach-server (default)"},
+            )
+        return _run_http(
+            server_url=attach_url,
+            workdir=workdir,
+            env=env,
+            prompt=prompt,
+            agent=args.agent,
+            model=args.model,
+            variant=getattr(args, "variant", None),
+            timeout_s=float(args.timeout),
+            save_events=args.save_events,
+            save_text=args.save_text,
+            max_artifact_bytes=int(args.max_artifact_bytes),
+            events_path=events_path,
+            stderr_path=stderr_path,
+            assistant_path=assistant_path,
+            permission_mode=args.permission_mode,
+            include_debug=args.include_debug,
+            on_session_id=lambda sid: _update_job({"sessionId": sid}),
         )
 
-    blocked_reason: str | None = None
-    summary_source_final_stripped = summary_source_final.strip()
-    if summary_source_final_stripped.upper().startswith("BLOCKED"):
-        blocked_reason = summary_source_final_stripped
-
-    summary, truncated = _truncate(summary_source_final_stripped, int(args.max_text_chars))
-
-    # Persist structured result to result.json (adapter writes the file; model only prints JSON).
-    result_path: Path | None = artifacts_dir / "result.json"
-    result_digest: str | None = None
-    result_record: Any
-    if isinstance(result_obj, dict):
-        result_record = dict(result_obj)
-        # Enrich with changed_files if the model didn't include it.
-        if "changed_files" not in result_record and "changedFiles" not in result_record:
-            result_record["changed_files"] = changed_files
-        if "untracked_files" not in result_record and "untrackedFiles" not in result_record:
-            result_record["untracked_files"] = untracked_files
+    if chosen == "cli":
+        outcome = run_cli()
+    elif chosen == "http":
+        outcome = run_http()
     else:
-        result_record = {
-            "summary": summary,
-            "evidence": [],
-            "changed_files": changed_files,
-            "untracked_files": untracked_files,
-            "next_steps": [],
-            "raw": result_obj,
-        }
+        # auto: prefer http if we have a server URL; otherwise cli.
+        if attach_url:
+            o1 = run_http()
+            if o1.ok:
+                outcome = o1
+            else:
+                fallback_from = "http"
+                outcome = run_cli()
+                outcome.fallback_from = "http"  # type: ignore[attr-defined]
+        else:
+            outcome = run_cli()
+
+    assert outcome is not None
+
+    # Post-process: structured result, summary, git status/patch
+    result_obj = _extract_structured_json(outcome.full_text)
+    # Choose summary
+    summary_source = ""
+    if isinstance(result_obj, dict) and isinstance(result_obj.get("summary"), str):
+        summary_source = str(result_obj.get("summary"))
+    else:
+        summary_source = outcome.full_text
+
+    summary, truncated = _truncate(summary_source.strip(), int(args.max_text_chars))
+
+    changed_files, untracked_files = _git_status(workdir)
+    patch_name = _git_patch(workdir, artifacts_dir)
+
+    # Persist structured result to result.json (always adapter-written)
+    result_path = artifacts_dir / "result.json"
+    result_digest: str | None = None
     try:
-        _write_json(result_path, result_record)
+        record: dict[str, Any]
+        if isinstance(result_obj, dict):
+            record = dict(result_obj)
+        else:
+            record = {"summary": summary, "evidence": [], "changes": [], "next_steps": [], "raw": result_obj}
+        # Enrich
+        record.setdefault("changed_files", changed_files)
+        record.setdefault("untracked_files", untracked_files)
+        _write_json(result_path, record)
         result_digest = _sha256_file(result_path)
     except Exception:
-        result_path = None
+        result_path = None  # type: ignore[assignment]
         result_digest = None
 
-    ok = (
-        (not timed_out)
-        and (output_too_large_error is None)
-        and (blocked_reason is None)
-        and exit_code == 0
-        and agg.error_event is None
-    )
+    # Final ok
+    ok = outcome.ok and (outcome.error is None)
 
-    error_obj: dict[str, Any] | None = None
-    if not ok:
-        if output_too_large_error is not None:
-            error_obj = output_too_large_error
-        elif timed_out:
-            error_obj = {"name": "Timeout", "message": f"opencode run exceeded timeout={args.timeout}s"}
-        elif blocked_reason is not None:
-            error_obj = {"name": "Blocked", "message": blocked_reason}
-        elif agg.error_event is not None:
-            error_obj = {"name": "OpenCodeErrorEvent", "message": "error event observed", "event": agg.error_event}
-        elif exit_code != 0:
-            error_obj = {"name": "NonZeroExit", "message": f"opencode exited with code {exit_code}"}
-
-    if error_obj is not None and stderr_path is not None:
-        tail = _read_tail(stderr_path, 4096)
-        if tail:
-            tail_s, _ = _truncate(tail.strip(), 2000)
-            if tail_s:
-                error_obj.setdefault("stderrTail", tail_s)
-
-    # Update job state.
-    _write_job_state(job_path, "finished" if ok else "failed", {"exitCode": exit_code, "timedOut": timed_out})
+    # Construct finish
+    debug: dict[str, Any] | None = None
+    if args.include_debug:
+        debug = {
+            "engineSelected": outcome.engine,
+            "fallbackFrom": fallback_from,
+            "serverError": server_error,
+            "serverUrl": attach_url,
+            "serverHealth": (OpencodeHttpClient(attach_url, auth=_get_http_auth_from_env(env)).health() if attach_url else None),
+        }
 
     out = _finish_obj(
         ok=ok,
-        exit_code=exit_code,
-        timed_out=timed_out,
+        exit_code=outcome.exit_code,
+        timed_out=outcome.timed_out,
         run_id=run_id,
         workdir=workdir,
-        session_id=agg.session_id,
+        engine=outcome.engine,
+        fallback_from=fallback_from,
+        server=server_state,
+        session_id=outcome.session_id,
         summary=summary,
-        truncated=truncated,
-        result=(result_record if args.inline_result else None),
+        summary_truncated=truncated,
+        result_digest=result_digest,
         changed_files=changed_files,
         untracked_files=untracked_files,
         artifacts_dir=artifacts_dir,
         artifacts=_artifacts_obj(
-            jobPath=job_path.name,
-            finishPath=finish_path.name,
-            eventsPath=events_path.name if events_path else None,
-            assistantPath=assistant_path.name if assistant_path else None,
-            stderrPath=stderr_path.name,
-            wrapperLogPath=wrapper_log_path.name if wrapper_log_path else None,
-            patchPath=Path(patch_path).name if patch_path else None,
-            promptPath=prompt_path.name if prompt_path else None,
-            resultPath=result_path.name if result_path else None,
-            resultDigest=result_digest,
+            dir_path=artifacts_dir,
+            job_path=job_path,
+            finish_path=finish_path,
+            prompt_path=prompt_path,
+            events_path=events_path,
+            stderr_path=stderr_path,
+            assistant_path=assistant_path,
+            wrapper_log_path=wrapper_log_path,
+            result_path=result_path if isinstance(result_path, Path) else None,
+            patch_path=patch_name,
         ),
-        server=server_state,
-        metrics=agg.metrics,
-        error=error_obj,
+        metrics=outcome.metrics,
+        error=outcome.error,
         include_debug=args.include_debug,
-        debug={
-            "opencodeCommand": cmd,
-            "serverError": server_error,
-            "retry": retry_info,
-            "exitCode": exit_code,
-            "timedOut": timed_out,
-        },
+        debug=debug,
     )
 
-    if retry_info:
-        out["retry"] = retry_info
-
     _write_json(finish_path, out)
-    sys.stdout.write(_json_line(out) + "\n")
+    # Update job state
+    job_obj2 = _load_json(job_path) or {}
+    if isinstance(job_obj2, dict):
+        job_obj2["state"] = "finished"
+        job_obj2["updatedAt"] = _now_ms()
+        job_obj2["ok"] = ok
+        if outcome.session_id:
+            job_obj2["sessionId"] = outcome.session_id
+        if attach_url:
+            job_obj2["serverUrl"] = attach_url
+        _write_json(job_path, job_obj2)
 
+    sys.stdout.write(_json_line(out) + "\n")
     return 0 if ok else 1
 
-
 def cmd_start(args: argparse.Namespace) -> int:
-    """Start a subtask in the background and return a handle (runId + artifacts dir).
-
-    The worker is the same script's `run` command with explicit --run-id/--artifacts-dir,
-    so start/wait never loses the pointer.
-    """
     workdir = Path(args.workdir).expanduser().resolve()
-
-    # Preflight: opencode binary (resolve to a concrete path; important on Windows where opencode is often a .cmd shim)
-    opencode_bin = _resolve_executable(args.opencode)
-    if not opencode_bin:
-        out = {
-            "type": "opencode-subtask-start",
-            "schemaVersion": ADAPTER_SCHEMA_VERSION,
-            "timestamp": _now_ms(),
-            "ok": False,
-            "error": {"name": "FileNotFoundError", "message": f"opencode not found: {args.opencode}"},
-        }
-        sys.stdout.write(_json_line(out) + "\n")
-        return 127
 
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write prompt to file to avoid shell quoting issues.
-    if getattr(args, "prompt_text", None) is not None:
-        if args.prompt:
-            raise SystemExit("Use either --prompt or positional prompt args, not both.")
-        prompt = str(args.prompt_text)
-    else:
-        prompt = _join_prompt(args.prompt)
+    prompt = _join_prompt(args.prompt)
+    # Note: the worker (`run`) will append the output contract unless --no-contract is set.
+
     prompt_path = artifacts_dir / "prompt.txt"
     _write_text(prompt_path, prompt)
 
@@ -1944,107 +1864,75 @@ def cmd_start(args: argparse.Namespace) -> int:
     finish_path = artifacts_dir / "finish.json"
     wrapper_log_path = artifacts_dir / "wrapper.log"
 
-    # Init job.
-    _write_json(
-        job_path,
-        {
-            "runId": run_id,
-            "workdir": str(workdir),
-            "state": "starting",
-            "createdAt": _now_ms(),
-            "updatedAt": _now_ms(),
-        },
-    )
+    _write_json(job_path, {"runId": run_id, "workdir": str(workdir), "state": "queued", "createdAt": _now_ms(), "updatedAt": _now_ms()})
+    _write_text(wrapper_log_path, "")
 
-    # Build worker command.
-    script_path = Path(__file__).resolve()
-
+    # Build worker command (explicitly pass run_id/artifacts_dir/opencode path and flags).
+    py = sys.executable
     worker_cmd: list[str] = [
-        sys.executable,
-        str(script_path),
+        py,
+        str(Path(__file__).resolve()),
         "run",
-        "--opencode",
-        str(opencode_bin),
-        "--workdir",
-        str(workdir),
-        "--run-id",
-        run_id,
-        "--artifacts-dir",
-        str(artifacts_dir),
-        "--prompt-file",
-        str(prompt_path),
-        "--timeout",
-        str(args.timeout),
-        "--max-text-chars",
-        str(args.max_text_chars),
-        "--max-artifact-bytes",
-        str(args.max_artifact_bytes),
-        "--permission-mode",
-        args.permission_mode,
+        "--workdir", str(workdir),
+        "--run-id", run_id,
+        "--artifacts-dir", str(artifacts_dir),
+        "--opencode", args.opencode,
+        "--engine", args.engine,
+        "--timeout", str(args.timeout),
+        "--max-text-chars", str(args.max_text_chars),
+        "--max-artifact-bytes", str(args.max_artifact_bytes),
+        "--permission-mode", args.permission_mode,
     ]
-    attach_server = bool(args.attach_server and not args.agent)
 
-    # Booleans.
-    if args.quiet:
-        worker_cmd.append("--quiet")
-    else:
-        worker_cmd.append("--no-quiet")
-
-    if args.save_events:
-        worker_cmd.append("--save-events")
-    else:
-        worker_cmd.append("--no-save-events")
-
-    if args.save_text:
-        worker_cmd.append("--save-text")
-    else:
-        worker_cmd.append("--no-save-text")
-
-    if args.disable_claude_code:
-        worker_cmd.append("--disable-claude-code")
-    else:
-        worker_cmd.append("--no-disable-claude-code")
-
+    # booleans
+    worker_cmd.append("--quiet" if args.quiet else "--no-quiet")
+    worker_cmd.append("--save-events" if args.save_events else "--no-save-events")
+    worker_cmd.append("--save-text" if args.save_text else "--no-save-text")
+    worker_cmd.append("--disable-claude-code" if args.disable_claude_code else "--no-disable-claude-code")
     if args.include_debug:
         worker_cmd.append("--include-debug")
-
-    if getattr(args, "inline_result", False):
-        worker_cmd.append("--inline-result")
-
     if args.no_contract:
         worker_cmd.append("--no-contract")
+    if args.wrapper_log:
+        worker_cmd.append("--wrapper-log")
+    if args.workaround_agent_attach:
+        worker_cmd.append("--workaround-agent-attach")
+    else:
+        worker_cmd.append("--no-workaround-agent-attach")
 
-    # Attach settings.
+    # attach settings
     if args.attach:
         worker_cmd.extend(["--attach", args.attach])
-    if not attach_server:
+    if args.attach_server:
+        worker_cmd.append("--attach-server")
+    else:
         worker_cmd.append("--no-attach-server")
+    worker_cmd.extend(["--server-hostname", args.server_hostname, "--server-port", str(args.server_port), "--server-wait", str(args.server_wait)])
 
-    worker_cmd.extend(["--server-hostname", args.server_hostname])
-    worker_cmd.extend(["--server-port", str(args.server_port)])
-    worker_cmd.extend(["--server-wait", str(args.server_wait)])
-
-    # passthroughs.
+    # passthrough
+    if getattr(args, "continue_last", False):
+        worker_cmd.append("--continue")
+    if getattr(args, "session", None):
+        worker_cmd.extend(["--session", str(getattr(args, "session"))])
+    if getattr(args, "title", None):
+        worker_cmd.extend(["--title", str(getattr(args, "title"))])
     if args.agent:
         worker_cmd.extend(["--agent", args.agent])
     if args.model:
         worker_cmd.extend(["--model", args.model])
-    if getattr(args, "opencode_print_logs", False):
-        worker_cmd.append("--opencode-print-logs")
-    if getattr(args, "opencode_log_level", None):
-        worker_cmd.extend(["--opencode-log-level", str(args.opencode_log_level)])
+    if getattr(args, "variant", None):
+        worker_cmd.extend(["--variant", str(getattr(args, "variant"))])
     for f in args.file:
         worker_cmd.extend(["--file", f])
-
     for ev in args.env:
         worker_cmd.extend(["--env", ev])
     for evf in args.env_file:
         worker_cmd.extend(["--env-file", evf])
 
-    # Ensure wrapper.log exists; redirect worker stdout/stderr there.
-    _write_text(wrapper_log_path, "")
-    log_fp = open(wrapper_log_path, "ab", buffering=0)
+    # prompt
+    worker_cmd.extend(["--prompt-file", str(prompt_path)])
 
+    log_fp = open(wrapper_log_path, "ab", buffering=0)
     popen_kwargs: dict[str, Any] = {}
     if os.name == "nt":
         creationflags = (
@@ -2064,7 +1952,13 @@ def cmd_start(args: argparse.Namespace) -> int:
         **popen_kwargs,
     )
 
-    _write_job_state(job_path, "running", {"pid": proc.pid, "finishPath": str(finish_path)})
+    # update job
+    job = _load_json(job_path) or {}
+    if isinstance(job, dict):
+        job["state"] = "running"
+        job["pid"] = proc.pid
+        job["updatedAt"] = _now_ms()
+        _write_json(job_path, job)
 
     out = _start_obj(
         run_id=run_id,
@@ -2072,117 +1966,132 @@ def cmd_start(args: argparse.Namespace) -> int:
         workdir=workdir,
         artifacts_dir=artifacts_dir,
         artifacts=_artifacts_obj(
-            jobPath=job_path.name,
-            finishPath=finish_path.name,
-            promptPath=prompt_path.name,
-            wrapperLogPath=wrapper_log_path.name,
+            dir_path=artifacts_dir,
+            job_path=job_path,
+            finish_path=finish_path,
+            prompt_path=prompt_path,
+            events_path=(artifacts_dir / "events.ndjson") if args.save_events else None,
+            stderr_path=(artifacts_dir / "stderr.log"),
+            assistant_path=(artifacts_dir / "assistant.txt") if args.save_text else None,
+            wrapper_log_path=wrapper_log_path,
+            result_path=(artifacts_dir / "result.json"),
+            patch_path=None,
         ),
     )
-
     sys.stdout.write(_json_line(out) + "\n")
     return 0
 
-
-def _load_finish_if_exists(finish_path: Path) -> dict[str, Any] | None:
-    if not finish_path.exists():
-        return None
-    obj = _load_json(finish_path)
-    if isinstance(obj, dict):
-        return obj
-    return None
-
+def _progress_snapshot(artifacts_dir: Path) -> dict[str, Any]:
+    files = {
+        "events": artifacts_dir / "events.ndjson",
+        "assistant": artifacts_dir / "assistant.txt",
+        "stderr": artifacts_dir / "stderr.log",
+        "wrapper": artifacts_dir / "wrapper.log",
+        "finish": artifacts_dir / "finish.json",
+    }
+    now = time.time()
+    prog: dict[str, Any] = {"files": {}, "idleForSeconds": None}
+    last_mtime = 0.0
+    for k, p in files.items():
+        if not p.exists():
+            continue
+        try:
+            st = p.stat()
+            prog["files"][k] = {"bytes": st.st_size, "mtime": st.st_mtime}
+            last_mtime = max(last_mtime, st.st_mtime)
+        except Exception:
+            continue
+    if last_mtime > 0:
+        prog["idleForSeconds"] = max(0.0, now - last_mtime)
+    return prog
 
 def cmd_status(args: argparse.Namespace) -> int:
+    if not getattr(args, 'run_id', None) and not getattr(args, 'artifacts_dir', None):
+        raise SystemExit('Provide --run-id or --artifacts-dir')
+
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
-    wrapper_log_path = artifacts_dir / "wrapper.log"
-    progress = _progress_snapshot(artifacts_dir)
+    prompt_path = artifacts_dir / "prompt.txt"
 
     if finish_path.exists():
         fin = _load_json(finish_path)
         if isinstance(fin, dict):
-            # Return finish as-is for convenience.
             sys.stdout.write(_json_line(fin) + "\n")
-            return 0
+            return 0 if fin.get("ok") is True else 1
+
+    if not job_path.exists():
         out = _status_obj(
             run_id=run_id,
-            status="failed",
-            workdir=None,
+            status="missing",
             pid=None,
+            workdir=None,
             artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name, wrapperLogPath=wrapper_log_path.name),
-            progress=progress,
-            error={
-                "name": "FinishUnreadable",
-                "message": "finish.json exists but is not valid JSON (possibly being written).",
-            },
+            artifacts=_artifacts_obj(
+                dir_path=artifacts_dir,
+                job_path=job_path,
+                finish_path=finish_path,
+                prompt_path=prompt_path,
+                events_path=artifacts_dir / "events.ndjson",
+                stderr_path=artifacts_dir / "stderr.log",
+                assistant_path=artifacts_dir / "assistant.txt",
+                wrapper_log_path=artifacts_dir / "wrapper.log",
+                result_path=artifacts_dir / "result.json",
+                patch_path=None,
+            ),
+            progress=_progress_snapshot(artifacts_dir),
+            error={"name": "JobNotFound", "message": "job.json not found"},
         )
         sys.stdout.write(_json_line(out) + "\n")
         return 1
 
-    pid = _read_job_pid(job_path)
-    state_obj = _load_json(job_path)
-    workdir = None
-    if isinstance(state_obj, dict) and isinstance(state_obj.get("workdir"), str):
-        workdir = Path(str(state_obj.get("workdir"))).expanduser().resolve()
+    job = _load_json(job_path) or {}
+    pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
+    status = str(job.get("state") or "running") if isinstance(job, dict) else "running"
+    if pid and not _pid_running(pid) and not finish_path.exists() and status != "finished":
+        status = "failed"
 
-    if pid and _pid_running(pid):
-        out = _status_obj(
-            run_id=run_id,
-            status="running",
-            workdir=workdir,
-            pid=pid,
-            artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name, wrapperLogPath=wrapper_log_path.name),
-            progress=progress,
-            error=None,
-        )
-        sys.stdout.write(_json_line(out) + "\n")
-        return 0
-
-    # Not finished, pid not running.
     out = _status_obj(
         run_id=run_id,
-        status="failed",
-        workdir=workdir,
-        pid=pid,
+        status=status,
+        pid=pid if pid else None,
+        workdir=str(job.get("workdir")) if isinstance(job, dict) else None,
         artifacts_dir=artifacts_dir,
-        artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name, wrapperLogPath=wrapper_log_path.name),
-        progress=progress,
-        error={
-            "name": "WorkerNotRunning",
-            "message": "worker process is not running and finish.json does not exist",
-        },
+        artifacts=_artifacts_obj(
+            dir_path=artifacts_dir,
+            job_path=job_path,
+            finish_path=finish_path,
+            prompt_path=prompt_path,
+            events_path=artifacts_dir / "events.ndjson",
+            stderr_path=artifacts_dir / "stderr.log",
+            assistant_path=artifacts_dir / "assistant.txt",
+            wrapper_log_path=artifacts_dir / "wrapper.log",
+            result_path=artifacts_dir / "result.json",
+            patch_path=None,
+        ),
+        progress=_progress_snapshot(artifacts_dir),
+        error=None,
     )
     sys.stdout.write(_json_line(out) + "\n")
-    return 1
-
+    return 0
 
 def cmd_wait(args: argparse.Namespace) -> int:
+    if not getattr(args, 'run_id', None) and not getattr(args, 'artifacts_dir', None):
+        raise SystemExit('Provide --run-id or --artifacts-dir')
+
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
-    progress = _progress_snapshot(artifacts_dir)
-    job_obj = _load_json(job_path) or {}
-    workdir = None
-    if isinstance(job_obj, dict) and isinstance(job_obj.get("workdir"), str):
-        workdir = Path(str(job_obj.get("workdir"))).expanduser().resolve()
 
-    # Fast-fail on unknown jobs.
     if not job_path.exists() and not finish_path.exists():
         out = _status_obj(
             run_id=run_id,
             status="missing",
-            workdir=None,
             pid=None,
+            workdir=None,
             artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name),
-            progress=progress,
-            error={
-                "name": "JobNotFound",
-                "message": "job.json and finish.json not found for this runId",
-            },
+            artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name},
+            error={"name": "JobNotFound", "message": "job.json and finish.json not found"},
         )
         sys.stdout.write(_json_line(out) + "\n")
         return 1
@@ -2194,40 +2103,39 @@ def cmd_wait(args: argparse.Namespace) -> int:
             if isinstance(fin, dict):
                 sys.stdout.write(_json_line(fin) + "\n")
                 return 0 if fin.get("ok") is True else 1
-            # finish.json exists but isn't parseable yet; retry until timeout.
             if time.monotonic() >= deadline:
                 out = _status_obj(
                     run_id=run_id,
                     status="failed",
+                    pid=None,
                     workdir=None,
-                    pid=_read_job_pid(job_path),
                     artifacts_dir=artifacts_dir,
-                    artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name),
-                    progress=progress,
-                    error={
-                        "name": "FinishUnreadable",
-                        "message": "timeout waiting for a readable finish.json",
-                    },
+                    artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name},
+                    error={"name": "FinishUnreadable", "message": "timeout waiting for a readable finish.json"},
                 )
                 sys.stdout.write(_json_line(out) + "\n")
                 return 1
             time.sleep(float(args.poll_interval))
             continue
 
-        pid = _read_job_pid(job_path)
+        pid = None
+        if job_path.exists():
+            job = _load_json(job_path) or {}
+            if isinstance(job, dict) and job.get("pid"):
+                try:
+                    pid = int(job.get("pid"))
+                except Exception:
+                    pid = None
         if pid and not _pid_running(pid):
             out = _status_obj(
                 run_id=run_id,
                 status="failed",
-                workdir=None,
                 pid=pid,
+                workdir=None,
                 artifacts_dir=artifacts_dir,
-                artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name, wrapperLogPath="wrapper.log"),
-                progress=progress,
-                error={
-                    "name": "WorkerNotRunning",
-                    "message": "worker process is not running and finish.json does not exist",
-                },
+                artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name, "wrapperLogPath": "wrapper.log"},
+                progress=_progress_snapshot(artifacts_dir),
+                error={"name": "WorkerNotRunning", "message": "worker process not running and finish.json missing"},
             )
             sys.stdout.write(_json_line(out) + "\n")
             return 1
@@ -2236,28 +2144,31 @@ def cmd_wait(args: argparse.Namespace) -> int:
             out = _status_obj(
                 run_id=run_id,
                 status="running",
-                workdir=workdir,
                 pid=pid,
+                workdir=None,
                 artifacts_dir=artifacts_dir,
-                artifacts=_artifacts_obj(jobPath=job_path.name, finishPath=finish_path.name),
+                artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name},
                 progress=_progress_snapshot(artifacts_dir),
-                error={
-                    "name": "WaitTimeout",
-                    "message": f"timeout waiting for finish.json (timeout={args.timeout}s)",
-                },
+                error={"name": "WaitTimeout", "message": f"timeout waiting for finish.json (timeout={args.timeout}s)"},
             )
             sys.stdout.write(_json_line(out) + "\n")
             return 0
 
         time.sleep(float(args.poll_interval))
 
-
 def cmd_cancel(args: argparse.Namespace) -> int:
+    if not getattr(args, 'run_id', None) and not getattr(args, 'artifacts_dir', None):
+        raise SystemExit('Provide --run-id or --artifacts-dir')
+
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
 
-    pid = _read_job_pid(job_path)
+    job = _load_json(job_path) or {}
+    pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
+    server_url = str(job.get("serverUrl")) if isinstance(job, dict) and job.get("serverUrl") else None
+    session_id = str(job.get("sessionId")) if isinstance(job, dict) and job.get("sessionId") else None
+
     ok = False
     if pid and _pid_running(pid):
         try:
@@ -2266,6 +2177,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         except Exception:
             ok = False
 
+    # Best-effort abort session if recorded.
+    if server_url and session_id:
+        env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+        auth = _get_http_auth_from_env(env)
+        try:
+            OpencodeHttpClient(server_url, auth=auth, timeout_s=5.0).abort(session_id)
+            ok = True
+        except Exception:
+            pass
+
     # If no finish exists, write a minimal one so wait won't hang.
     if not finish_path.exists():
         out = _finish_obj(
@@ -2273,25 +2194,18 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             exit_code=130,
             timed_out=False,
             run_id=run_id,
-            workdir=Path(_load_json(job_path).get("workdir", str(Path.cwd()))) if isinstance(_load_json(job_path), dict) else Path.cwd(),
-            session_id=None,
+            workdir=Path(str(job.get("workdir"))) if isinstance(job, dict) and job.get("workdir") else Path.cwd(),
+            engine="cancel",
+            fallback_from=None,
+            server=None,
+            session_id=session_id,
             summary="Canceled",
-            truncated=False,
-            result=None,
+            summary_truncated=False,
+            result_digest=None,
             changed_files=[],
             untracked_files=[],
             artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(
-                jobPath=job_path.name,
-                finishPath=finish_path.name,
-                stderrPath=None,
-                eventsPath=None,
-                assistantPath=None,
-                wrapperLogPath="wrapper.log",
-                patchPath=None,
-                promptPath="prompt.txt",
-            ),
-            server=None,
+            artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name},
             metrics=None,
             error={"name": "Canceled", "message": "job canceled by adapter"},
             include_debug=False,
@@ -2305,193 +2219,152 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "timestamp": _now_ms(),
         "runId": run_id,
         "ok": ok,
-        "pid": pid,
+        "pid": pid or None,
+        "sessionId": session_id,
     }
     sys.stdout.write(_json_line(out2) + "\n")
     return 0 if ok else 1
 
+def cmd_ensure_server(args: argparse.Namespace) -> int:
+    workdir = Path(args.workdir).expanduser().resolve()
+    env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+    auth = _get_http_auth_from_env(env)
+    opencode_bin = _resolve_executable(args.opencode)
+    if not opencode_bin:
+        sys.stdout.write(_json_line({"ok": False, "error": {"name": "OpencodeNotFound", "message": args.opencode}}) + "\n")
+        return 1
+    st = ensure_server(
+        opencode_bin=opencode_bin,
+        workdir=workdir,
+        hostname=args.server_hostname,
+        port=args.server_port,
+        wait_s=args.server_wait,
+        env=env,
+        auth=auth,
+    )
+    out = {"type": "opencode-subtask-server", "ok": True, "server": st}
+    sys.stdout.write(_json_line(out) + "\n")
+    return 0
+
+def cmd_stop_server(args: argparse.Namespace) -> int:
+    workdir = Path(args.workdir).expanduser().resolve()
+    out = stop_server(workdir)
+    out2 = {"type": "opencode-subtask-stop-server", **out}
+    sys.stdout.write(_json_line(out2) + "\n")
+    return 0 if out.get("ok") else 1
 
 # ============================
 # CLI
 # ============================
 
-
 def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--opencode", default=DEFAULT_OPENCODE_BIN, help="Path to opencode binary")
-    p.add_argument("--workdir", default=".", help="Working directory / project root")
+    default_opencode = "opencode"
+    p.add_argument("--opencode", default=default_opencode, help="Path to opencode executable (Windows: prefer opencode.exe if available).")
+    p.add_argument("--workdir", default=".", help="Working directory (project root).")
 
-    p.add_argument("--attach", default=None, help="Attach to an existing opencode server URL")
-    p.add_argument(
-        "--attach-server",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Reuse a per-project opencode serve via --attach (recommended for speed)",
-    )
-    p.add_argument(
-        "--no-attach",
-        dest="attach_server",
-        action="store_false",
-        help="(deprecated) Alias for --no-attach-server",
-    )
+    p.add_argument("--run-id", default=None, help="Existing run id (advanced; used by worker/start).")
+    p.add_argument("--artifacts-dir", default=None, help="Explicit artifacts directory (advanced; used by worker/start).")
 
-    p.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME)
-    p.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
-    p.add_argument("--server-wait", type=float, default=DEFAULT_SERVER_WAIT_S)
+    p.add_argument("--engine", choices=["auto", "http", "cli"], default="auto", help="Execution engine. auto prefers HTTP then falls back to CLI.")
+    p.add_argument("--attach", default=None, help="Attach/connect to an existing OpenCode server URL (e.g., http://127.0.0.1:4096).")
+
+    # New naming: attach-server / no-attach-server (default: attach)
+    p.add_argument("--attach-server", dest="attach_server", action=argparse.BooleanOptionalAction, default=True, help="Ensure/attach a per-project opencode server (default: true).")
+    # Deprecated alias: --no-attach
+    p.add_argument("--no-attach", dest="no_attach_deprecated", action="store_true", help=argparse.SUPPRESS)
+
+    p.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME, help="opencode serve hostname")
+    p.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT, help="opencode serve port (0 => auto)")
+    p.add_argument("--server-wait", type=float, default=DEFAULT_SERVER_WAIT_S, help="Seconds to wait for server health")
+
+    # Session continuity (optional). These map to `opencode run` flags and only affect the CLI engine.
+    p.add_argument("-c", "--continue", dest="continue_last", action="store_true", help="(CLI engine) Continue the last opencode session.")
+    p.add_argument("-s", "--session", default=None, help="(CLI engine) Continue a specific opencode session id.")
+    p.add_argument("--title", default=None, help="(CLI engine) Title for the session.")
 
     p.add_argument("--agent", default=None, help="OpenCode agent name")
-    p.add_argument("--model", default=None, help="Model in provider/model form")
-    p.add_argument("--file", action="append", default=[], help="File(s) to attach to the message")
-    p.add_argument(
-        "--opencode-print-logs",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Pass --print-logs to opencode (captured in artifacts/stderr.log)",
-    )
-    p.add_argument(
-        "--opencode-log-level",
-        choices=["DEBUG", "INFO", "WARN", "ERROR"],
-        default=None,
-        help="Pass --log-level to opencode (captured in artifacts/stderr.log)",
-    )
+    p.add_argument("-m", "--model", default=None, help="Model id provider/model")
+    p.add_argument("--variant", default=None, help="Model variant (provider-specific). Equivalent to `opencode run --variant`.")
+    p.add_argument("-f", "--file", action="append", default=[], help="Extra files to include (CLI engine only).")
 
-    p.add_argument("--timeout", type=float, default=DEFAULT_RUN_TIMEOUT_S, help="Timeout for opencode run")
-    p.add_argument(
-        "--quiet",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="If true, suppress passthrough of OpenCode NDJSON to stdout (recommended)",
-    )
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="Overall timeout seconds for the subtask.")
+    p.add_argument("--poll-interval", type=float, default=0.5, help="wait/status poll interval seconds")
+    p.add_argument("--quiet", action=argparse.BooleanOptionalAction, default=True, help="Quiet mode (stdout only final one-line JSON).")
+    p.add_argument("--save-events", action=argparse.BooleanOptionalAction, default=True, help="Save events.ndjson.")
+    p.add_argument("--save-text", action=argparse.BooleanOptionalAction, default=True, help="Save assistant.txt.")
+    p.add_argument("--wrapper-log", action=argparse.BooleanOptionalAction, default=True, help="Keep wrapper.log (start mode).")
 
-    p.add_argument(
-        "--save-events",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Save full NDJSON stream to artifacts/events.ndjson",
-    )
-    p.add_argument(
-        "--save-text",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Save aggregated assistant text to artifacts/assistant.txt",
-    )
-    p.add_argument(
-        "--max-text-chars",
-        type=int,
-        default=DEFAULT_MAX_TEXT_CHARS,
-        help="Max characters of summary returned in finish JSON (full text is still saved)",
-    )
-    p.add_argument(
-        "--max-artifact-bytes",
-        type=int,
-        default=DEFAULT_MAX_ARTIFACT_BYTES,
-        help="Kill opencode if any artifact file exceeds this size in bytes (0 disables)",
-    )
-    p.add_argument(
-        "--inline-result",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Inline parsed result JSON into the finish event (otherwise only write artifacts/result.json and return resultPath/digest)",
-    )
-    p.add_argument(
-        "--include-debug",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Include debug field in finish JSON (may include unstable fields)",
-    )
+    p.add_argument("--permission-mode", choices=["inherit", "allow", "noninteractive"], default="inherit", help="Permission handling. HTTP engine auto-replies via API when possible.")
+    p.add_argument("--disable-claude-code", action=argparse.BooleanOptionalAction, default=True, help="Set OPENCODE_DISABLE_CLAUDE_CODE=1 (defensive).")
 
-    p.add_argument(
-        "--disable-claude-code",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Set OPENCODE_DISABLE_CLAUDE_CODE=1 for isolation (recommended when running under other agents)",
-    )
+    p.add_argument("--max-text-chars", type=int, default=DEFAULT_MAX_TEXT_CHARS, help="Max chars returned in finish.summary.")
+    p.add_argument("--max-artifact-bytes", type=int, default=DEFAULT_MAX_ARTIFACT_BYTES, help="Hard cap per artifact file (0 disables).")
+    p.add_argument("--include-debug", action="store_true", help="Include debug info under finish.debug (may be noisy).")
+    p.add_argument("--workaround-agent-attach", dest="workaround_agent_attach", action=argparse.BooleanOptionalAction, default=True, help="Workaround: avoid CLI --attach when --agent is set unless attach is explicit.")
 
-    p.add_argument(
-        "--permission-mode",
-        choices=["inherit", "allow", "noninteractive"],
-        default="allow",
-        help="Permission policy override via OPENCODE_PERMISSION (use noninteractive to avoid ask deadlocks)",
-    )
+    p.add_argument("--no-contract", action="store_true", help="Do not append output contract to the prompt.")
+    p.add_argument("--prompt-file", default=None, help="Read prompt from file.")
+    p.add_argument("--prompt", dest="prompt_text", default=None, help="Prompt as a single string (alternative to positional prompt args).")
 
-    p.add_argument("--env", action="append", default=[], help="Extra env var KEY=VALUE")
-    p.add_argument("--env-file", action="append", default=[], help="Extra env var from file KEY=PATH")
+    p.add_argument("--env", action="append", default=[], help="Set env KEY=VALUE for opencode process/server.")
+    p.add_argument("--env-file", action="append", default=[], help="Set env KEY=PATH (file contents as value).")
 
-    p.add_argument(
-        "--no-contract",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Do not append the adapter's compact JSON output contract to the prompt",
-    )
+def main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
 
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="OpenCode subtask adapter: stable JSON boundary + artifacts + background start/wait.",
-    )
+    parser = argparse.ArgumentParser(prog="opencode_subtask.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_srv = sub.add_parser("ensure-server", help="Start/reuse a per-project opencode serve")
-    p_srv.add_argument("--opencode", default=DEFAULT_OPENCODE_BIN)
-    p_srv.add_argument("--workdir", default=".")
-    p_srv.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME)
-    p_srv.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
-    p_srv.add_argument("--server-wait", type=float, default=DEFAULT_SERVER_WAIT_S)
-    p_srv.add_argument(
-        "--disable-claude-code",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    p_srv.add_argument("--env", action="append", default=[])
-    p_srv.add_argument("--env-file", action="append", default=[])
-    p_srv.set_defaults(func=cmd_ensure_server)
-
-    p_stop = sub.add_parser("stop-server", help="Stop the per-project opencode serve")
-    p_stop.add_argument("--workdir", default=".")
-    p_stop.set_defaults(func=cmd_stop_server)
-
-    p_run = sub.add_parser("run", help="Run a subtask (foreground, returns finish JSON)")
+    p_run = sub.add_parser("run", help="Run a subtask (foreground).")
     _add_common_run_flags(p_run)
-    p_run.add_argument("--run-id", default=None)
-    p_run.add_argument("--artifacts-dir", default=None)
-    p_run.add_argument("--prompt-file", default=None, help="Read prompt from a file")
-    p_run.add_argument("--prompt", dest="prompt_text", help="Prompt text (alternative to positional args or stdin)")
-    p_run.add_argument(
-        "--wrapper-log",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="(internal) If true, create artifacts/wrapper.log placeholder",
-    )
-    p_run.add_argument("prompt", nargs="*", help="Prompt to send to OpenCode")
+    p_run.add_argument("prompt", nargs=argparse.REMAINDER, help="Prompt args (use `--` before the prompt).")
     p_run.set_defaults(func=cmd_run)
 
-    p_start = sub.add_parser("start", help="Start a subtask (background), returns runId handle")
+    p_start = sub.add_parser("start", help="Start a subtask in background.")
     _add_common_run_flags(p_start)
-    p_start.add_argument("--run-id", default=None)
-    p_start.add_argument("--artifacts-dir", default=None)
-    p_start.add_argument("--prompt", dest="prompt_text", default=None, help="Prompt string (alternative to positional args or stdin).")
-    p_start.add_argument("prompt", nargs="*", help="Prompt to send to OpenCode")
+    p_start.add_argument("prompt", nargs=argparse.REMAINDER, help="Prompt args (use `--` before the prompt).")
     p_start.set_defaults(func=cmd_start)
 
-    p_status = sub.add_parser("status", help="Check status for a background run")
-    p_status.add_argument("--run-id", default=None, required=False)
-    p_status.add_argument("--artifacts-dir", default=None, required=False)
-    p_status.set_defaults(func=cmd_status)
-
-    p_wait = sub.add_parser("wait", help="Wait for finish.json; returns finish or running status")
-    p_wait.add_argument("--run-id", default=None, required=False)
-    p_wait.add_argument("--artifacts-dir", default=None, required=False)
-    p_wait.add_argument("--timeout", type=float, default=DEFAULT_WAIT_TIMEOUT_S)
-    p_wait.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL_S)
+    p_wait = sub.add_parser("wait", help="Wait for a background job finish.json.")
+    p_wait.add_argument("--run-id", required=False, default=None)
+    p_wait.add_argument("--artifacts-dir", required=False, default=None)
+    p_wait.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    p_wait.add_argument("--poll-interval", type=float, default=0.5)
     p_wait.set_defaults(func=cmd_wait)
 
-    p_cancel = sub.add_parser("cancel", help="Cancel a background run")
-    p_cancel.add_argument("--run-id", default=None, required=False)
-    p_cancel.add_argument("--artifacts-dir", default=None, required=False)
+    p_status = sub.add_parser("status", help="Show job status/progress.")
+    p_status.add_argument("--run-id", required=False, default=None)
+    p_status.add_argument("--artifacts-dir", required=False, default=None)
+    p_status.set_defaults(func=cmd_status)
+
+    p_cancel = sub.add_parser("cancel", help="Cancel a job by killing worker and aborting session if known.")
+    p_cancel.add_argument("--run-id", required=False, default=None)
+    p_cancel.add_argument("--artifacts-dir", required=False, default=None)
+    p_cancel.add_argument("--env", action="append", default=[], help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env.")
+    p_cancel.add_argument("--env-file", action="append", default=[], help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env-file.")
     p_cancel.set_defaults(func=cmd_cancel)
 
-    args = parser.parse_args()
-    return int(args.func(args))
+    p_es = sub.add_parser("ensure-server", help="Ensure a per-project opencode server.")
+    p_es.add_argument("--opencode", default=("opencode.cmd" if os.name == "nt" else "opencode"))
+    p_es.add_argument("--workdir", default=".")
+    p_es.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME)
+    p_es.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
+    p_es.add_argument("--server-wait", type=float, default=DEFAULT_SERVER_WAIT_S)
+    p_es.add_argument("--env", action="append", default=[])
+    p_es.add_argument("--env-file", action="append", default=[])
+    p_es.set_defaults(func=cmd_ensure_server)
 
+    p_ss = sub.add_parser("stop-server", help="Stop the per-project opencode server.")
+    p_ss.add_argument("--workdir", default=".")
+    p_ss.set_defaults(func=cmd_stop_server)
+
+    args = parser.parse_args(argv)
+
+    # Apply deprecated alias: --no-attach => --no-attach-server
+    if hasattr(args, "no_attach_deprecated") and getattr(args, "no_attach_deprecated"):
+        setattr(args, "attach_server", False)
+
+    return int(args.func(args))  # type: ignore[misc]
 
 if __name__ == "__main__":
     raise SystemExit(main())
