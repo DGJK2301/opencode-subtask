@@ -175,7 +175,7 @@ All commands return a single JSON object to stdout:
 |------|---------------|--------------|
 | `inherit` | No auto-reply | Use existing OPENCODE_PERMISSION |
 | `allow` | Auto-allow via API | OPENCODE_PERMISSION=`{\"*\":\"allow\"}` |
-| `noninteractive` | Auto-deny via API | OPENCODE_PERMISSION=<no-ask preset JSON (deny `external_directory`/`doom_loop`/nested agents; deny `*.env` reads)> |
+| `noninteractive` | Auto-reply via API (conservative allow/deny; denies `external_directory`/`doom_loop`/nested agents and `*.env` reads when detectable) | OPENCODE_PERMISSION=<no-ask preset JSON (deny `external_directory`/`doom_loop`/nested agents; deny `*.env` reads)> |
 
 ## Model Selection
 
@@ -204,7 +204,7 @@ python scripts/opencode_subtask.py stop-server --workdir .
 - **Stuck detection**: Use `status` output's `progress.idleForSeconds` + artifact sizes
 - **Prompt hygiene**: Use Facts/Hypotheses/Constraints/Acceptance capsule (see `subtask-orchestrator`)
 - **Result extraction**: Prefers sentinel-wrapped JSON (`BEGIN_OC_SUBTASK_JSON`/`END_OC_SUBTASK_JSON`)
-- **Windows**: Default executable is `opencode.cmd`; uses `taskkill /T /F` for process cleanup
+- **Windows**: Default executable is `opencode` (the wrapper prefers `opencode.exe` if available and falls back to `opencode.cmd`); uses `taskkill /T /F` for process cleanup
 - **Fallback logging**: When HTTP→CLI fallback occurs, `engine.fallbackFrom` is set in finish JSON
 
 ## Troubleshooting

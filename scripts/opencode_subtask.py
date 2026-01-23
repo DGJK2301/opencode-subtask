@@ -1257,6 +1257,62 @@ def _run_http(
     sse_connected = threading.Event()
     sse_open_error: list[str] = []
 
+    def _noninteractive_permission_response(evt: dict[str, Any]) -> str:
+        """
+        Best-effort: align HTTP permission handling with the CLI "noninteractive" preset.
+
+        Goal: avoid hangs (no prompts) while denying a few high-risk classes when we can identify them
+        from SSE payloads. If we cannot classify the request, default to "allow" to keep unattended
+        runs moving (callers can always choose --permission-mode inherit for interactive safety).
+        """
+        perm_obj: dict[str, Any] | None = None
+        perm = evt.get("permission")
+        if isinstance(perm, dict):
+            perm_obj = perm
+        data = evt.get("data")
+        if perm_obj is None and isinstance(data, dict):
+            perm2 = data.get("permission")
+            if isinstance(perm2, dict):
+                perm_obj = perm2
+
+        def _strings_from(obj: Any) -> list[str]:
+            out: list[str] = []
+            if isinstance(obj, str):
+                out.append(obj)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    out.extend(_strings_from(v))
+            elif isinstance(obj, list):
+                for v in obj:
+                    out.extend(_strings_from(v))
+            return out
+
+        kind = None
+        if perm_obj:
+            for k in ("permission", "type", "name", "tool", "category", "action"):
+                v = perm_obj.get(k)
+                if isinstance(v, str) and v:
+                    kind = v
+                    break
+        if not kind and isinstance(perm, str) and perm:
+            kind = perm
+
+        kind_l = kind.lower() if isinstance(kind, str) else ""
+        if kind_l in ("task", "skill", "external_directory", "doom_loop"):
+            return "deny"
+
+        # Deny reads of .env-style secrets when we can detect them.
+        # (The CLI preset denies *.env and *.env.* but allows *.env.example.)
+        if kind_l.startswith("read") or kind_l == "read":
+            texts = [s.lower() for s in _strings_from(perm_obj or {})]
+            for s in texts:
+                if s.endswith(".env.example"):
+                    continue
+                if s.endswith(".env") or ".env." in s:
+                    return "deny"
+
+        return "allow"
+
     def maybe_permission_id(evt: dict[str, Any]) -> str | None:
         # Heuristic extraction: permissionID / permissionId / permission.id / data.permission.id
         for k in ("permissionID", "permissionId"):
@@ -1360,7 +1416,11 @@ def _run_http(
                                 client.reply_permission(
                                     session_id,
                                     pid,
-                                    response=("allow" if permission_mode == "allow" else "deny"),
+                                    response=(
+                                        "allow"
+                                        if permission_mode == "allow"
+                                        else _noninteractive_permission_response(evt)
+                                    ),
                                     remember=False,
                                 )
 
@@ -2271,7 +2331,13 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--attach", default=None, help="Attach/connect to an existing OpenCode server URL (e.g., http://127.0.0.1:4096).")
 
     # New naming: attach-server / no-attach-server (default: attach)
-    p.add_argument("--attach-server", dest="attach_server", action=argparse.BooleanOptionalAction, default=True, help="Ensure/attach a per-project opencode server (default: true).")
+    p.add_argument(
+        "--attach-server",
+        dest="attach_server",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Attach to a per-project opencode server when available (auto), or ensure one is running (http). (default: true)",
+    )
     # Deprecated alias: --no-attach
     p.add_argument("--no-attach", dest="no_attach_deprecated", action="store_true", help=argparse.SUPPRESS)
 
