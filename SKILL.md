@@ -72,7 +72,7 @@ python scripts/opencode_subtask.py run --workdir . --engine auto --no-quiet -- \
 | Flag | Default | Notes |
 |------|---------|------|
 | `--workdir` | `.` | Target project directory (not the skill directory). |
-| `--engine` | `auto` | `auto` tries HTTP first → CLI fallback on failure. |
+| `--engine` | `auto` | `auto` uses HTTP only if a server URL is available (via `--attach` or `ensure-server`), otherwise CLI. |
 | `--model` | (OpenCode default) | Prefer setting defaults in `opencode.json`. |
 | `--variant` | (none) | Pass as `--variant <name>`; do **not** use `model:suffix`. |
 | `--permission-mode` | `inherit` | Use `allow` for unattended runs; use `inherit` for interactive safety. |
@@ -94,7 +94,7 @@ Session reuse can reduce cost/time, but it also increases the risk of “context
 
 | Flag | Notes |
 |------|------|
-| `--no-quiet` | Allow streaming progress logs (still keeps stdout as one JSON line). |
+| `--no-quiet` | Allow streaming OpenCode events to stderr (stdout still stays one JSON line). |
 | `--max-text-chars <n>` | Bound the `summary` size in the finish JSON. |
 | `--max-artifact-bytes <n>` | Hard cap per artifact file (0 disables). |
 | `--include-debug` | Include extra debug fields in the finish JSON. |

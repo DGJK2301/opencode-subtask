@@ -1085,8 +1085,9 @@ def _run_cli(
                     pass
             if not quiet:
                 try:
-                    sys.stdout.buffer.write(raw)
-                    sys.stdout.buffer.flush()
+                    # Never write streaming events to stdout; stdout is reserved for the final one-line JSON.
+                    sys.stderr.buffer.write(raw)
+                    sys.stderr.buffer.flush()
                 except Exception:
                     pass
             # Parse JSON event
@@ -1938,6 +1939,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
             | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
         popen_kwargs["creationflags"] = creationflags
     else:
@@ -2345,7 +2347,7 @@ def main(argv: list[str] | None = None) -> int:
     p_cancel.set_defaults(func=cmd_cancel)
 
     p_es = sub.add_parser("ensure-server", help="Ensure a per-project opencode server.")
-    p_es.add_argument("--opencode", default=("opencode.cmd" if os.name == "nt" else "opencode"))
+    p_es.add_argument("--opencode", default="opencode")
     p_es.add_argument("--workdir", default=".")
     p_es.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME)
     p_es.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
