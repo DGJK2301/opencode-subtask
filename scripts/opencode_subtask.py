@@ -188,6 +188,33 @@ def _server_log_path(workdir: Path) -> Path:
 def _server_lock_path(workdir: Path) -> Path:
     return _servers_dir() / f"{_project_key(workdir)}.lock"
 
+def _win_hide_popen_kwargs(*, detached: bool) -> dict[str, Any]:
+    """
+    Best-effort to prevent Windows console windows from flashing open.
+
+    - For background processes (server/worker): detached=True.
+    - For CLI runs (need stdout pipes): detached=False.
+    """
+    if os.name != "nt":
+        return {}
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if detached:
+        creationflags |= (
+            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        )
+
+    kw: dict[str, Any] = {"creationflags": creationflags}
+    try:
+        si = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
+        si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kw["startupinfo"] = si
+    except Exception:
+        pass
+    return kw
+
 def _make_run_id() -> str:
     return f"run_{_now_ms()}_{os.getpid()}"
 
@@ -486,6 +513,15 @@ def ensure_server(
                 _write_json(st_path, st)
                 return st
 
+            # If we have a recorded PID and it is still alive, do not spawn another server.
+            # Starting multiple servers for the same project is noisy on Windows and can confuse callers.
+            pid = int(st.get("pid") or 0) if isinstance(st.get("pid"), (int, str)) else 0
+            if pid and _pid_running(pid):
+                raise RuntimeError(
+                    f"opencode serve appears to be running but unhealthy: pid={pid} url={url}. "
+                    "Use `stop-server` (or fix server auth/config) before retrying."
+                )
+
         # Do NOT auto-kill a stale PID here.
         # OpenCode may be running other work; killing aggressively can disrupt unrelated tasks.
 
@@ -498,12 +534,7 @@ def ensure_server(
 
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            creationflags = (
-                subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-                | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-            popen_kwargs["creationflags"] = creationflags
+            popen_kwargs.update(_win_hide_popen_kwargs(detached=True))
         else:
             popen_kwargs["start_new_session"] = True
 
@@ -1039,7 +1070,7 @@ def _run_cli(
     try:
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            popen_kwargs.update(_win_hide_popen_kwargs(detached=False))
         proc = subprocess.Popen(
             cmd,
             cwd=str(workdir),
@@ -1996,12 +2027,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     log_fp = open(wrapper_log_path, "ab", buffering=0)
     popen_kwargs: dict[str, Any] = {}
     if os.name == "nt":
-        creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-            | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
-        popen_kwargs["creationflags"] = creationflags
+        popen_kwargs.update(_win_hide_popen_kwargs(detached=True))
     else:
         popen_kwargs["start_new_session"] = True
 
@@ -2295,18 +2321,23 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
     if not opencode_bin:
         sys.stdout.write(_json_line({"ok": False, "error": {"name": "OpencodeNotFound", "message": args.opencode}}) + "\n")
         return 1
-    st = ensure_server(
-        opencode_bin=opencode_bin,
-        workdir=workdir,
-        hostname=args.server_hostname,
-        port=args.server_port,
-        wait_s=args.server_wait,
-        env=env,
-        auth=auth,
-    )
-    out = {"type": "opencode-subtask-server", "ok": True, "server": st}
-    sys.stdout.write(_json_line(out) + "\n")
-    return 0
+    try:
+        st = ensure_server(
+            opencode_bin=opencode_bin,
+            workdir=workdir,
+            hostname=args.server_hostname,
+            port=args.server_port,
+            wait_s=args.server_wait,
+            env=env,
+            auth=auth,
+        )
+        out = {"type": "opencode-subtask-server", "ok": True, "server": st}
+        sys.stdout.write(_json_line(out) + "\n")
+        return 0
+    except Exception as e:
+        out = {"type": "opencode-subtask-server", "ok": False, "error": {"name": type(e).__name__, "message": str(e)}}
+        sys.stdout.write(_json_line(out) + "\n")
+        return 1
 
 def cmd_stop_server(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()

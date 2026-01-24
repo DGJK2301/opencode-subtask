@@ -212,6 +212,7 @@ python scripts/opencode_subtask.py stop-server --workdir .
 | Symptom | Check |
 |---------|-------|
 | `ok=false`, `error.name=ServerUnhealthy` | Server not running/healthy. If you want HTTP, run `ensure-server` (or pass `--attach`). Otherwise use CLI (`--engine cli`). |
+| A `opencode serve` / Node console window pops up | You are starting/ensuring a server (`ensure-server` or `--engine http`). Use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`) to avoid starting a server. |
 | `ok=false`, `error.name=SseUnavailable` | SSE endpoint blocked; try `--engine cli` |
 | `ok=false`, `error.name=Timeout` | Increase `--timeout`; check model complexity |
 | `ok=false`, `error.name=OutputTooLarge` | Reduce output or increase `--max-artifact-bytes` |
