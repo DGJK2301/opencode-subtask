@@ -123,10 +123,19 @@ Session reuse can reduce cost/time by continuing an existing OpenCode session, a
 | `--session <id>` / `-s <id>` | Continue a specific OpenCode session. |
 | `--title <text>` | Set/update session title. |
 
-**Example: Multi-step review workflow**
+**Practical scenarios:**
+
+| Scenario | Approach | Benefit |
+|----------|----------|---------|
+| Code review → Fix → Verify | `--session <id>` chain | Model remembers identified issues across steps |
+| Incremental refactoring | `--continue` for each step | Maintains refactoring context and decisions |
+| Q&A about a codebase | `--continue` conversation | Avoids re-reading files, uses cached context |
+| Parallel independent tasks | No session reuse (default) | Clean isolation, no cross-contamination |
+
+**Example 1: Multi-step code review (explicit session ID)**
 
 ```bash
-# Step 1: Initial analysis (starts new session, returns sessionId in finish JSON)
+# Step 1: Initial analysis (starts new session)
 RESULT1=$(python scripts/opencode_subtask.py run --workdir . --engine cli \
   --model google/antigravity-gemini-3-flash --variant low \
   --permission-mode allow \
@@ -134,6 +143,7 @@ RESULT1=$(python scripts/opencode_subtask.py run --workdir . --engine cli \
 
 # Extract sessionId from JSON output
 SESSION_ID=$(echo "$RESULT1" | python -c "import sys,json; print(json.load(sys.stdin).get('sessionId',''))")
+echo "Session: $SESSION_ID"
 
 # Step 2: Continue same session for follow-up (has context from step 1)
 python scripts/opencode_subtask.py run --workdir . --engine cli \
@@ -142,15 +152,69 @@ python scripts/opencode_subtask.py run --workdir . --engine cli \
   --permission-mode allow \
   -- "Now fix the first bug you identified. Show the diff."
 
-# Alternative: Just continue the last session (simpler but less explicit)
+# Step 3: Continue for verification
 python scripts/opencode_subtask.py run --workdir . --engine cli \
-  --continue \
+  --session "$SESSION_ID" \
   --model google/antigravity-gemini-3-flash --variant low \
   --permission-mode allow \
-  -- "Fix the second bug you identified."
+  -- "Verify the fix is correct. Any remaining issues?"
 ```
 
-**Note:** The `sessionId` is returned in the finish JSON (`finish.sessionId`). The session belongs to OpenCode, not to this adapter.
+**Example 2: Quick Q&A chain (--continue shorthand)**
+
+```bash
+# Step 1: Ask about file structure
+python scripts/opencode_subtask.py run --workdir . --engine cli \
+  --model siliconflow-cn/Pro/zai-org/GLM-4.7 \
+  --permission-mode allow \
+  -- "Count how many lines are in SKILL.md."
+
+# Step 2: Follow-up (uses --continue to auto-resume last session)
+python scripts/opencode_subtask.py run --workdir . --engine cli \
+  --continue \
+  --model siliconflow-cn/Pro/zai-org/GLM-4.7 \
+  --permission-mode allow \
+  -- "What file did you just count? How many lines?"
+
+# Step 3: Another follow-up
+python scripts/opencode_subtask.py run --workdir . --engine cli \
+  --continue \
+  --model siliconflow-cn/Pro/zai-org/GLM-4.7 \
+  --permission-mode allow \
+  -- "What was the first section heading in that file?"
+```
+
+**Verified behavior (tested with GLM-4.7):**
+
+| Step | Input tokens | Cache read | Observation |
+|------|--------------|------------|-------------|
+| Step 1 (new session) | 5042 | 10240 | Fresh context, reads file |
+| Step 2 (`--session`) | 380 | 15232 | 92% fewer input tokens, remembers "SKILL.md had 318 lines" |
+| Step 3 (`--continue`) | 713 | 15232 | Remembers file, answers from memory |
+
+**Example 3: Windows batch script**
+
+```bat
+@echo off
+setlocal EnableDelayedExpansion
+
+REM Step 1: Analyze
+for /f "delims=" %%i in ('python scripts\opencode_subtask.py run --workdir . --engine cli --model google/antigravity-gemini-3-flash --permission-mode allow -- "List all TODO comments in src/"') do set RESULT=%%i
+
+REM Extract sessionId using Python
+for /f %%s in ('echo !RESULT! ^| python -c "import sys,json; print(json.load(sys.stdin).get('sessionId',''))"') do set SESSION_ID=%%s
+
+echo Session: %SESSION_ID%
+
+REM Step 2: Continue
+python scripts\opencode_subtask.py run --workdir . --engine cli ^
+  --session "%SESSION_ID%" ^
+  --model google/antigravity-gemini-3-flash ^
+  --permission-mode allow ^
+  -- "Pick the most important TODO and implement it."
+```
+
+**Note:** The `sessionId` is returned in the finish JSON (`finish.sessionId`). The session belongs to OpenCode CLI, not to this adapter. HTTP engine uses different session mechanics (server-managed sessions).
 
 ### Output control / debugging
 
