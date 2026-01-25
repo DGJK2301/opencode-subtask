@@ -11,6 +11,7 @@ A Codex-friendly adapter around OpenCode that provides:
 Python: 3.10+
 No third-party deps.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,7 +31,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
-from typing import Any, Final, Iterable
+from typing import Any, Final, Iterable, Never, NoReturn
 
 # ============================
 # Constants / schema
@@ -51,18 +52,35 @@ DEFAULT_SERVER_WAIT_S: Final[float] = 10.0
 SENTINEL_BEGIN: Final[str] = "BEGIN_OC_SUBTASK_JSON"
 SENTINEL_END: Final[str] = "END_OC_SUBTASK_JSON"
 
-JSON_FENCE_RE: Final[re.Pattern[str]] = re.compile(r"```(?:json)?\s*({[\s\S]*?})\s*```", re.IGNORECASE)
+JSON_FENCE_RE: Final[re.Pattern[str]] = re.compile(
+    r"```(?:json)?\s*({[\s\S]*?})\s*```", re.IGNORECASE
+)
 
 # ============================
 # Small utilities
 # ============================
 
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
 
 def _json_line(obj: dict[str, Any]) -> str:
     # ASCII-only JSON to survive GBK/CP1252 stdout encodings.
     return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
+
+
+def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> Never:
+    """Print a JSON error to stdout and exit. Maintains stdout contract."""
+    obj = {
+        "type": "opencode-subtask-error",
+        "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "ok": False,
+        "error": {"name": error_name, "message": message},
+    }
+    sys.stdout.write(_json_line(obj) + "\n")
+    sys.exit(exit_code)
+
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -71,6 +89,7 @@ def _sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
     if max_chars <= 0:
         return "", True
@@ -78,10 +97,14 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
         return text, False
     return text[: max_chars - 1] + "…", True
 
+
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
-def _atomic_write_bytes(path: Path, data: bytes, *, retries: int = 5, sleep_s: float = 0.05) -> None:
+
+def _atomic_write_bytes(
+    path: Path, data: bytes, *, retries: int = 5, sleep_s: float = 0.05
+) -> None:
     """
     Atomic-ish write: write temp then os.replace.
     On Windows, os.replace may fail transiently due to AV/indexers locking files.
@@ -101,18 +124,22 @@ def _atomic_write_bytes(path: Path, data: bytes, *, retries: int = 5, sleep_s: f
     if last_err:
         raise last_err
 
+
 def _write_text(path: Path, text: str) -> None:
     _atomic_write_bytes(path, text.encode("utf-8"))
+
 
 def _write_json(path: Path, obj: dict[str, Any]) -> None:
     data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
     _atomic_write_bytes(path, data)
+
 
 def _load_json(path: Path) -> dict[str, Any] | None:
     try:
         return json.loads(_read_text(path))
     except Exception:
         return None
+
 
 def _tail_bytes(path: Path, max_bytes: int = 2048) -> str:
     try:
@@ -125,6 +152,7 @@ def _tail_bytes(path: Path, max_bytes: int = 2048) -> str:
     except Exception:
         return ""
 
+
 def _join_prompt(args_prompt: list[str]) -> str:
     prompt = " ".join(args_prompt).strip()
     if prompt:
@@ -133,9 +161,14 @@ def _join_prompt(args_prompt: list[str]) -> str:
         data = sys.stdin.read().strip()
         if data:
             return data
-    raise SystemExit("Missing prompt. Pass it as arguments after `--` or via stdin.")
+    _exit_with_error(
+        "MissingPrompt", "Missing prompt. Pass it as arguments after `--` or via stdin."
+    )
 
-def _merge_env(base: dict[str, str], set_vars: list[str], set_from_files: list[str]) -> dict[str, str]:
+
+def _merge_env(
+    base: dict[str, str], set_vars: list[str], set_from_files: list[str]
+) -> dict[str, str]:
     env = dict(base)
     for item in set_vars:
         if "=" not in item:
@@ -149,9 +182,11 @@ def _merge_env(base: dict[str, str], set_vars: list[str], set_from_files: list[s
         env[k.strip()] = _read_text(Path(p).expanduser().resolve())
     return env
 
+
 # ============================
 # Paths
 # ============================
+
 
 def _cache_root() -> Path:
     home = Path.home()
@@ -161,11 +196,14 @@ def _cache_root() -> Path:
         base = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
     return base / "opencode-subtask"
 
+
 def _runs_dir() -> Path:
     return _cache_root() / "runs"
 
+
 def _servers_dir() -> Path:
     return _cache_root() / "servers"
+
 
 def _find_git_root(start: Path) -> Path:
     cur = start.resolve()
@@ -174,19 +212,24 @@ def _find_git_root(start: Path) -> Path:
             return p
     return cur
 
+
 def _project_key(workdir: Path) -> str:
     root = _find_git_root(workdir)
     h = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
     return h[:12]
 
+
 def _server_state_path(workdir: Path) -> Path:
     return _servers_dir() / f"{_project_key(workdir)}.json"
+
 
 def _server_log_path(workdir: Path) -> Path:
     return _servers_dir() / f"{_project_key(workdir)}.log"
 
+
 def _server_lock_path(workdir: Path) -> Path:
     return _servers_dir() / f"{_project_key(workdir)}.lock"
+
 
 def _win_hide_popen_kwargs(*, detached: bool) -> dict[str, Any]:
     """
@@ -215,10 +258,14 @@ def _win_hide_popen_kwargs(*, detached: bool) -> dict[str, Any]:
         pass
     return kw
 
+
 def _make_run_id() -> str:
     return f"run_{_now_ms()}_{os.getpid()}"
 
-def _resolve_artifacts_dir(run_id: str | None, artifacts_dir: str | None) -> tuple[str, Path]:
+
+def _resolve_artifacts_dir(
+    run_id: str | None, artifacts_dir: str | None
+) -> tuple[str, Path]:
     rid = run_id or _make_run_id()
     if artifacts_dir:
         ad = Path(artifacts_dir).expanduser().resolve()
@@ -226,9 +273,11 @@ def _resolve_artifacts_dir(run_id: str | None, artifacts_dir: str | None) -> tup
         ad = (_runs_dir() / rid).resolve()
     return rid, ad
 
+
 # ============================
 # Process helpers
 # ============================
+
 
 def _pid_running(pid: int) -> bool:
     if pid <= 0:
@@ -247,6 +296,7 @@ def _pid_running(pid: int) -> bool:
         return str(pid) in out
     except Exception:
         return False
+
 
 def _kill_tree(pid: int) -> None:
     if pid <= 0:
@@ -267,6 +317,7 @@ def _kill_tree(pid: int) -> None:
         except Exception:
             pass
 
+
 def _proc_cmdline(pid: int) -> str:
     if pid <= 0:
         return ""
@@ -279,21 +330,32 @@ def _proc_cmdline(pid: int) -> str:
     # Windows: wmic is deprecated but still common; fall back to tasklist if needed.
     try:
         out = subprocess.check_output(
-            ["wmic", "process", "where", f"processid={pid}", "get", "CommandLine", "/VALUE"],
+            [
+                "wmic",
+                "process",
+                "where",
+                f"processid={pid}",
+                "get",
+                "CommandLine",
+                "/VALUE",
+            ],
             stderr=subprocess.DEVNULL,
         ).decode("utf-8", errors="replace")
         return out
     except Exception:
         return ""
 
+
 def _pick_free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
         return int(s.getsockname()[1])
 
+
 # ============================
 # Executable resolution (Windows-safe)
 # ============================
+
 
 def _resolve_executable(cmd: str) -> str | None:
     """
@@ -330,17 +392,22 @@ def _resolve_executable(cmd: str) -> str | None:
                 return str(Path(found2).resolve())
     return None
 
+
 # ============================
 # HTTP client (stdlib)
 # ============================
+
 
 @dataclass(frozen=True)
 class HttpAuth:
     username: str
     password: str
 
+
 class OpencodeHttpClient:
-    def __init__(self, base_url: str, auth: HttpAuth | None = None, timeout_s: float = 10.0):
+    def __init__(
+        self, base_url: str, auth: HttpAuth | None = None, timeout_s: float = 10.0
+    ):
         self.base_url = base_url.rstrip("/")
         self.auth = auth
         self.timeout_s = timeout_s
@@ -354,14 +421,24 @@ class OpencodeHttpClient:
             h.update(extra)
         return h
 
-    def _request_json(self, method: str, path: str, body: dict[str, Any] | None = None, timeout_s: float | None = None) -> tuple[int, dict[str, Any] | None]:
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        timeout_s: float | None = None,
+    ) -> tuple[int, dict[str, Any] | None]:
         url = self.base_url + path
         data = None
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method=method, headers=self._headers())
+        req = urllib.request.Request(
+            url, data=data, method=method, headers=self._headers()
+        )
         try:
-            with urllib.request.urlopen(req, timeout=float(timeout_s or self.timeout_s)) as resp:
+            with urllib.request.urlopen(
+                req, timeout=float(timeout_s or self.timeout_s)
+            ) as resp:
                 raw = resp.read()
                 if not raw:
                     return resp.status, None
@@ -373,7 +450,9 @@ class OpencodeHttpClient:
                 msg = raw.decode("utf-8", errors="replace")
             except Exception:
                 msg = ""
-            raise RuntimeError(f"HTTP {e.code} {e.reason} for {path}: {msg[:500]}") from e
+            raise RuntimeError(
+                f"HTTP {e.code} {e.reason} for {path}: {msg[:500]}"
+            ) from e
         except Exception as e:
             raise RuntimeError(f"HTTP request failed for {path}: {e}") from e
 
@@ -409,7 +488,9 @@ class OpencodeHttpClient:
         if agent:
             body["agent"] = agent
         # Server docs: POST /session/:id/message -> Message
-        _, js = self._request_json("POST", f"/session/{session_id}/message", body, timeout_s=timeout_s)
+        _, js = self._request_json(
+            "POST", f"/session/{session_id}/message", body, timeout_s=timeout_s
+        )
         if not isinstance(js, dict):
             raise RuntimeError("Invalid /message response (expected JSON object)")
         return js
@@ -417,30 +498,50 @@ class OpencodeHttpClient:
     def abort(self, session_id: str) -> None:
         # Server docs: POST /session/:id/abort
         try:
-            self._request_json("POST", f"/session/{session_id}/abort", {}, timeout_s=5.0)
+            self._request_json(
+                "POST", f"/session/{session_id}/abort", {}, timeout_s=5.0
+            )
         except Exception:
             pass
 
-    def reply_permission(self, session_id: str, permission_id: str, *, response: str, remember: bool = False) -> None:
+    def reply_permission(
+        self,
+        session_id: str,
+        permission_id: str,
+        *,
+        response: str,
+        remember: bool = False,
+    ) -> None:
         # Server docs: POST /session/:id/permissions/:permissionID
         body = {"response": response, "remember": remember}
         try:
-            self._request_json("POST", f"/session/{session_id}/permissions/{permission_id}", body, timeout_s=5.0)
+            self._request_json(
+                "POST",
+                f"/session/{session_id}/permissions/{permission_id}",
+                body,
+                timeout_s=5.0,
+            )
         except Exception:
             pass
 
-    def open_sse(self, path: str, *, timeout_s: float = 30.0) -> urllib.request.addinfourl:
+    def open_sse(
+        self, path: str, *, timeout_s: float = 30.0
+    ) -> urllib.request.addinfourl:
         """
         Open an SSE stream endpoint (returns a file-like HTTP response).
         Note: stdlib doesn't have native SSE parsing; we do manual line parsing.
         """
         url = self.base_url + path
-        req = urllib.request.Request(url, method="GET", headers=self._headers({"Accept": "text/event-stream"}))
+        req = urllib.request.Request(
+            url, method="GET", headers=self._headers({"Accept": "text/event-stream"})
+        )
         return urllib.request.urlopen(req, timeout=timeout_s)  # type: ignore[return-value]
+
 
 # ============================
 # Server lifecycle
 # ============================
+
 
 def _server_health(url_base: str, auth: HttpAuth | None) -> dict[str, Any] | None:
     c = OpencodeHttpClient(url_base, auth=auth, timeout_s=2.0)
@@ -449,12 +550,14 @@ def _server_health(url_base: str, auth: HttpAuth | None) -> dict[str, Any] | Non
         return js
     return None
 
+
 class _FileLock:
     """
     Minimal cross-platform advisory lock on a file.
     - Unix: fcntl.flock
     - Windows: msvcrt.locking
     """
+
     def __init__(self, path: Path):
         self.path = path
         self.fp = None
@@ -464,10 +567,12 @@ class _FileLock:
         self.fp = open(self.path, "a+b")
         if os.name == "nt":
             import msvcrt  # type: ignore
+
             # lock 1 byte
             msvcrt.locking(self.fp.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl  # type: ignore
+
             fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX)
         return self
 
@@ -477,10 +582,12 @@ class _FileLock:
         try:
             if os.name == "nt":
                 import msvcrt  # type: ignore
+
                 self.fp.seek(0)
                 msvcrt.locking(self.fp.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl  # type: ignore
+
                 fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
         finally:
             try:
@@ -488,6 +595,7 @@ class _FileLock:
             except Exception:
                 pass
             self.fp = None
+
 
 def ensure_server(
     *,
@@ -515,7 +623,9 @@ def ensure_server(
 
             # If we have a recorded PID and it is still alive, do not spawn another server.
             # Starting multiple servers for the same project is noisy on Windows and can confuse callers.
-            pid = int(st.get("pid") or 0) if isinstance(st.get("pid"), (int, str)) else 0
+            pid = (
+                int(st.get("pid") or 0) if isinstance(st.get("pid"), (int, str)) else 0
+            )
             if pid and _pid_running(pid):
                 raise RuntimeError(
                     f"opencode serve appears to be running but unhealthy: pid={pid} url={url}. "
@@ -578,6 +688,7 @@ def ensure_server(
         _write_json(st_path, state)
         return state
 
+
 def attach_existing_server(
     *,
     workdir: Path,
@@ -601,6 +712,7 @@ def attach_existing_server(
         _write_json(st_path, st)
         return st
 
+
 def stop_server(workdir: Path) -> dict[str, Any]:
     st_path = _server_state_path(workdir)
     st = _load_json(st_path) or {}
@@ -615,9 +727,11 @@ def stop_server(workdir: Path) -> dict[str, Any]:
         pass
     return {"ok": ok, "pid": pid, "statePath": str(st_path)}
 
+
 # ============================
 # Event aggregation (CLI NDJSON)
 # ============================
+
 
 class _TailText:
     def __init__(self, max_chars: int = 200_000):
@@ -636,6 +750,7 @@ class _TailText:
     def get(self) -> str:
         with self._lock:
             return self._buf
+
 
 def _extract_text_from_event(evt: dict[str, Any]) -> str | None:
     # Best-effort for OpenCode event shapes.
@@ -671,6 +786,7 @@ def _extract_text_from_event(evt: dict[str, Any]) -> str | None:
                 return v
     return None
 
+
 @dataclass
 class RunOutcome:
     ok: bool
@@ -683,11 +799,15 @@ class RunOutcome:
     metrics: dict[str, Any] | None
     error: dict[str, Any] | None
 
+
 # ============================
 # Structured result extraction
 # ============================
 
-def _extract_structured_json(text: str, *, max_scan_chars: int = 80_000) -> dict[str, Any] | None:
+
+def _extract_structured_json(
+    text: str, *, max_scan_chars: int = 80_000
+) -> dict[str, Any] | None:
     """
     Extraction order:
     1) Sentinel block between BEGIN_OC_SUBTASK_JSON and END_OC_SUBTASK_JSON.
@@ -740,6 +860,7 @@ def _extract_structured_json(text: str, *, max_scan_chars: int = 80_000) -> dict
             continue
     return None
 
+
 def _default_contract_prompt() -> str:
     return (
         "\n\n"
@@ -759,9 +880,11 @@ def _default_contract_prompt() -> str:
         "If you cannot comply, output an object with empty arrays.\n"
     )
 
+
 # ============================
 # Git diff / status
 # ============================
+
 
 def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
     """
@@ -772,10 +895,14 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
     if which("git") is None:
         return [], []
     try:
-        inside = subprocess.check_output(
-            ["git", "-C", str(workdir), "rev-parse", "--is-inside-work-tree"],
-            stderr=subprocess.DEVNULL,
-        ).decode("utf-8", errors="replace").strip()
+        inside = (
+            subprocess.check_output(
+                ["git", "-C", str(workdir), "rev-parse", "--is-inside-work-tree"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("utf-8", errors="replace")
+            .strip()
+        )
         if inside != "true":
             return [], []
     except Exception:
@@ -817,6 +944,7 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
         except Exception:
             return [], []
 
+
 def _git_patch(workdir: Path, artifacts_dir: Path) -> str | None:
     if which("git") is None:
         return None
@@ -833,9 +961,11 @@ def _git_patch(workdir: Path, artifacts_dir: Path) -> str | None:
     except Exception:
         return None
 
+
 # ============================
 # Output objects (stable contract)
 # ============================
+
 
 def _artifacts_obj(
     *,
@@ -862,6 +992,7 @@ def _artifacts_obj(
         "resultPath": result_path.name if result_path else None,
         "patchPath": patch_path,
     }
+
 
 def _finish_obj(
     *,
@@ -907,13 +1038,16 @@ def _finish_obj(
             "url": (server or {}).get("url"),
             "version": (server or {}).get("version"),
             "logPath": (server or {}).get("logPath"),
-        } if server else None,
+        }
+        if server
+        else None,
         "metrics": metrics,
         "error": error,
     }
     if include_debug and isinstance(debug, dict):
         obj["debug"] = debug
     return obj
+
 
 def _start_obj(
     *,
@@ -933,6 +1067,7 @@ def _start_obj(
         "workdir": str(workdir),
         "artifacts": artifacts,
     }
+
 
 def _status_obj(
     *,
@@ -958,9 +1093,11 @@ def _status_obj(
         "error": error,
     }
 
+
 # ============================
 # Permission mode
 # ============================
+
 
 def _apply_permission_mode(env: dict[str, str], mode: str) -> None:
     """
@@ -983,11 +1120,17 @@ def _apply_permission_mode(env: dict[str, str], mode: str) -> None:
                 "skill": "deny",
                 "external_directory": "deny",
                 "doom_loop": "deny",
-                "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+                "read": {
+                    "*": "allow",
+                    "*.env": "deny",
+                    "*.env.*": "deny",
+                    "*.env.example": "allow",
+                },
             }
         )
     else:
         env["OPENCODE_PERMISSION"] = mode
+
 
 def _get_http_auth_from_env(env: dict[str, str]) -> HttpAuth | None:
     # Server docs: OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD for Basic Auth.
@@ -997,11 +1140,15 @@ def _get_http_auth_from_env(env: dict[str, str]) -> HttpAuth | None:
         return HttpAuth(username=u, password=p)
     return None
 
+
 # ============================
 # Engines
 # ============================
 
-def _enforce_artifact_cap(paths: Iterable[Path], max_bytes: int) -> tuple[bool, str | None]:
+
+def _enforce_artifact_cap(
+    paths: Iterable[Path], max_bytes: int
+) -> tuple[bool, str | None]:
     if max_bytes <= 0:
         return True, None
     for p in paths:
@@ -1011,6 +1158,7 @@ def _enforce_artifact_cap(paths: Iterable[Path], max_bytes: int) -> tuple[bool, 
         except Exception:
             continue
     return True, None
+
 
 def _run_cli(
     *,
@@ -1058,8 +1206,14 @@ def _run_cli(
     cmd.append("--")
     cmd.append("Follow the instructions in the attached prompt.txt.")
 
-    events_fp = open(events_path, "ab", buffering=0) if (save_events and events_path) else None
-    assistant_fp = open(assistant_path, "ab", buffering=0) if (save_text and assistant_path) else None
+    events_fp = (
+        open(events_path, "ab", buffering=0) if (save_events and events_path) else None
+    )
+    assistant_fp = (
+        open(assistant_path, "ab", buffering=0)
+        if (save_text and assistant_path)
+        else None
+    )
     stderr_fp = open(stderr_path, "ab", buffering=0)
 
     tail = _TailText()
@@ -1142,8 +1296,16 @@ def _run_cli(
             if evt.get("type") in ("step-finish", "step_finish", "step-finished"):
                 part = evt.get("part") if isinstance(evt.get("part"), dict) else evt
                 if isinstance(part, dict):
-                    tok = part.get("tokens") if isinstance(part.get("tokens"), dict) else None
-                    metrics = {"reason": part.get("reason"), "cost": part.get("cost"), "tokens": tok}
+                    tok = (
+                        part.get("tokens")
+                        if isinstance(part.get("tokens"), dict)
+                        else None
+                    )
+                    metrics = {
+                        "reason": part.get("reason"),
+                        "cost": part.get("cost"),
+                        "tokens": tok,
+                    }
             # Collect assistant-ish text
             t = _extract_text_from_event(evt)
             if isinstance(t, str) and t:
@@ -1194,16 +1356,30 @@ def _run_cli(
     exit_code = proc.returncode if proc.returncode is not None else 1
     full_text = tail.get()
 
-    ok = (not timed_out) and (not killed_for_size) and exit_code == 0 and error_event is None
+    ok = (
+        (not timed_out)
+        and (not killed_for_size)
+        and exit_code == 0
+        and error_event is None
+    )
 
     err: dict[str, Any] | None = None
     if not ok:
         if killed_for_size:
-            err = {"name": "OutputTooLarge", "message": f"artifact {killed_file} exceeded max-artifact-bytes={max_artifact_bytes}"}
+            err = {
+                "name": "OutputTooLarge",
+                "message": f"artifact {killed_file} exceeded max-artifact-bytes={max_artifact_bytes}",
+            }
         elif timed_out:
-            err = {"name": "Timeout", "message": f"opencode run exceeded timeout={timeout_s}s"}
+            err = {
+                "name": "Timeout",
+                "message": f"opencode run exceeded timeout={timeout_s}s",
+            }
         elif error_event:
-            err = {"name": "OpencodeErrorEvent", "message": json.dumps(error_event, ensure_ascii=False)[:5000]}
+            err = {
+                "name": "OpencodeErrorEvent",
+                "message": json.dumps(error_event, ensure_ascii=False)[:5000],
+            }
         else:
             err = {"name": "NonZeroExit", "message": f"opencode exit_code={exit_code}"}
 
@@ -1218,6 +1394,7 @@ def _run_cli(
         metrics=metrics,
         error=err,
     )
+
 
 def _extract_text_from_message_obj(msg: dict[str, Any]) -> str:
     # /message response is documented as Message, typically has parts[]
@@ -1240,6 +1417,7 @@ def _extract_text_from_message_obj(msg: dict[str, Any]) -> str:
     if isinstance(msg.get("text"), str):
         return str(msg["text"])
     return json.dumps(msg, ensure_ascii=False)
+
 
 def _run_http(
     *,
@@ -1276,11 +1454,20 @@ def _run_http(
             session_id=None,
             full_text="",
             metrics=None,
-            error={"name": "ServerUnhealthy", "message": f"/global/health not healthy for {server_url}"},
+            error={
+                "name": "ServerUnhealthy",
+                "message": f"/global/health not healthy for {server_url}",
+            },
         )
 
-    events_fp = open(events_path, "ab", buffering=0) if (save_events and events_path) else None
-    assistant_fp = open(assistant_path, "ab", buffering=0) if (save_text and assistant_path) else None
+    events_fp = (
+        open(events_path, "ab", buffering=0) if (save_events and events_path) else None
+    )
+    assistant_fp = (
+        open(assistant_path, "ab", buffering=0)
+        if (save_text and assistant_path)
+        else None
+    )
     stderr_fp = open(stderr_path, "ab", buffering=0)
 
     responded_permissions: set[str] = set()
@@ -1359,7 +1546,11 @@ def _run_http(
         if isinstance(data, dict):
             perm2 = data.get("permission")
             if isinstance(perm2, dict):
-                v = perm2.get("id") or perm2.get("permissionID") or perm2.get("permissionId")
+                v = (
+                    perm2.get("id")
+                    or perm2.get("permissionID")
+                    or perm2.get("permissionId")
+                )
                 if isinstance(v, str) and v:
                     return v
         return None
@@ -1427,13 +1618,20 @@ def _run_http(
                     sid = evt.get("sessionID") or evt.get("sessionId")
                     if isinstance(sid, str) and sid and sid != session_id:
                         continue
-                    if not sid and evt.get("type") not in ("server.connected", "server_connected"):
+                    if not sid and evt.get("type") not in (
+                        "server.connected",
+                        "server_connected",
+                    ):
                         continue
 
                     # Write NDJSON
                     if events_fp:
                         try:
-                            events_fp.write((json.dumps(evt, ensure_ascii=False) + "\n").encode("utf-8"))
+                            events_fp.write(
+                                (json.dumps(evt, ensure_ascii=False) + "\n").encode(
+                                    "utf-8"
+                                )
+                            )
                         except Exception:
                             pass
 
@@ -1462,7 +1660,9 @@ def _run_http(
                     )
                     if not ok_cap and which_file:
                         try:
-                            stderr_fp.write(f"OutputTooLarge: {which_file}\n".encode("utf-8"))
+                            stderr_fp.write(
+                                f"OutputTooLarge: {which_file}\n".encode("utf-8")
+                            )
                             stderr_fp.flush()
                         except Exception:
                             pass
@@ -1526,7 +1726,11 @@ def _run_http(
                 events_fp.close()
             if assistant_fp:
                 assistant_fp.close()
-            stderr_fp.write(("SSE unavailable; cannot stream events for diagnostics/permissions.\n").encode("utf-8"))
+            stderr_fp.write(
+                (
+                    "SSE unavailable; cannot stream events for diagnostics/permissions.\n"
+                ).encode("utf-8")
+            )
             stderr_fp.close()
             return RunOutcome(
                 ok=False,
@@ -1537,7 +1741,14 @@ def _run_http(
                 session_id=session_id,
                 full_text="",
                 metrics=None,
-                error={"name": "SseUnavailable", "message": (sse_open_error[-1] if sse_open_error else "SSE stream not connected")},
+                error={
+                    "name": "SseUnavailable",
+                    "message": (
+                        sse_open_error[-1]
+                        if sse_open_error
+                        else "SSE stream not connected"
+                    ),
+                },
             )
 
     timed_out = False
@@ -1558,7 +1769,10 @@ def _run_http(
         if "timed out" in str(e).lower() or "timeout" in str(e).lower():
             timed_out = True
             client.abort(session_id)
-            err = {"name": "Timeout", "message": f"HTTP message exceeded timeout={timeout_s}s"}
+            err = {
+                "name": "Timeout",
+                "message": f"HTTP message exceeded timeout={timeout_s}s",
+            }
         else:
             err = {"name": "HttpError", "message": str(e)}
     finally:
@@ -1580,7 +1794,10 @@ def _run_http(
         )
         if not ok_cap and which_file:
             client.abort(session_id)
-            err = {"name": "OutputTooLarge", "message": f"artifact {which_file} exceeded max-artifact-bytes={max_artifact_bytes}"}
+            err = {
+                "name": "OutputTooLarge",
+                "message": f"artifact {which_file} exceeded max-artifact-bytes={max_artifact_bytes}",
+            }
         full_text = text
     else:
         full_text = ""
@@ -1605,9 +1822,11 @@ def _run_http(
         error=err,
     )
 
+
 # ============================
 # Commands
 # ============================
+
 
 def cmd_run(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
@@ -1620,7 +1839,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         prompt = _read_text(Path(args.prompt_file).expanduser().resolve())
     elif args.prompt_text is not None:
         if args.prompt:
-            raise SystemExit("Use either --prompt or positional prompt args, not both.")
+            _exit_with_error(
+                "PromptConflict",
+                "Use either --prompt or positional prompt args, not both.",
+            )
         prompt = str(args.prompt_text)
     else:
         prompt = _join_prompt(args.prompt)
@@ -1678,7 +1900,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Need opencode binary if we might call CLI engine OR we need to start a server.
     opencode_bin: str | None = None
-    need_opencode_bin = (args.engine in ("cli", "auto")) or (not attach_url and args.attach_server)
+    need_opencode_bin = (args.engine in ("cli", "auto")) or (
+        not attach_url and args.attach_server
+    )
     if need_opencode_bin:
         default_cmd = args.opencode
         opencode_bin = _resolve_executable(default_cmd)
@@ -1712,7 +1936,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                     patch_path=None,
                 ),
                 metrics=None,
-                error={"name": "OpencodeNotFound", "message": f"Could not find opencode executable: {default_cmd}"},
+                error={
+                    "name": "OpencodeNotFound",
+                    "message": f"Could not find opencode executable: {default_cmd}",
+                },
                 include_debug=args.include_debug,
                 debug=None,
             )
@@ -1763,7 +1990,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     # CLI workaround: in some OpenCode versions, "opencode run --attach ... --agent <name>" can fail.
     # If attach was auto-created (not user-provided) and agent is set, prefer standalone CLI (no attach).
     cli_attach_url = attach_url
-    if args.agent and cli_attach_url and (args.attach is None) and args.workaround_agent_attach:
+    if (
+        args.agent
+        and cli_attach_url
+        and (args.attach is None)
+        and args.workaround_agent_attach
+    ):
         cli_attach_url = None
 
     def run_cli() -> RunOutcome:
@@ -1803,7 +2035,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                 session_id=None,
                 full_text="",
                 metrics=None,
-                error={"name": "NoServer", "message": "HTTP engine requires --attach or --attach-server (default)"},
+                error={
+                    "name": "NoServer",
+                    "message": "HTTP engine requires --attach or --attach-server (default)",
+                },
             )
         return _run_http(
             server_url=attach_url,
@@ -1866,7 +2101,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         if isinstance(result_obj, dict):
             record = dict(result_obj)
         else:
-            record = {"summary": summary, "evidence": [], "changes": [], "next_steps": [], "raw": result_obj}
+            record = {
+                "summary": summary,
+                "evidence": [],
+                "changes": [],
+                "next_steps": [],
+                "raw": result_obj,
+            }
         # Enrich
         record.setdefault("changed_files", changed_files)
         record.setdefault("untracked_files", untracked_files)
@@ -1887,7 +2128,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             "fallbackFrom": fallback_from,
             "serverError": server_error,
             "serverUrl": attach_url,
-            "serverHealth": (OpencodeHttpClient(attach_url, auth=_get_http_auth_from_env(env)).health() if attach_url else None),
+            "serverHealth": (
+                OpencodeHttpClient(
+                    attach_url, auth=_get_http_auth_from_env(env)
+                ).health()
+                if attach_url
+                else None
+            ),
         }
 
     out = _finish_obj(
@@ -1940,6 +2187,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     sys.stdout.write(_json_line(out) + "\n")
     return 0 if ok else 1
 
+
 def cmd_start(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
 
@@ -1956,7 +2204,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     finish_path = artifacts_dir / "finish.json"
     wrapper_log_path = artifacts_dir / "wrapper.log"
 
-    _write_json(job_path, {"runId": run_id, "workdir": str(workdir), "state": "queued", "createdAt": _now_ms(), "updatedAt": _now_ms()})
+    _write_json(
+        job_path,
+        {
+            "runId": run_id,
+            "workdir": str(workdir),
+            "state": "queued",
+            "createdAt": _now_ms(),
+            "updatedAt": _now_ms(),
+        },
+    )
     _write_text(wrapper_log_path, "")
 
     # Build worker command (explicitly pass run_id/artifacts_dir/opencode path and flags).
@@ -1965,22 +2222,35 @@ def cmd_start(args: argparse.Namespace) -> int:
         py,
         str(Path(__file__).resolve()),
         "run",
-        "--workdir", str(workdir),
-        "--run-id", run_id,
-        "--artifacts-dir", str(artifacts_dir),
-        "--opencode", args.opencode,
-        "--engine", args.engine,
-        "--timeout", str(args.timeout),
-        "--max-text-chars", str(args.max_text_chars),
-        "--max-artifact-bytes", str(args.max_artifact_bytes),
-        "--permission-mode", args.permission_mode,
+        "--workdir",
+        str(workdir),
+        "--run-id",
+        run_id,
+        "--artifacts-dir",
+        str(artifacts_dir),
+        "--opencode",
+        args.opencode,
+        "--engine",
+        args.engine,
+        "--timeout",
+        str(args.timeout),
+        "--max-text-chars",
+        str(args.max_text_chars),
+        "--max-artifact-bytes",
+        str(args.max_artifact_bytes),
+        "--permission-mode",
+        args.permission_mode,
     ]
 
     # booleans
     worker_cmd.append("--quiet" if args.quiet else "--no-quiet")
     worker_cmd.append("--save-events" if args.save_events else "--no-save-events")
     worker_cmd.append("--save-text" if args.save_text else "--no-save-text")
-    worker_cmd.append("--disable-claude-code" if args.disable_claude_code else "--no-disable-claude-code")
+    worker_cmd.append(
+        "--disable-claude-code"
+        if args.disable_claude_code
+        else "--no-disable-claude-code"
+    )
     if args.include_debug:
         worker_cmd.append("--include-debug")
     if args.no_contract:
@@ -1999,7 +2269,16 @@ def cmd_start(args: argparse.Namespace) -> int:
         worker_cmd.append("--attach-server")
     else:
         worker_cmd.append("--no-attach-server")
-    worker_cmd.extend(["--server-hostname", args.server_hostname, "--server-port", str(args.server_port), "--server-wait", str(args.server_wait)])
+    worker_cmd.extend(
+        [
+            "--server-hostname",
+            args.server_hostname,
+            "--server-port",
+            str(args.server_port),
+            "--server-wait",
+            str(args.server_wait),
+        ]
+    )
 
     # passthrough
     if getattr(args, "continue_last", False):
@@ -2060,7 +2339,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             prompt_path=prompt_path,
             events_path=(artifacts_dir / "events.ndjson") if args.save_events else None,
             stderr_path=(artifacts_dir / "stderr.log"),
-            assistant_path=(artifacts_dir / "assistant.txt") if args.save_text else None,
+            assistant_path=(artifacts_dir / "assistant.txt")
+            if args.save_text
+            else None,
             wrapper_log_path=wrapper_log_path,
             result_path=(artifacts_dir / "result.json"),
             patch_path=None,
@@ -2068,6 +2349,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
     sys.stdout.write(_json_line(out) + "\n")
     return 0
+
 
 def _progress_snapshot(artifacts_dir: Path) -> dict[str, Any]:
     files = {
@@ -2093,9 +2375,10 @@ def _progress_snapshot(artifacts_dir: Path) -> dict[str, Any]:
         prog["idleForSeconds"] = max(0.0, now - last_mtime)
     return prog
 
+
 def cmd_status(args: argparse.Namespace) -> int:
-    if not getattr(args, 'run_id', None) and not getattr(args, 'artifacts_dir', None):
-        raise SystemExit('Provide --run-id or --artifacts-dir')
+    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
+        _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
 
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
@@ -2136,7 +2419,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     job = _load_json(job_path) or {}
     pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
     status = str(job.get("state") or "running") if isinstance(job, dict) else "running"
-    if pid and not _pid_running(pid) and not finish_path.exists() and status != "finished":
+    if (
+        pid
+        and not _pid_running(pid)
+        and not finish_path.exists()
+        and status != "finished"
+    ):
         status = "failed"
 
     out = _status_obj(
@@ -2163,9 +2451,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     sys.stdout.write(_json_line(out) + "\n")
     return 0
 
+
 def cmd_wait(args: argparse.Namespace) -> int:
-    if not getattr(args, 'run_id', None) and not getattr(args, 'artifacts_dir', None):
-        raise SystemExit('Provide --run-id or --artifacts-dir')
+    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
+        _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
 
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
@@ -2178,8 +2467,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
             pid=None,
             workdir=None,
             artifacts_dir=artifacts_dir,
-            artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name},
-            error={"name": "JobNotFound", "message": "job.json and finish.json not found"},
+            artifacts={
+                "dir": str(artifacts_dir),
+                "jobPath": job_path.name,
+                "finishPath": finish_path.name,
+            },
+            error={
+                "name": "JobNotFound",
+                "message": "job.json and finish.json not found",
+            },
         )
         sys.stdout.write(_json_line(out) + "\n")
         return 1
@@ -2198,8 +2494,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
                     pid=None,
                     workdir=None,
                     artifacts_dir=artifacts_dir,
-                    artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name},
-                    error={"name": "FinishUnreadable", "message": "timeout waiting for a readable finish.json"},
+                    artifacts={
+                        "dir": str(artifacts_dir),
+                        "jobPath": job_path.name,
+                        "finishPath": finish_path.name,
+                    },
+                    error={
+                        "name": "FinishUnreadable",
+                        "message": "timeout waiting for a readable finish.json",
+                    },
                 )
                 sys.stdout.write(_json_line(out) + "\n")
                 return 1
@@ -2221,9 +2524,17 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 pid=pid,
                 workdir=None,
                 artifacts_dir=artifacts_dir,
-                artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name, "wrapperLogPath": "wrapper.log"},
+                artifacts={
+                    "dir": str(artifacts_dir),
+                    "jobPath": job_path.name,
+                    "finishPath": finish_path.name,
+                    "wrapperLogPath": "wrapper.log",
+                },
                 progress=_progress_snapshot(artifacts_dir),
-                error={"name": "WorkerNotRunning", "message": "worker process not running and finish.json missing"},
+                error={
+                    "name": "WorkerNotRunning",
+                    "message": "worker process not running and finish.json missing",
+                },
             )
             sys.stdout.write(_json_line(out) + "\n")
             return 1
@@ -2235,18 +2546,26 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 pid=pid,
                 workdir=None,
                 artifacts_dir=artifacts_dir,
-                artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name},
+                artifacts={
+                    "dir": str(artifacts_dir),
+                    "jobPath": job_path.name,
+                    "finishPath": finish_path.name,
+                },
                 progress=_progress_snapshot(artifacts_dir),
-                error={"name": "WaitTimeout", "message": f"timeout waiting for finish.json (timeout={args.timeout}s)"},
+                error={
+                    "name": "WaitTimeout",
+                    "message": f"timeout waiting for finish.json (timeout={args.timeout}s)",
+                },
             )
             sys.stdout.write(_json_line(out) + "\n")
             return 0
 
         time.sleep(float(args.poll_interval))
 
+
 def cmd_cancel(args: argparse.Namespace) -> int:
-    if not getattr(args, 'run_id', None) and not getattr(args, 'artifacts_dir', None):
-        raise SystemExit('Provide --run-id or --artifacts-dir')
+    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
+        _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
 
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
@@ -2254,8 +2573,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     job = _load_json(job_path) or {}
     pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
-    server_url = str(job.get("serverUrl")) if isinstance(job, dict) and job.get("serverUrl") else None
-    session_id = str(job.get("sessionId")) if isinstance(job, dict) and job.get("sessionId") else None
+    server_url = (
+        str(job.get("serverUrl"))
+        if isinstance(job, dict) and job.get("serverUrl")
+        else None
+    )
+    session_id = (
+        str(job.get("sessionId"))
+        if isinstance(job, dict) and job.get("sessionId")
+        else None
+    )
 
     ok = False
     if pid and _pid_running(pid):
@@ -2282,7 +2609,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             exit_code=130,
             timed_out=False,
             run_id=run_id,
-            workdir=Path(str(job.get("workdir"))) if isinstance(job, dict) and job.get("workdir") else Path.cwd(),
+            workdir=Path(str(job.get("workdir")))
+            if isinstance(job, dict) and job.get("workdir")
+            else Path.cwd(),
             engine="cancel",
             fallback_from=None,
             server=None,
@@ -2293,7 +2622,11 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             changed_files=[],
             untracked_files=[],
             artifacts_dir=artifacts_dir,
-            artifacts={"dir": str(artifacts_dir), "jobPath": job_path.name, "finishPath": finish_path.name},
+            artifacts={
+                "dir": str(artifacts_dir),
+                "jobPath": job_path.name,
+                "finishPath": finish_path.name,
+            },
             metrics=None,
             error={"name": "Canceled", "message": "job canceled by adapter"},
             include_debug=False,
@@ -2313,13 +2646,22 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     sys.stdout.write(_json_line(out2) + "\n")
     return 0 if ok else 1
 
+
 def cmd_ensure_server(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
     env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
     auth = _get_http_auth_from_env(env)
     opencode_bin = _resolve_executable(args.opencode)
     if not opencode_bin:
-        sys.stdout.write(_json_line({"ok": False, "error": {"name": "OpencodeNotFound", "message": args.opencode}}) + "\n")
+        sys.stdout.write(
+            _json_line(
+                {
+                    "ok": False,
+                    "error": {"name": "OpencodeNotFound", "message": args.opencode},
+                }
+            )
+            + "\n"
+        )
         return 1
     try:
         st = ensure_server(
@@ -2335,9 +2677,14 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
         sys.stdout.write(_json_line(out) + "\n")
         return 0
     except Exception as e:
-        out = {"type": "opencode-subtask-server", "ok": False, "error": {"name": type(e).__name__, "message": str(e)}}
+        out = {
+            "type": "opencode-subtask-server",
+            "ok": False,
+            "error": {"name": type(e).__name__, "message": str(e)},
+        }
         sys.stdout.write(_json_line(out) + "\n")
         return 1
+
 
 def cmd_stop_server(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
@@ -2346,20 +2693,43 @@ def cmd_stop_server(args: argparse.Namespace) -> int:
     sys.stdout.write(_json_line(out2) + "\n")
     return 0 if out.get("ok") else 1
 
+
 # ============================
 # CLI
 # ============================
 
+
 def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     default_opencode = "opencode"
-    p.add_argument("--opencode", default=default_opencode, help="Path to opencode executable (Windows: prefer opencode.exe if available).")
+    p.add_argument(
+        "--opencode",
+        default=default_opencode,
+        help="Path to opencode executable (Windows: prefer opencode.exe if available).",
+    )
     p.add_argument("--workdir", default=".", help="Working directory (project root).")
 
-    p.add_argument("--run-id", default=None, help="Existing run id (advanced; used by worker/start).")
-    p.add_argument("--artifacts-dir", default=None, help="Explicit artifacts directory (advanced; used by worker/start).")
+    p.add_argument(
+        "--run-id",
+        default=None,
+        help="Existing run id (advanced; used by worker/start).",
+    )
+    p.add_argument(
+        "--artifacts-dir",
+        default=None,
+        help="Explicit artifacts directory (advanced; used by worker/start).",
+    )
 
-    p.add_argument("--engine", choices=["auto", "http", "cli"], default="auto", help="Execution engine. auto prefers HTTP then falls back to CLI.")
-    p.add_argument("--attach", default=None, help="Attach/connect to an existing OpenCode server URL (e.g., http://127.0.0.1:4096).")
+    p.add_argument(
+        "--engine",
+        choices=["auto", "http", "cli"],
+        default="auto",
+        help="Execution engine. auto prefers HTTP then falls back to CLI.",
+    )
+    p.add_argument(
+        "--attach",
+        default=None,
+        help="Attach/connect to an existing OpenCode server URL (e.g., http://127.0.0.1:4096).",
+    )
 
     # New naming: attach-server / no-attach-server (default: attach)
     p.add_argument(
@@ -2370,43 +2740,163 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         help="Attach to a per-project opencode server when available (auto), or ensure one is running (http). (default: true)",
     )
     # Deprecated alias: --no-attach
-    p.add_argument("--no-attach", dest="no_attach_deprecated", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--no-attach",
+        dest="no_attach_deprecated",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
-    p.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME, help="opencode serve hostname")
-    p.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT, help="opencode serve port (0 => auto)")
-    p.add_argument("--server-wait", type=float, default=DEFAULT_SERVER_WAIT_S, help="Seconds to wait for server health")
+    p.add_argument(
+        "--server-hostname",
+        default=DEFAULT_SERVER_HOSTNAME,
+        help="opencode serve hostname",
+    )
+    p.add_argument(
+        "--server-port",
+        type=int,
+        default=DEFAULT_SERVER_PORT,
+        help="opencode serve port (0 => auto)",
+    )
+    p.add_argument(
+        "--server-wait",
+        type=float,
+        default=DEFAULT_SERVER_WAIT_S,
+        help="Seconds to wait for server health",
+    )
 
     # Session continuity (optional). These map to `opencode run` flags and only affect the CLI engine.
-    p.add_argument("-c", "--continue", dest="continue_last", action="store_true", help="(CLI engine) Continue the last opencode session.")
-    p.add_argument("-s", "--session", default=None, help="(CLI engine) Continue a specific opencode session id.")
+    p.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_last",
+        action="store_true",
+        help="(CLI engine) Continue the last opencode session.",
+    )
+    p.add_argument(
+        "-s",
+        "--session",
+        default=None,
+        help="(CLI engine) Continue a specific opencode session id.",
+    )
     p.add_argument("--title", default=None, help="(CLI engine) Title for the session.")
 
     p.add_argument("--agent", default=None, help="OpenCode agent name")
     p.add_argument("-m", "--model", default=None, help="Model id provider/model")
-    p.add_argument("--variant", default=None, help="Model variant (provider-specific). Equivalent to `opencode run --variant`.")
-    p.add_argument("-f", "--file", action="append", default=[], help="Extra files to include (CLI engine only).")
+    p.add_argument(
+        "--variant",
+        default=None,
+        help="Model variant (provider-specific). Equivalent to `opencode run --variant`.",
+    )
+    p.add_argument(
+        "-f",
+        "--file",
+        action="append",
+        default=[],
+        help="Extra files to include (CLI engine only).",
+    )
 
-    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="Overall timeout seconds for the subtask.")
-    p.add_argument("--poll-interval", type=float, default=0.5, help="wait/status poll interval seconds")
-    p.add_argument("--quiet", action=argparse.BooleanOptionalAction, default=True, help="Quiet mode (stdout only final one-line JSON).")
-    p.add_argument("--save-events", action=argparse.BooleanOptionalAction, default=True, help="Save events.ndjson.")
-    p.add_argument("--save-text", action=argparse.BooleanOptionalAction, default=True, help="Save assistant.txt.")
-    p.add_argument("--wrapper-log", action=argparse.BooleanOptionalAction, default=True, help="Keep wrapper.log (start mode).")
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help="Overall timeout seconds for the subtask.",
+    )
+    p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.5,
+        help="wait/status poll interval seconds",
+    )
+    p.add_argument(
+        "--quiet",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quiet mode (stdout only final one-line JSON).",
+    )
+    p.add_argument(
+        "--save-events",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save events.ndjson.",
+    )
+    p.add_argument(
+        "--save-text",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save assistant.txt.",
+    )
+    p.add_argument(
+        "--wrapper-log",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep wrapper.log (start mode).",
+    )
 
-    p.add_argument("--permission-mode", choices=["inherit", "allow", "noninteractive"], default="inherit", help="Permission handling. HTTP engine auto-replies via API when possible.")
-    p.add_argument("--disable-claude-code", action=argparse.BooleanOptionalAction, default=True, help="Set OPENCODE_DISABLE_CLAUDE_CODE=1 (defensive).")
+    p.add_argument(
+        "--permission-mode",
+        choices=["inherit", "allow", "noninteractive"],
+        default="inherit",
+        help="Permission handling. HTTP engine auto-replies via API when possible.",
+    )
+    p.add_argument(
+        "--disable-claude-code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Set OPENCODE_DISABLE_CLAUDE_CODE=1 (defensive).",
+    )
 
-    p.add_argument("--max-text-chars", type=int, default=DEFAULT_MAX_TEXT_CHARS, help="Max chars returned in finish.summary.")
-    p.add_argument("--max-artifact-bytes", type=int, default=DEFAULT_MAX_ARTIFACT_BYTES, help="Hard cap per artifact file (0 disables).")
-    p.add_argument("--include-debug", action="store_true", help="Include debug info under finish.debug (may be noisy).")
-    p.add_argument("--workaround-agent-attach", dest="workaround_agent_attach", action=argparse.BooleanOptionalAction, default=True, help="Workaround: avoid CLI --attach when --agent is set unless attach is explicit.")
+    p.add_argument(
+        "--max-text-chars",
+        type=int,
+        default=DEFAULT_MAX_TEXT_CHARS,
+        help="Max chars returned in finish.summary.",
+    )
+    p.add_argument(
+        "--max-artifact-bytes",
+        type=int,
+        default=DEFAULT_MAX_ARTIFACT_BYTES,
+        help="Hard cap per artifact file (0 disables).",
+    )
+    p.add_argument(
+        "--include-debug",
+        action="store_true",
+        help="Include debug info under finish.debug (may be noisy).",
+    )
+    p.add_argument(
+        "--workaround-agent-attach",
+        dest="workaround_agent_attach",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Workaround: avoid CLI --attach when --agent is set unless attach is explicit.",
+    )
 
-    p.add_argument("--no-contract", action="store_true", help="Do not append output contract to the prompt.")
+    p.add_argument(
+        "--no-contract",
+        action="store_true",
+        help="Do not append output contract to the prompt.",
+    )
     p.add_argument("--prompt-file", default=None, help="Read prompt from file.")
-    p.add_argument("--prompt", dest="prompt_text", default=None, help="Prompt as a single string (alternative to positional prompt args).")
+    p.add_argument(
+        "--prompt",
+        dest="prompt_text",
+        default=None,
+        help="Prompt as a single string (alternative to positional prompt args).",
+    )
 
-    p.add_argument("--env", action="append", default=[], help="Set env KEY=VALUE for opencode process/server.")
-    p.add_argument("--env-file", action="append", default=[], help="Set env KEY=PATH (file contents as value).")
+    p.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        help="Set env KEY=VALUE for opencode process/server.",
+    )
+    p.add_argument(
+        "--env-file",
+        action="append",
+        default=[],
+        help="Set env KEY=PATH (file contents as value).",
+    )
+
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
@@ -2416,12 +2906,20 @@ def main(argv: list[str] | None = None) -> int:
 
     p_run = sub.add_parser("run", help="Run a subtask (foreground).")
     _add_common_run_flags(p_run)
-    p_run.add_argument("prompt", nargs=argparse.REMAINDER, help="Prompt args (use `--` before the prompt).")
+    p_run.add_argument(
+        "prompt",
+        nargs=argparse.REMAINDER,
+        help="Prompt args (use `--` before the prompt).",
+    )
     p_run.set_defaults(func=cmd_run)
 
     p_start = sub.add_parser("start", help="Start a subtask in background.")
     _add_common_run_flags(p_start)
-    p_start.add_argument("prompt", nargs=argparse.REMAINDER, help="Prompt args (use `--` before the prompt).")
+    p_start.add_argument(
+        "prompt",
+        nargs=argparse.REMAINDER,
+        help="Prompt args (use `--` before the prompt).",
+    )
     p_start.set_defaults(func=cmd_start)
 
     p_wait = sub.add_parser("wait", help="Wait for a background job finish.json.")
@@ -2436,11 +2934,23 @@ def main(argv: list[str] | None = None) -> int:
     p_status.add_argument("--artifacts-dir", required=False, default=None)
     p_status.set_defaults(func=cmd_status)
 
-    p_cancel = sub.add_parser("cancel", help="Cancel a job by killing worker and aborting session if known.")
+    p_cancel = sub.add_parser(
+        "cancel", help="Cancel a job by killing worker and aborting session if known."
+    )
     p_cancel.add_argument("--run-id", required=False, default=None)
     p_cancel.add_argument("--artifacts-dir", required=False, default=None)
-    p_cancel.add_argument("--env", action="append", default=[], help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env.")
-    p_cancel.add_argument("--env-file", action="append", default=[], help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env-file.")
+    p_cancel.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env.",
+    )
+    p_cancel.add_argument(
+        "--env-file",
+        action="append",
+        default=[],
+        help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env-file.",
+    )
     p_cancel.set_defaults(func=cmd_cancel)
 
     p_es = sub.add_parser("ensure-server", help="Ensure a per-project opencode server.")
@@ -2464,6 +2974,7 @@ def main(argv: list[str] | None = None) -> int:
         setattr(args, "attach_server", False)
 
     return int(args.func(args))  # type: ignore[misc]
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
