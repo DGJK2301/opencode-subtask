@@ -339,8 +339,8 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 | Complex analysis, multi-step refactors | `google/antigravity-claude-opus-4-5-thinking` (variants: `low`, `max`) |
 | Pure formatting, minimal reasoning | `google/antigravity-claude-sonnet-4-5` (no thinking) |
 | Simple isolated tasks | `google/antigravity-gemini-3-pro` (variants: `low`, `high`) |
-| Cost-effective alternative (SiliconFlow) | `siliconflow-cn/Pro/zai-org/GLM-4.7` (comparable to sonnet-4.5, lower cost) |
-| High-capability alternative (SiliconFlow) | `siliconflow-cn/moonshotai/Kimi-K2-Instruct` |
+| Cost-effective alternative (SiliconFlow) |  `siliconflow-cn/Pro/moonshotai/Kimi-K2.5` (comparable to sonnet-4.5, lower cost) |
+| High-capability alternative (SiliconFlow) | `siliconflow-cn/Pro/zai-org/GLM-4.7` |
 
 > **Note:** The models above are from specific providers. For other environments or additional models, consult your `opencode.json` configuration.
 
