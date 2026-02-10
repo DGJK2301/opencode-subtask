@@ -1,6 +1,6 @@
 ---
 name: opencode-subtask
-description: Run an OpenCode subtask as an isolated sub-agent executor (run/start/status/wait/cancel). Prints exactly one JSON line to stdout and writes full artifacts to disk; prefers HTTP server API with CLI fallback. 用 OpenCode 跑一个子任务并返回稳定 JSON。
+description: Run an OpenCode subtask as an isolated sub-agent executor (run/start/status/wait/cancel). Prints exactly one JSON line to stdout and writes full artifacts to disk; prefers HTTP server API with CLI fallback. Use when delegating a single well-scoped coding task to OpenCode. Not for task decomposition or orchestration (use subtask-orchestrator). 用 OpenCode 跑一个子任务并返回稳定 JSON。
 ---
 
 # OpenCode Subtask Adapter
@@ -32,6 +32,12 @@ This skill turns OpenCode into a reliable "subagent primitive" for upstream agen
 3. **Protocol shielding**: Callers depend only on this adapter's schema, not OpenCode internals
 4. **Engine abstraction**: HTTP server API preferred, CLI fallback on failure
 
+## Prerequisites
+
+- **Python**: 3.10+ (no third-party dependencies)
+- **OpenCode**: installed and in PATH (or specify via `--opencode <path>`). The adapter resolves `.exe`/`.cmd` shims automatically on Windows.
+- **git**: optional; used for `changedFiles`/`untrackedFiles` and `changes.patch` generation
+
 ## Quick Start
 
 ### Run from anywhere (recommended)
@@ -61,10 +67,7 @@ REM Windows - using wrapper
   - If you pass prompts via `--prompt-file` / piping / generated files, the **first non-empty line of the effective prompt** must still be the persona. Avoid leading BOM/whitespace/headers before `Act as ...`.
   - If you're using an orchestrator/planner that emits a prompt template, pass that template **verbatim** as the prompt input; do not prepend titles or metadata that would push the persona off line 1.
 
-**Boundary (important):**
-- This skill is an **executor primitive**: it runs a single well-scoped subtask prompt and returns a stable JSON contract + artifacts.
-- It does **not** decide *which* subtasks to run, how to decompose a big goal, or which expert roles to assign.
-- If you need decomposition + role cards + acceptance criteria, use a planning/orchestration layer (e.g. the `subtask-orchestrator` skill) and then execute each subtask via this adapter.
+**Boundary:** This is an executor, not a planner — see [Boundary (planning vs execution)](#boundary-planning-vs-execution) below.
 
 **Practical tip:**
 - Prefer writing the persona line yourself as the first line (it avoids accidentally injecting a generic default persona).
@@ -119,8 +122,6 @@ python scripts/opencode_subtask.py run --workdir . --engine auto --no-quiet -- \
 | `--permission-mode` | `inherit` | Use `allow` for unattended runs; use `inherit` for interactive safety. |
 | `--timeout` | (varies) | Increase for long-running reasoning models. |
 
-## Advanced flags (opt-in)
-
 ## Persona-first prompts (default behavior)
 
 For best results (especially with Gemini), every subtask prompt should start with a simple, explicit persona **on the first non-empty line**:
@@ -157,7 +158,7 @@ It deliberately does **not** decide:
 
 If you need role allocation, decomposition, and auditable acceptance criteria, use a separate **planner/orchestrator** and feed the resulting per-subtask prompt into `opencode-subtask`.
 
-### Session reuse (CLI engine only; reduces isolation)
+## Session reuse (CLI engine only; reduces isolation)
 
 Session reuse can reduce cost/time by continuing an existing OpenCode session, avoiding the overhead of starting fresh. However, it increases the risk of "context bleed" across subtasks.
 
@@ -269,7 +270,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 
 **Note:** The `sessionId` is returned in the finish JSON (`finish.sessionId`). The session belongs to OpenCode CLI, not to this adapter. HTTP engine uses different session mechanics (server-managed sessions).
 
-### Output control / debugging
+## Output control / debugging
 
 | Flag | Notes |
 |------|------|
@@ -278,7 +279,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 | `--max-artifact-bytes <n>` | Hard cap per artifact file (0 disables). |
 | `--include-debug` | Include extra debug fields in the finish JSON. |
 
-### Prompt / input control
+## Prompt / input control
 
 | Flag | Notes |
 |------|------|
@@ -287,7 +288,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 | `-f` / `--file <path>` | Extra files to include (CLI engine only). |
 | `--no-contract` | Don't append the default output contract to the prompt. |
 
-### Environment / executable
+## Environment / executable
 
 | Flag | Notes |
 |------|------|
@@ -296,7 +297,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 | `--env KEY=VALUE` | Set environment variable for the OpenCode process. |
 | `--env-file KEY=PATH` | Set environment variable from file contents. |
 
-### Server attachment
+## Server attachment
 
 | Flag | Notes |
 |------|------|
