@@ -50,8 +50,25 @@ REM Windows - using wrapper
   --engine auto ^
   --model google/antigravity-gemini-3-flash --variant minimal ^
   --permission-mode allow ^
-  -- "Summarize the repo structure (3 bullets)."
+  -- "Act as a senior software engineer. Summarize the repo structure (3 bullets)."
 ```
+
+**Non‑negotiable prompt hygiene (default):**
+- Make the **first line** of every subtask prompt a simple persona: `Act as a [profession]...` (no leading blank lines)
+- This adapter enforces it by default via `--persona-mode require` (fail fast if missing).
+- If you want auto-injection for convenience, use `--persona-mode prepend`.
+- If you hit `PersonaMissing`, either add the persona line yourself or switch to `--persona-mode prepend` (auto-inject) / `off` (disable).
+  - If you pass prompts via `--prompt-file` / piping / generated files, the **first non-empty line of the effective prompt** must still be the persona. Avoid leading BOM/whitespace/headers before `Act as ...`.
+  - If you're using an orchestrator/planner that emits a prompt template, pass that template **verbatim** as the prompt input; do not prepend titles or metadata that would push the persona off line 1.
+
+**Boundary (important):**
+- This skill is an **executor primitive**: it runs a single well-scoped subtask prompt and returns a stable JSON contract + artifacts.
+- It does **not** decide *which* subtasks to run, how to decompose a big goal, or which expert roles to assign.
+- If you need decomposition + role cards + acceptance criteria, use a planning/orchestration layer (e.g. the `subtask-orchestrator` skill) and then execute each subtask via this adapter.
+
+**Practical tip:**
+- Prefer writing the persona line yourself as the first line (it avoids accidentally injecting a generic default persona).
+- Keep personas boring and specific: a clear job title beats role-play.
 
 ```bash
 # Unix/macOS - using Python directly
@@ -60,14 +77,14 @@ python ~/.claude/skills/opencode-subtask/scripts/opencode_subtask.py run \
   --engine auto \
   --model google/antigravity-gemini-3-flash --variant minimal \
   --permission-mode allow \
-  -- "Summarize the repo structure (3 bullets)."
+  -- "Act as a senior software engineer. Summarize the repo structure (3 bullets)."
 ```
 
 **Option B: Relative path (from skill directory)**
 
 ```bash
 cd ~/.claude/skills/opencode-subtask  # or %USERPROFILE%\.claude\skills\opencode-subtask on Windows
-python scripts/opencode_subtask.py run --workdir /path/to/project --engine auto -- "Your prompt"
+python scripts/opencode_subtask.py run --workdir /path/to/project --engine auto -- "Act as a senior software engineer. <your prompt>"
 ```
 
 ### Background job (recommended for long-running tasks)
@@ -75,7 +92,7 @@ python scripts/opencode_subtask.py run --workdir /path/to/project --engine auto 
 ```bash
 # 1) Start (returns immediately with runId)
 python scripts/opencode_subtask.py start --workdir . --engine auto --permission-mode allow -- \
-  "Review src/foo.py exception handling; propose a minimal fix with file:line evidence."
+  "Act as a senior software engineer. Review src/foo.py exception handling; propose a minimal fix with file:line evidence."
 
 # 2) Poll status (optional)
 python scripts/opencode_subtask.py status --run-id <runId>
@@ -88,7 +105,7 @@ python scripts/opencode_subtask.py wait --run-id <runId>
 
 ```bash
 python scripts/opencode_subtask.py run --workdir . --engine auto --no-quiet -- \
-  "Explain why tests fail on Windows; point to exact file:line."
+  "Act as a senior software engineer. Explain why tests fail on Windows; point to exact file:line."
 ```
 
 ## Basic flags (most callers only need these)
@@ -103,6 +120,42 @@ python scripts/opencode_subtask.py run --workdir . --engine auto --no-quiet -- \
 | `--timeout` | (varies) | Increase for long-running reasoning models. |
 
 ## Advanced flags (opt-in)
+
+## Persona-first prompts (default behavior)
+
+For best results (especially with Gemini), every subtask prompt should start with a simple, explicit persona **on the first non-empty line**:
+
+```text
+Act as a [profession]...
+```
+
+Examples:
+
+```text
+Act as a senior software engineer. Review src/foo.py and propose a minimal fix with file:line evidence.
+```
+
+```text
+Act as a MATLAB runtime capture engineer. Design a Frida hook plan; list exact functions and stop conditions.
+```
+
+This adapter supports a lightweight persona policy and enables it by default:
+
+| Flag | Default | Notes |
+|------|---------|------|
+| `--persona-mode` | `require` | `off`/`warn`/`require`/`prepend`. In `require`, the adapter fails fast if the prompt doesn't start with `Act as ...`. In `prepend`, it injects a persona line **only if** missing. |
+| `--persona-line` | `Act as a senior software engineer.` | Used by `prepend` (and can be used as a required prefix). Prefer a simple job title. |
+
+## Boundary (planning vs execution)
+
+This skill is an **execution adapter**: it runs a *single* OpenCode subtask and returns a stable JSON result + on-disk artifacts.
+
+It deliberately does **not** decide:
+- how to decompose a big goal into subtasks,
+- which expert roles to assign,
+- or what acceptance criteria should be.
+
+If you need role allocation, decomposition, and auditable acceptance criteria, use a separate **planner/orchestrator** and feed the resulting per-subtask prompt into `opencode-subtask`.
 
 ### Session reuse (CLI engine only; reduces isolation)
 
@@ -139,7 +192,7 @@ Session reuse can reduce cost/time by continuing an existing OpenCode session, a
 RESULT1=$(python scripts/opencode_subtask.py run --workdir . --engine cli \
   --model google/antigravity-gemini-3-flash --variant low \
   --permission-mode allow \
-  -- "Analyze src/foo.py for potential bugs. List them with file:line.")
+  -- "Act as a senior software engineer. Analyze src/foo.py for potential bugs. List them with file:line.")
 
 # Extract sessionId from JSON output
 SESSION_ID=$(echo "$RESULT1" | python -c "import sys,json; print(json.load(sys.stdin).get('sessionId',''))")
@@ -150,14 +203,14 @@ python scripts/opencode_subtask.py run --workdir . --engine cli \
   --session "$SESSION_ID" \
   --model google/antigravity-gemini-3-flash --variant low \
   --permission-mode allow \
-  -- "Now fix the first bug you identified. Show the diff."
+  -- "Act as a senior software engineer. Now fix the first bug you identified. Show the diff."
 
 # Step 3: Continue for verification
 python scripts/opencode_subtask.py run --workdir . --engine cli \
   --session "$SESSION_ID" \
   --model google/antigravity-gemini-3-flash --variant low \
   --permission-mode allow \
-  -- "Verify the fix is correct. Any remaining issues?"
+  -- "Act as a senior software engineer. Verify the fix is correct. Any remaining issues?"
 ```
 
 **Example 2: Quick Q&A chain (--continue shorthand)**
@@ -165,23 +218,23 @@ python scripts/opencode_subtask.py run --workdir . --engine cli \
 ```bash
 # Step 1: Ask about file structure
 python scripts/opencode_subtask.py run --workdir . --engine cli \
-  --model siliconflow-cn/Pro/zai-org/GLM-4.7 \
+  --model siliconflow-cn/Pro/moonshotai/Kimi-K2.5 \
   --permission-mode allow \
-  -- "Count how many lines are in SKILL.md."
+  -- "Act as a senior software engineer. Count how many lines are in SKILL.md."
 
 # Step 2: Follow-up (uses --continue to auto-resume last session)
 python scripts/opencode_subtask.py run --workdir . --engine cli \
   --continue \
-  --model siliconflow-cn/Pro/zai-org/GLM-4.7 \
+  --model siliconflow-cn/Pro/moonshotai/Kimi-K2.5 \
   --permission-mode allow \
-  -- "What file did you just count? How many lines?"
+  -- "Act as a senior software engineer. What file did you just count? How many lines?"
 
 # Step 3: Another follow-up
 python scripts/opencode_subtask.py run --workdir . --engine cli \
   --continue \
-  --model siliconflow-cn/Pro/zai-org/GLM-4.7 \
+  --model siliconflow-cn/Pro/moonshotai/Kimi-K2.5 \
   --permission-mode allow \
-  -- "What was the first section heading in that file?"
+  -- "Act as a senior software engineer. What was the first section heading in that file?"
 ```
 
 **Verified behavior (tested with GLM-4.7):**
@@ -199,7 +252,7 @@ python scripts/opencode_subtask.py run --workdir . --engine cli \
 setlocal EnableDelayedExpansion
 
 REM Step 1: Analyze
-for /f "delims=" %%i in ('python scripts\opencode_subtask.py run --workdir . --engine cli --model google/antigravity-gemini-3-flash --permission-mode allow -- "List all TODO comments in src/"') do set RESULT=%%i
+for /f "delims=" %%i in ('python scripts\opencode_subtask.py run --workdir . --engine cli --model google/antigravity-gemini-3-flash --permission-mode allow -- "Act as a senior software engineer. List all TODO comments in src/."') do set RESULT=%%i
 
 REM Extract sessionId using Python
 for /f %%s in ('echo !RESULT! ^| python -c "import sys,json; print(json.load(sys.stdin).get('sessionId',''))"') do set SESSION_ID=%%s
@@ -211,7 +264,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
   --session "%SESSION_ID%" ^
   --model google/antigravity-gemini-3-flash ^
   --permission-mode allow ^
-  -- "Pick the most important TODO and implement it."
+  -- "Act as a senior software engineer. Pick the most important TODO and implement it."
 ```
 
 **Note:** The `sessionId` is returned in the finish JSON (`finish.sessionId`). The session belongs to OpenCode CLI, not to this adapter. HTTP engine uses different session mechanics (server-managed sessions).
@@ -249,6 +302,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 |------|------|
 | `--attach <url>` | Attach to a specific `opencode serve` URL. |
 | `--no-attach-server` | Don’t attach to a per-project server automatically. (`--engine http` will still require `--attach` or `ensure-server`.) |
+| `--stop-server-after-run` | If the run used the HTTP engine, stop the per-project server after completion. Useful for long loops to avoid accumulating server-side sessions/memory. |
 
 ## Engine Selection (`--engine`)
 
@@ -259,6 +313,8 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 | `cli` | CLI only (`opencode run --format json`) |
 
 **Note:** `--attach-server` defaults to `true`, meaning `auto` mode will attempt to reuse an existing server if one is running for the project. Use `--no-attach-server` to force CLI mode without checking for servers.
+
+**Note (memory):** HTTP engine sessions live inside the per-project `opencode serve` process and are not automatically deleted. If you run many subtasks against a long-lived server, memory can grow over time. Options: run with `--stop-server-after-run`, periodically run `stop-server`, or use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`).
 
 **HTTP path** (preferred):
 - Uses OpenCode Server API: `/global/health`, `/session`, `/session/:id/message`
@@ -335,8 +391,8 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 | Use Case | Recommended Model |
 |----------|-------------------|
 | Quick probes, connectivity checks | `google/antigravity-gemini-3-flash` (variants: `minimal`, `low`, `medium`, `high`) |
-| Routine analysis, code review | `google/antigravity-claude-sonnet-4-5-thinking` (variants: `low`, `max`) |
-| Complex analysis, multi-step refactors | `google/antigravity-claude-opus-4-5-thinking` (variants: `low`, `max`) |
+| Routine analysis, code review | `google/antigravity-claude-sonnet-4-6-thinking` (variants: `low`, `max`) |
+| Complex analysis, multi-step refactors | `google/antigravity-claude-opus-4-6-thinking` (variants: `low`, `max`) |
 | Pure formatting, minimal reasoning | `google/antigravity-claude-sonnet-4-5` (no thinking) |
 | Simple isolated tasks | `google/antigravity-gemini-3-pro` (variants: `low`, `high`) |
 | Cost-effective alternative (SiliconFlow) |  `siliconflow-cn/Pro/moonshotai/Kimi-K2.5` (comparable to sonnet-4.5, lower cost) |
@@ -354,6 +410,9 @@ python scripts/opencode_subtask.py ensure-server --workdir .
 
 # Stop server
 python scripts/opencode_subtask.py stop-server --workdir .
+
+# One-shot runs (start server if needed, then stop it after completion)
+python scripts/opencode_subtask.py run --engine http --stop-server-after-run --workdir . --prompt "..."
 ```
 
 ## Operational Notes

@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from shutil import which
+from shutil import rmtree, which
 from typing import Any, Final, Iterable, Never, NoReturn
 
 # ============================
@@ -80,6 +80,94 @@ def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> Never
     }
     sys.stdout.write(_json_line(obj) + "\n")
     sys.exit(exit_code)
+
+
+def _first_nonempty_line(s: str) -> str:
+    # Be robust against BOM/zero-width characters that can appear when prompts
+    # come from files/CLIs. These can otherwise break the "Act as ..." detector.
+    # Include common bidi/directional markers as well (often introduced by copy/paste).
+    strip_prefix = (
+        "\ufeff"  # BOM
+        "\u200b\u200c\u200d\u2060"  # zero-width
+        "\u200e\u200f"  # LRM/RLM
+        "\u202a\u202b\u202c\u202d\u202e"  # LRE/RLE/PDF/LRO/RLO
+        "\u2066\u2067\u2068\u2069"  # LRI/RLI/FSI/PDI
+        "\ufffd"  # replacement char (decode artifacts)
+    )
+    for ln in (s or "").splitlines():
+        t = ln.strip()
+        if t:
+            return t.lstrip(strip_prefix)
+    return ""
+
+
+def _first_line_stripped(s: str) -> str:
+    """
+    Return the first line with BOM/zero-width prefixes stripped.
+    This is stricter than _first_nonempty_line(): it does NOT skip blank lines.
+    """
+    strip_prefix = (
+        "\ufeff"  # BOM
+        "\u200b\u200c\u200d\u2060"  # zero-width
+        "\u200e\u200f"  # LRM/RLM
+        "\u202a\u202b\u202c\u202d\u202e"  # LRE/RLE/PDF/LRO/RLO
+        "\u2066\u2067\u2068\u2069"  # LRI/RLI/FSI/PDI
+        "\ufffd"  # replacement char (decode artifacts)
+    )
+    if not s:
+        return ""
+    lines = (s or "").splitlines()
+    if not lines:
+        return ""
+    return lines[0].lstrip(strip_prefix).lstrip()
+
+
+def _apply_persona_policy(prompt: str, persona_mode: str, persona_line: str) -> str:
+    """
+    Prompt hygiene: require or inject a first-line persona (e.g. "Act as a [profession]...").
+
+    Rationale:
+    - Helps Gemini and other models respond more consistently.
+    - Makes automated subagent prompts less ambiguous.
+    """
+    mode = (persona_mode or "off").strip().lower()
+    if mode == "off":
+        return prompt
+
+    first = _first_line_stripped(prompt)
+    if first.lower().startswith("act as "):
+        return prompt
+
+    persona = (persona_line or "").strip()
+    if not persona:
+        persona = "Act as a senior software engineer."
+    if not persona.lower().startswith("act as "):
+        persona = "Act as " + persona
+    if not persona.rstrip().endswith("."):
+        persona = persona.rstrip() + "."
+
+    if mode == "warn":
+        sys.stderr.write(
+            "[opencode-subtask] WARN: prompt does not start with an 'Act as ...' persona line on the FIRST line.\n"
+        )
+        return prompt
+    if mode == "require":
+        _exit_with_error(
+            "PersonaMissing",
+            "Prompt must start with a persona line on the FIRST line (no leading blank lines): "
+            "'Act as a [profession]...'. Either add it as line 1, or set "
+            "--persona-mode prepend (auto-inject) / off (disable).",
+        )
+        return prompt  # unreachable
+    if mode == "prepend":
+        sys.stderr.write(
+            "[opencode-subtask] NOTE: injected missing persona line. "
+            "Prefer starting prompts with: \"Act as a [profession]...\".\n"
+        )
+        return persona + "\n" + (prompt or "")
+
+    _exit_with_error("BadPersonaMode", f"Unknown --persona-mode: {persona_mode!r}")
+    return prompt  # unreachable
 
 
 def _sha256_file(path: Path) -> str:
@@ -154,7 +242,12 @@ def _tail_bytes(path: Path, max_bytes: int = 2048) -> str:
 
 
 def _join_prompt(args_prompt: list[str]) -> str:
-    prompt = " ".join(args_prompt).strip()
+    parts = list(args_prompt or [])
+    # argparse + nargs=REMAINDER keeps a literal `--` in the remainder list.
+    # Treat it as a separator and drop it to match the CLI help text.
+    while parts and parts[0] == "--":
+        parts = parts[1:]
+    prompt = " ".join(parts).strip()
     if prompt:
         return prompt
     if not sys.stdin.isatty():
@@ -203,6 +296,66 @@ def _runs_dir() -> Path:
 
 def _servers_dir() -> Path:
     return _cache_root() / "servers"
+
+
+def _prune_run_artifacts(*, keep_last: int, dry_run: bool) -> dict[str, Any]:
+    """
+    Prune local on-disk run artifacts under the cache root.
+
+    This addresses cache growth (disk), not a memory leak.
+
+    Policy:
+    - Keep the most-recent `keep_last` run directories by mtime; delete the rest.
+    - Safe-by-default: `dry_run=True` does not delete.
+    """
+    keep_last = int(keep_last)
+    if keep_last < 0:
+        keep_last = 0
+
+    runs_dir = _runs_dir()
+    if not runs_dir.exists():
+        return {
+            "runsDir": str(runs_dir),
+            "total": 0,
+            "kept": 0,
+            "candidates": 0,
+            "deleted": 0,
+            "dryRun": dry_run,
+            "errors": [],
+        }
+
+    items: list[tuple[float, Path]] = []
+    for p in runs_dir.iterdir():
+        if not p.is_dir():
+            continue
+        try:
+            st = p.stat()
+        except Exception:
+            continue
+        items.append((float(st.st_mtime), p))
+
+    items.sort(key=lambda t: t[0], reverse=True)
+    candidates = [p for _, p in items[keep_last:]]
+
+    errors: list[dict[str, str]] = []
+    deleted = 0
+    if not dry_run:
+        for p in candidates:
+            try:
+                rmtree(p, ignore_errors=False)
+                deleted += 1
+            except Exception as e:
+                errors.append({"path": str(p), "error": f"{type(e).__name__}: {e}"})
+
+    return {
+        "runsDir": str(runs_dir),
+        "total": len(items),
+        "kept": min(len(items), keep_last),
+        "candidates": len(candidates),
+        "deleted": deleted,
+        "dryRun": dry_run,
+        "errors": errors,
+    }
 
 
 def _find_git_root(start: Path) -> Path:
@@ -487,13 +640,30 @@ class OpencodeHttpClient:
             body["variant"] = variant
         if agent:
             body["agent"] = agent
-        # Server docs: POST /session/:id/message -> Message
-        _, js = self._request_json(
-            "POST", f"/session/{session_id}/message", body, timeout_s=timeout_s
-        )
-        if not isinstance(js, dict):
-            raise RuntimeError("Invalid /message response (expected JSON object)")
-        return js
+
+        def _post_message(payload: dict[str, Any]) -> dict[str, Any]:
+            # Server docs: POST /session/:id/message -> Message
+            _, js = self._request_json(
+                "POST", f"/session/{session_id}/message", payload, timeout_s=timeout_s
+            )
+            if not isinstance(js, dict):
+                raise RuntimeError("Invalid /message response (expected JSON object)")
+            return js
+
+        try:
+            return _post_message(body)
+        except RuntimeError as e:
+            # Back-compat: newer servers validate `model` as an object, older servers accept a string.
+            # Retry only when the server clearly rejects the string type for `model`.
+            if model and "\"path\":[\"model\"]" in str(e) and "expected object" in str(e):
+                body2 = dict(body)
+                provider_id, sep, model_id = model.partition("/")
+                if sep:
+                    body2["model"] = {"providerID": provider_id, "modelID": model_id}
+                else:
+                    body2["model"] = {"providerID": "", "modelID": model}
+                return _post_message(body2)
+            raise
 
     def abort(self, session_id: str) -> None:
         # Server docs: POST /session/:id/abort
@@ -1847,6 +2017,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         prompt = _join_prompt(args.prompt)
 
+    prompt = _apply_persona_policy(prompt, args.persona_mode, args.persona_line)
+
     if not args.no_contract:
         prompt = prompt + _default_contract_prompt()
 
@@ -1897,6 +2069,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     server_state: dict[str, Any] | None = None
     attach_url = args.attach
     server_error: dict[str, Any] | None = None
+    server_started_new = False
 
     # Need opencode binary if we might call CLI engine OR we need to start a server.
     opencode_bin: str | None = None
@@ -1955,16 +2128,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         if args.engine == "http":
             try:
                 assert opencode_bin is not None
-                server_state = ensure_server(
-                    opencode_bin=opencode_bin,
-                    workdir=workdir,
-                    hostname=args.server_hostname,
-                    port=args.server_port,
-                    wait_s=args.server_wait,
-                    env=env,
-                    auth=auth,
-                )
-                attach_url = str(server_state.get("url"))
+                # Prefer reusing an already-running healthy server (if any) to avoid
+                # spawning multiple per-project servers and to make "stop-after-run"
+                # safe (we only stop servers that we started in this invocation).
+                server_state = attach_existing_server(workdir=workdir, auth=auth)
+                if server_state:
+                    attach_url = str(server_state.get("url"))
+                else:
+                    server_state = ensure_server(
+                        opencode_bin=opencode_bin,
+                        workdir=workdir,
+                        hostname=args.server_hostname,
+                        port=args.server_port,
+                        wait_s=args.server_wait,
+                        env=env,
+                        auth=auth,
+                    )
+                    server_started_new = True
+                    attach_url = str(server_state.get("url"))
             except Exception as e:
                 server_error = {"name": type(e).__name__, "message": str(e)}
                 server_state = None
@@ -2184,6 +2365,21 @@ def cmd_run(args: argparse.Namespace) -> int:
             job_obj2["serverUrl"] = attach_url
         _write_json(job_path, job_obj2)
 
+    # Optional: stop the per-project server after completion.
+    # This helps avoid long-running servers accumulating memory across many runs.
+    # We only do this when the HTTP engine was actually used for the run to avoid
+    # surprising side effects for CLI-only executions.
+    if getattr(args, "stop_server_after_run", False) and outcome.engine == "http":
+        try:
+            st = stop_server(workdir)
+            sys.stderr.write(
+                f"[opencode-subtask] NOTE: stop-server-after-run: ok={st.get('ok')} pid={st.get('pid')}\n"
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[opencode-subtask] WARN: stop-server-after-run failed: {type(e).__name__}: {e}\n"
+            )
+
     sys.stdout.write(_json_line(out) + "\n")
     return 0 if ok else 1
 
@@ -2195,6 +2391,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = _join_prompt(args.prompt)
+    prompt = _apply_persona_policy(prompt, args.persona_mode, args.persona_line)
     # Note: the worker (`run`) will append the output contract unless --no-contract is set.
 
     prompt_path = artifacts_dir / "prompt.txt"
@@ -2255,6 +2452,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         worker_cmd.append("--include-debug")
     if args.no_contract:
         worker_cmd.append("--no-contract")
+
+    # prompt persona policy (keep worker behavior consistent with start/run)
+    worker_cmd.extend(["--persona-mode", str(args.persona_mode), "--persona-line", str(args.persona_line)])
     if args.wrapper_log:
         worker_cmd.append("--wrapper-log")
     if args.workaround_agent_attach:
@@ -2269,6 +2469,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         worker_cmd.append("--attach-server")
     else:
         worker_cmd.append("--no-attach-server")
+    if getattr(args, "stop_server_after_run", False):
+        worker_cmd.append("--stop-server-after-run")
     worker_cmd.extend(
         [
             "--server-hostname",
@@ -2694,6 +2896,25 @@ def cmd_stop_server(args: argparse.Namespace) -> int:
     return 0 if out.get("ok") else 1
 
 
+def cmd_prune_cache(args: argparse.Namespace) -> int:
+    rep = _prune_run_artifacts(keep_last=int(args.keep_last), dry_run=(not args.apply))
+    ok = len(rep.get("errors", [])) == 0
+    sys.stdout.write(
+        _json_line(
+            {
+                "type": "opencode-subtask-prune-cache",
+                "schemaVersion": ADAPTER_SCHEMA_VERSION,
+                "timestamp": _now_ms(),
+                "ok": ok,
+                "applied": bool(args.apply),
+                "report": rep,
+            }
+        )
+        + "\n"
+    )
+    return 0 if ok else 2
+
+
 # ============================
 # CLI
 # ============================
@@ -2763,6 +2984,13 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_SERVER_WAIT_S,
         help="Seconds to wait for server health",
+    )
+    p.add_argument(
+        "--stop-server-after-run",
+        dest="stop_server_after_run",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="(HTTP engine) Stop the per-project opencode server after completion (best-effort). Useful in long loops to avoid server memory growth.",
     )
 
     # Session continuity (optional). These map to `opencode run` flags and only affect the CLI engine.
@@ -2876,6 +3104,18 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Do not append output contract to the prompt.",
     )
+
+    p.add_argument(
+        "--persona-mode",
+        choices=["off", "warn", "require", "prepend"],
+        default="require",
+        help="Prompt hygiene: ensure FIRST line is 'Act as ...' persona (no leading blank lines).",
+    )
+    p.add_argument(
+        "--persona-line",
+        default="Act as a senior software engineer.",
+        help="Persona line used by --persona-mode prepend (and as the suggested default).",
+    )
     p.add_argument("--prompt-file", default=None, help="Read prompt from file.")
     p.add_argument(
         "--prompt",
@@ -2966,6 +3206,23 @@ def main(argv: list[str] | None = None) -> int:
     p_ss = sub.add_parser("stop-server", help="Stop the per-project opencode server.")
     p_ss.add_argument("--workdir", default=".")
     p_ss.set_defaults(func=cmd_stop_server)
+
+    p_pc = sub.add_parser(
+        "prune-cache",
+        help="Prune local run artifacts cache (disk). Safe-by-default: dry-run unless --apply.",
+    )
+    p_pc.add_argument(
+        "--keep-last",
+        type=int,
+        default=200,
+        help="Keep the most-recent N run artifact directories (by mtime).",
+    )
+    p_pc.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete; otherwise report-only (dry-run).",
+    )
+    p_pc.set_defaults(func=cmd_prune_cache)
 
     args = parser.parse_args(argv)
 
