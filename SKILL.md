@@ -238,7 +238,7 @@ python scripts/opencode_subtask.py run --workdir . --engine cli \
   -- "Act as a senior software engineer. What was the first section heading in that file?"
 ```
 
-**Verified behavior (tested with GLM-4.7):**
+**Verified behavior (tested with GLM-5):**
 
 | Step | Input tokens | Cache read | Observation |
 |------|--------------|------------|-------------|
@@ -397,7 +397,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 | Pure formatting, minimal reasoning | `google/antigravity-claude-sonnet-4-5` (no thinking) |
 | Simple isolated tasks | `google/antigravity-gemini-3-pro` (variants: `low`, `high`) |
 | Cost-effective alternative (SiliconFlow) |  `siliconflow-cn/Pro/moonshotai/Kimi-K2.5` (comparable to sonnet-4.5, lower cost) |
-| High-capability alternative (SiliconFlow) | `siliconflow-cn/Pro/zai-org/GLM-4.7` |
+| High-capability alternative (SiliconFlow) | `siliconflow-cn/Pro/zai-org/GLM-5` |
 
 > **Note:** The models above are from specific providers. For other environments or additional models, consult your `opencode.json` configuration.
 
