@@ -779,6 +779,31 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
     )
 
 
+def _server_pid_ownership_status(pid: int, url: str) -> str:
+    """
+    Classify ownership check result for a tracked server PID.
+    Returns: "verified" | "mismatch" | "unknown"
+    - unknown: cannot read cmdline or cannot infer expected port safely
+    """
+    if pid <= 0:
+        return "mismatch"
+    expected_port = _extract_server_port_from_url(url)
+    if expected_port is None:
+        return "unknown"
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return "unknown"
+    cmdline_lc = cmdline.lower()
+    if ("opencode" not in cmdline_lc) or ("serve" not in cmdline_lc):
+        return "mismatch"
+    port_txt = str(expected_port)
+    if re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc) or re.search(
+        rf"--port\s+{re.escape(port_txt)}\b", cmdline_lc
+    ):
+        return "verified"
+    return "mismatch"
+
+
 def _pid_matches_subtask_worker(pid: int, run_id: str | None = None) -> bool:
     if pid <= 0:
         return False
@@ -1530,25 +1555,31 @@ def stop_server(workdir: Path) -> dict[str, Any]:
         url = str(st.get("url") or "") if isinstance(st, dict) else ""
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
+        kept_state = False
         reason = "no-pid"
         if pid and _pid_running(pid):
-            if url and _pid_matches_server_url(pid, url):
+            own = _server_pid_ownership_status(pid, url)
+            if own == "verified":
                 _kill_tree(pid)
                 ok = True
                 reason = "killed"
+            elif own == "unknown":
+                kept_state = True
+                reason = "owner-unverified-state-kept"
             else:
-                reason = "owner-unverified-state-cleared"
+                reason = "owner-mismatch-state-cleared"
         elif pid:
             reason = "pid-not-running"
-        try:
-            st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        if not kept_state:
+            try:
+                st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
         return {
             "ok": ok,
             "pid": pid,
             "statePath": str(st_path),
-            "keptState": False,
+            "keptState": kept_state,
             "reason": reason,
         }
 
@@ -2726,6 +2757,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     auth = _get_http_auth_from_env(env)
     reaper_info: dict[str, Any] | None = None
+    effective_engine = str(getattr(args, "engine", requested_engine)).strip().lower()
     reaper_idle_s = float(
         getattr(args, "orphan_reaper_idle_s", DEFAULT_ORPHAN_REAPER_IDLE_S)
     )
@@ -2736,7 +2768,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     if (
         bool(getattr(args, "orphan_reaper", True))
-        and (requested_engine in ("http", "auto"))
+        and (effective_engine in ("http", "auto"))
         and (args.attach is None)
         and bool(args.attach_server)
     ):
