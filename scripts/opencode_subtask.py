@@ -275,7 +275,11 @@ def _join_prompt(args_prompt: list[str]) -> str:
 def _resolve_prompt_input(args: argparse.Namespace) -> str:
     has_file = bool(getattr(args, "prompt_file", None))
     has_text = getattr(args, "prompt_text", None) is not None
-    has_positional = bool(getattr(args, "prompt", None))
+    prompt_parts = list(getattr(args, "prompt", []) or [])
+    prompt_probe = list(prompt_parts)
+    while prompt_probe and prompt_probe[0] == "--":
+        prompt_probe = prompt_probe[1:]
+    has_positional = bool(" ".join(prompt_probe).strip())
 
     chosen = int(has_file) + int(has_text) + int(has_positional)
     if chosen > 1:
@@ -288,7 +292,7 @@ def _resolve_prompt_input(args: argparse.Namespace) -> str:
         return _read_text(Path(args.prompt_file).expanduser().resolve())
     if has_text:
         return str(args.prompt_text)
-    return _join_prompt(getattr(args, "prompt", []))
+    return _join_prompt(prompt_parts)
 
 
 def _read_env_float(env: dict[str, str], key: str) -> float | None:
@@ -723,6 +727,38 @@ def _proc_cmdline(pid: int) -> str:
         return ""
 
 
+def _extract_server_port_from_url(url: str) -> int | None:
+    m = re.match(
+        r"^[a-zA-Z][a-zA-Z0-9+.\-]*://(?:\[[^\]]+\]|[^:/?#]+):(\d+)(?:[/?#]|$)",
+        str(url or "").strip(),
+    )
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _pid_matches_server_url(pid: int, url: str) -> bool:
+    if pid <= 0:
+        return False
+    expected_port = _extract_server_port_from_url(url)
+    if expected_port is None:
+        return False
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return False
+    cmdline_lc = cmdline.lower()
+    if ("opencode" not in cmdline_lc) or ("serve" not in cmdline_lc):
+        return False
+    port_txt = str(expected_port)
+    return bool(
+        re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc)
+        or re.search(rf"--port\s+{re.escape(port_txt)}\b", cmdline_lc)
+    )
+
+
 def _pick_free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
@@ -1133,6 +1169,16 @@ def reap_orphan_server_for_project(
         health_probe = _server_health_probe(url, auth)
         health_status = str(health_probe.get("status") or "").strip().lower()
         if health_status == "unhealthy":
+            if not _pid_matches_server_url(pid, url):
+                return {
+                    "checked": True,
+                    "reaped": False,
+                    "reason": "unhealthy-owner-unverified",
+                    "url": url,
+                    "pid": pid,
+                    "healthStatus": health_status,
+                    "statePath": str(st_path),
+                }
             try:
                 _kill_tree(pid)
             except Exception:
