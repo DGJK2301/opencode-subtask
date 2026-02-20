@@ -986,13 +986,15 @@ def _server_health(url_base: str, auth: HttpAuth | None) -> dict[str, Any] | Non
 
 
 def _scan_running_job_server_urls(
-    *, limit: int = ORPHAN_REAPER_SCAN_LIMIT
+    *,
+    current_project_key: str | None = None,
+    limit: int = ORPHAN_REAPER_SCAN_LIMIT,
 ) -> tuple[set[str], set[str]]:
     """
     Scan recent run job.json files and return:
     - active_urls: server URLs currently referenced by live running workers
-    - crashed_owner_urls: server URLs referenced by running jobs whose worker PID is dead
-      and serverStartedNew=true (strong orphan signal after hard kill/crash)
+    - crashed_owner_urls: server URLs referenced by running jobs whose worker PID is dead,
+      serverStartedNew=true, and (when current_project_key is set) belong to the same project.
     """
     active_urls: set[str] = set()
     crashed_owner_urls: set[str] = set()
@@ -1036,6 +1038,15 @@ def _scan_running_job_server_urls(
         if state != "running":
             continue
 
+        job_project_key: str | None = None
+        if current_project_key is not None:
+            try:
+                workdir_val = job.get("workdir")
+                if isinstance(workdir_val, str) and workdir_val.strip():
+                    job_project_key = _project_key(Path(workdir_val))
+            except Exception:
+                job_project_key = None
+
         pid = 0
         try:
             raw = job.get("pid")
@@ -1047,7 +1058,10 @@ def _scan_running_job_server_urls(
         if pid > 0 and _pid_running(pid):
             active_urls.add(url)
         elif bool(job.get("serverStartedNew")):
-            crashed_owner_urls.add(url)
+            if (current_project_key is None) or (
+                job_project_key == current_project_key
+            ):
+                crashed_owner_urls.add(url)
 
     return active_urls, crashed_owner_urls
 
@@ -1147,7 +1161,9 @@ def reap_orphan_server_for_project(
                 "statePath": str(st_path),
             }
 
-        active_urls, crashed_owner_urls = _scan_running_job_server_urls()
+        active_urls, crashed_owner_urls = _scan_running_job_server_urls(
+            current_project_key=_project_key(workdir)
+        )
         if url in active_urls:
             return {
                 "checked": True,
