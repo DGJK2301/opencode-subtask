@@ -28,6 +28,7 @@ This skill turns OpenCode into a reliable "subagent primitive" for upstream agen
    - `ensure-server` → `opencode-subtask-server`
    - `stop-server` → `opencode-subtask-stop-server`
    - CLI argument errors → `opencode-subtask-error` (with `ok: false`)
+   - `cancel` includes cleanup telemetry fields: `stopServerAttempted`, `stopServerOk`
 2. **Artifacts-first**: Large outputs (NDJSON, transcript, stderr) written to disk
 3. **Protocol shielding**: Callers depend only on this adapter's schema, not OpenCode internals
 4. **Engine abstraction**: HTTP server API preferred, CLI fallback on failure
@@ -94,7 +95,7 @@ python scripts/opencode_subtask.py run --workdir /path/to/project --engine auto 
 
 ```bash
 # 1) Start (returns immediately with runId)
-python scripts/opencode_subtask.py start --workdir . --engine auto --permission-mode allow -- \
+python scripts/opencode_subtask.py start --workdir . --engine auto --permission-mode allow --execution-profile checkpoint -- \
   "Act as a senior software engineer. Review src/foo.py exception handling; propose a minimal fix with file:line evidence."
 
 # 2) Poll status (optional)
@@ -107,7 +108,7 @@ python scripts/opencode_subtask.py wait --run-id <runId>
 ### Foreground (debug/quick tasks)
 
 ```bash
-python scripts/opencode_subtask.py run --workdir . --engine auto --no-quiet -- \
+python scripts/opencode_subtask.py run --workdir . --engine auto --execution-profile latency --no-quiet -- \
   "Act as a senior software engineer. Explain why tests fail on Windows; point to exact file:line."
 ```
 
@@ -120,6 +121,11 @@ python scripts/opencode_subtask.py run --workdir . --engine auto --no-quiet -- \
 | `--model` | (OpenCode default) | Prefer setting defaults in `opencode.json`. |
 | `--variant` | (none) | Pass as `--variant <name>`; do **not** use `model:suffix`. |
 | `--permission-mode` | `inherit` | Use `allow` for unattended runs; use `inherit` for interactive safety. |
+| `--execution-profile` | `hybrid` | Policy switch for engine/artifact behavior: `hybrid`/`latency`/`checkpoint`/`legacy`. |
+| `--hybrid-short-timeout-s` | (unset) | `hybrid` short-task timeout threshold override (seconds). Precedence: flag > env > default `240`. |
+| `--hybrid-short-prompt-chars` | (unset) | `hybrid` short-task prompt-length threshold override (chars). Precedence: flag > env > default `1600`. |
+| `--orphan-reaper` | `true` | On run start, reap orphan per-project servers left by crashed/hard-killed workers. Use `--no-orphan-reaper` to disable. |
+| `--orphan-reaper-idle-s` | `1800` | Fallback idle timeout for reaping healthy but unreferenced per-project servers. Set `0` to disable idle-timeout reaping. |
 | `--timeout` | (varies) | Increase for long-running reasoning models. |
 
 ## Persona-first prompts (default behavior)
@@ -303,7 +309,40 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 |------|------|
 | `--attach <url>` | Attach to a specific `opencode serve` URL. |
 | `--no-attach-server` | Don’t attach to a per-project server automatically. (`--engine http` will still require `--attach` or `ensure-server`.) |
-| `--stop-server-after-run` | If the run used the HTTP engine, stop the per-project server after completion. Useful for long loops to avoid accumulating server-side sessions/memory. |
+| `--stop-server-after-run <mode>` | HTTP server shutdown policy: `if-started` (default, only stop if this run started the server), `always`, or `never`. |
+| `--orphan-reaper` / `--no-orphan-reaper` | Enable/disable startup orphan-server cleanup before attach/ensure logic. |
+| `--orphan-reaper-idle-s <seconds>` | Idle fallback threshold used by the startup reaper. |
+
+Shutdown note:
+- In `--engine auto`, if HTTP is attempted first and then falls back to CLI, shutdown policy is still evaluated for that attempted HTTP path.
+- `if-started` only stops when this invocation created the per-project server; `always` stops regardless of who started it.
+- Safety gate: `always` / `if-started` only stop the currently tracked **local** per-project server URL (prevents stopping unrelated or remote `--attach` targets).
+- `cancel` applies the same policy from persisted job state (`httpAttempted`, `serverStartedNew`, `stopServerAfterRunMode`) to reduce orphaned per-project servers.
+- Startup reaper uses recent `job.json` evidence and server health: it reaps dead/unhealthy servers immediately, reaps strong crashed-owner orphans, and optionally reaps idle healthy servers after `--orphan-reaper-idle-s`.
+
+## Execution Profile (`--execution-profile`)
+
+`--execution-profile` controls routing and artifact density. This is orthogonal to model selection.
+
+| Mode | Intended use | Behavior |
+|------|--------------|----------|
+| `hybrid` (default) | General-purpose mixed workloads | Heuristic routing: short tasks prefer HTTP and lighter artifacts (`--no-save-events --no-save-text`), long tasks prefer CLI and full artifacts (`--save-events --save-text`). Default short-task thresholds are `timeout <= 240s` and prompt length `<= 1600` chars, configurable via flags/env (below). |
+| `latency` | Fast interactive / probe calls | Prefer HTTP when possible and use lighter artifacts. Best for short, disposable subtasks. |
+| `checkpoint` | Long-chain / auditable / recoverable workflows | Prefer CLI path and keep full artifacts for resume/debug/audit. Recommended for multi-agent chains. |
+| `legacy` | Backward compatibility | Keep pre-policy behavior; use when migrating existing orchestration scripts. |
+
+Policy guidance:
+- For long chains, default to `checkpoint`.
+- For quick probes and low-latency asks, use `latency`.
+- Keep `hybrid` as project default when task mix is unknown.
+- If caller input was `--engine auto`, profile-based HTTP preference still preserves HTTP-failure fallback to CLI.
+
+Hybrid threshold configuration:
+- Flags: `--hybrid-short-timeout-s`, `--hybrid-short-prompt-chars`
+- Env: `OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S`, `OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS`
+- Precedence: CLI flag > env var > built-in default
+- Example (flags): `python scripts/opencode_subtask.py run --execution-profile hybrid --hybrid-short-timeout-s 120 --hybrid-short-prompt-chars 1200 --timeout 90 --prompt "..."`
+- Example (env): set `OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S=120` and `OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS=1200`, then run with `--execution-profile hybrid`
 
 ## Engine Selection (`--engine`)
 
@@ -315,7 +354,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 
 **Note:** `--attach-server` defaults to `true`, meaning `auto` mode will attempt to reuse an existing server if one is running for the project. Use `--no-attach-server` to force CLI mode without checking for servers.
 
-**Note (memory):** HTTP engine sessions live inside the per-project `opencode serve` process and are not automatically deleted. If you run many subtasks against a long-lived server, memory can grow over time. Options: run with `--stop-server-after-run`, periodically run `stop-server`, or use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`).
+**Note (memory):** HTTP engine sessions live inside the per-project `opencode serve` process and are not automatically deleted. If you run many subtasks against a long-lived server, memory can grow over time. Options: run with `--stop-server-after-run if-started` (or `always`), periodically run `stop-server`, or use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`).
 
 **HTTP path** (preferred):
 - Uses OpenCode Server API: `/global/health`, `/session`, `/session/:id/message`
@@ -394,8 +433,8 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 | Quick probes, connectivity checks | `google/antigravity-gemini-3-flash` (variants: `minimal`, `low`, `medium`, `high`) |
 | Routine analysis, code review | `google/antigravity-claude-sonnet-4-6-thinking` (variants: `low`, `max`) |
 | Complex analysis, multi-step refactors | `google/antigravity-claude-opus-4-6-thinking` (variants: `low`, `max`) |
-| Pure formatting, minimal reasoning | `google/antigravity-claude-sonnet-4-5` (no thinking) |
-| Simple isolated tasks | `google/antigravity-gemini-3-pro` (variants: `low`, `high`) |
+| Pure formatting, minimal reasoning | `google/antigravity-claude-sonnet-4-6` (no thinking) |
+| Simple isolated tasks | `google/antigravity-gemini-3.1-pro` (variants: `low`, `high`) |
 | Cost-effective alternative (SiliconFlow) |  `siliconflow-cn/Pro/moonshotai/Kimi-K2.5` (comparable to sonnet-4.5, lower cost) |
 | High-capability alternative (SiliconFlow) | `siliconflow-cn/Pro/zai-org/GLM-5` |
 
@@ -413,7 +452,7 @@ python scripts/opencode_subtask.py ensure-server --workdir .
 python scripts/opencode_subtask.py stop-server --workdir .
 
 # One-shot runs (start server if needed, then stop it after completion)
-python scripts/opencode_subtask.py run --engine http --stop-server-after-run --workdir . --prompt "..."
+python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-started --workdir . --prompt "..."
 ```
 
 ## Operational Notes
@@ -423,6 +462,7 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run --w
 - **Result extraction**: Prefers sentinel-wrapped JSON (`BEGIN_OC_SUBTASK_JSON`/`END_OC_SUBTASK_JSON`)
 - **Windows**: Default executable is `opencode` (the wrapper prefers `opencode.exe` if available and falls back to `opencode.cmd`); uses `taskkill /T /F` for process cleanup
 - **Fallback logging**: When HTTP→CLI fallback occurs, `engine.fallbackFrom` is set in finish JSON
+- **Orphan reaper telemetry**: run debug/job state may include `orphanReaper` details; cancel output includes `stopServerAttempted` / `stopServerOk`
 
 ## Troubleshooting
 
@@ -431,6 +471,7 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run --w
 | `ok=false`, `error.name=ServerUnhealthy` | Server not running/healthy. If you want HTTP, run `ensure-server` (or pass `--attach`). Otherwise use CLI (`--engine cli`). |
 | `ok=false`, `error.name=OpencodeNotFound` | OpenCode not installed or not in PATH. Install OpenCode or use `--opencode <path>` to specify the executable path. |
 | `ok=false`, `error.name=MissingPrompt` | No prompt provided. Pass prompt after `--` or use `--prompt` / `--prompt-file`. |
+| `ok=false`, `error.name=PromptConflict` | Multiple prompt sources were provided. Use exactly one of: positional args after `--`, `--prompt`, or `--prompt-file`. |
 | `ok=false`, `error.name=MissingRunId` | `status`/`wait`/`cancel` requires `--run-id` or `--artifacts-dir`. |
 | `ok=false`, `error.name=JobNotFound` | The specified run-id/artifacts-dir doesn't have a `job.json`. The job may not have started. |
 | `ok=false`, `error.name=WorkerNotRunning` | Background worker process not running and `finish.json` missing. The job may have crashed. Check `wrapper.log` and `stderr.log`. |
