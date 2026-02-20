@@ -41,6 +41,14 @@ ADAPTER_SCHEMA_VERSION: Final[int] = 1
 
 DEFAULT_TIMEOUT_S: Final[float] = 900.0
 DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
+DEFAULT_GIT_TIMEOUT_S: Final[float] = 20.0
+DEFAULT_EXECUTION_PROFILE: Final[str] = "hybrid"
+HYBRID_SHORT_TIMEOUT_S: Final[float] = 240.0
+HYBRID_SHORT_PROMPT_CHARS: Final[int] = 1600
+DEFAULT_STOP_SERVER_AFTER_RUN: Final[str] = "if-started"
+DEFAULT_ORPHAN_REAPER_IDLE_S: Final[float] = 1800.0
+# 0 => no cap (scan all run dirs) to avoid missing active long-lived workers.
+ORPHAN_REAPER_SCAN_LIMIT: Final[int] = 0
 
 # 0 means "no hard cap"
 DEFAULT_MAX_ARTIFACT_BYTES: Final[int] = 20_000_000
@@ -210,6 +218,10 @@ def _atomic_write_bytes(
             time.sleep(sleep_s * (i + 1))
     # final attempt without swallowing
     if last_err:
+        try:
+            tmp.unlink(missing_ok=True)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         raise last_err
 
 
@@ -255,8 +267,224 @@ def _join_prompt(args_prompt: list[str]) -> str:
         if data:
             return data
     _exit_with_error(
-        "MissingPrompt", "Missing prompt. Pass it as arguments after `--` or via stdin."
+        "MissingPrompt",
+        "Missing prompt. Pass after `--`, via --prompt/--prompt-file, or via stdin.",
     )
+
+
+def _resolve_prompt_input(args: argparse.Namespace) -> str:
+    has_file = bool(getattr(args, "prompt_file", None))
+    has_text = getattr(args, "prompt_text", None) is not None
+    prompt_parts = list(getattr(args, "prompt", []) or [])
+    prompt_probe = list(prompt_parts)
+    while prompt_probe and prompt_probe[0] == "--":
+        prompt_probe = prompt_probe[1:]
+    has_positional = bool(" ".join(prompt_probe).strip())
+
+    chosen = int(has_file) + int(has_text) + int(has_positional)
+    if chosen > 1:
+        _exit_with_error(
+            "PromptConflict",
+            "Use exactly one prompt source: --prompt-file, --prompt, or positional args after `--`.",
+        )
+
+    if has_file:
+        return _read_text(Path(args.prompt_file).expanduser().resolve())
+    if has_text:
+        return str(args.prompt_text)
+    return _join_prompt(prompt_parts)
+
+
+def _read_env_float(env: dict[str, str], key: str) -> float | None:
+    raw = env.get(key)
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    if not txt:
+        return None
+    try:
+        return float(txt)
+    except Exception:
+        _exit_with_error("BadConfig", f"{key} must be a float, got: {raw!r}")
+
+
+def _read_env_int(env: dict[str, str], key: str) -> int | None:
+    raw = env.get(key)
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    if not txt:
+        return None
+    try:
+        return int(txt)
+    except Exception:
+        _exit_with_error("BadConfig", f"{key} must be an int, got: {raw!r}")
+
+
+def _resolve_hybrid_thresholds(
+    args: argparse.Namespace, env: dict[str, str]
+) -> tuple[float, str, int, str]:
+    timeout_s = HYBRID_SHORT_TIMEOUT_S
+    timeout_source = "default"
+    prompt_chars = HYBRID_SHORT_PROMPT_CHARS
+    prompt_source = "default"
+
+    env_timeout = _read_env_float(env, "OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S")
+    if env_timeout is not None:
+        if env_timeout <= 0:
+            _exit_with_error(
+                "BadConfig",
+                f"OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S must be > 0, got: {env_timeout}",
+            )
+        timeout_s = float(env_timeout)
+        timeout_source = "env"
+
+    env_prompt_chars = _read_env_int(env, "OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS")
+    if env_prompt_chars is not None:
+        if env_prompt_chars <= 0:
+            _exit_with_error(
+                "BadConfig",
+                f"OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS must be > 0, got: {env_prompt_chars}",
+            )
+        prompt_chars = int(env_prompt_chars)
+        prompt_source = "env"
+
+    flag_timeout = getattr(args, "hybrid_short_timeout_s", None)
+    if flag_timeout is not None:
+        if float(flag_timeout) <= 0:
+            _exit_with_error(
+                "BadConfig",
+                f"--hybrid-short-timeout-s must be > 0, got: {flag_timeout}",
+            )
+        timeout_s = float(flag_timeout)
+        timeout_source = "flag"
+
+    flag_prompt_chars = getattr(args, "hybrid_short_prompt_chars", None)
+    if flag_prompt_chars is not None:
+        if int(flag_prompt_chars) <= 0:
+            _exit_with_error(
+                "BadConfig",
+                f"--hybrid-short-prompt-chars must be > 0, got: {flag_prompt_chars}",
+            )
+        prompt_chars = int(flag_prompt_chars)
+        prompt_source = "flag"
+
+    return timeout_s, timeout_source, prompt_chars, prompt_source
+
+
+def _apply_execution_profile(
+    args: argparse.Namespace, prompt: str, env: dict[str, str]
+) -> dict[str, Any]:
+    """
+    Hybrid routing policy for engine/artifact behavior.
+    - short tasks: prefer HTTP + lighter artifacts
+    - long tasks: prefer CLI + full artifacts
+    """
+    raw_profile = str(
+        getattr(args, "execution_profile", DEFAULT_EXECUTION_PROFILE)
+        or DEFAULT_EXECUTION_PROFILE
+    )
+    profile = raw_profile.strip().lower()
+    if profile not in ("legacy", "hybrid", "latency", "checkpoint"):
+        profile = DEFAULT_EXECUTION_PROFILE
+
+    prompt_chars = len(prompt)
+    timeout_s = float(getattr(args, "timeout", DEFAULT_TIMEOUT_S))
+    (
+        hybrid_short_timeout_s,
+        hybrid_timeout_source,
+        hybrid_short_prompt_chars,
+        hybrid_prompt_source,
+    ) = _resolve_hybrid_thresholds(args, env)
+    short_task = (
+        timeout_s <= hybrid_short_timeout_s
+        and prompt_chars <= hybrid_short_prompt_chars
+    )
+
+    # Preserve old behavior.
+    if profile == "legacy":
+        return {
+            "profile": profile,
+            "taskClass": "legacy",
+            "promptChars": prompt_chars,
+            "timeoutS": timeout_s,
+            "hybridShortTimeoutS": hybrid_short_timeout_s,
+            "hybridShortPromptChars": hybrid_short_prompt_chars,
+            "hybridThresholdSource": {
+                "timeoutS": hybrid_timeout_source,
+                "promptChars": hybrid_prompt_source,
+            },
+        }
+
+    # Explicit modes.
+    if profile == "latency":
+        if getattr(args, "engine", "auto") == "auto":
+            if getattr(args, "attach", None) or bool(getattr(args, "attach_server", True)):
+                args.engine = "http"
+            else:
+                args.engine = "cli"
+        args.save_events = False
+        args.save_text = False
+        return {
+            "profile": profile,
+            "taskClass": "short",
+            "promptChars": prompt_chars,
+            "timeoutS": timeout_s,
+            "hybridShortTimeoutS": hybrid_short_timeout_s,
+            "hybridShortPromptChars": hybrid_short_prompt_chars,
+            "hybridThresholdSource": {
+                "timeoutS": hybrid_timeout_source,
+                "promptChars": hybrid_prompt_source,
+            },
+        }
+
+    if profile == "checkpoint":
+        if getattr(args, "engine", "auto") == "auto":
+            args.engine = "cli"
+        args.save_events = True
+        args.save_text = True
+        return {
+            "profile": profile,
+            "taskClass": "long",
+            "promptChars": prompt_chars,
+            "timeoutS": timeout_s,
+            "hybridShortTimeoutS": hybrid_short_timeout_s,
+            "hybridShortPromptChars": hybrid_short_prompt_chars,
+            "hybridThresholdSource": {
+                "timeoutS": hybrid_timeout_source,
+                "promptChars": hybrid_prompt_source,
+            },
+        }
+
+    # hybrid
+    if short_task:
+        if getattr(args, "engine", "auto") == "auto":
+            if getattr(args, "attach", None) or bool(getattr(args, "attach_server", True)):
+                args.engine = "http"
+            else:
+                args.engine = "cli"
+        args.save_events = False
+        args.save_text = False
+        task_class = "short"
+    else:
+        if getattr(args, "engine", "auto") == "auto":
+            args.engine = "cli"
+        args.save_events = True
+        args.save_text = True
+        task_class = "long"
+
+    return {
+        "profile": profile,
+        "taskClass": task_class,
+        "promptChars": prompt_chars,
+        "timeoutS": timeout_s,
+        "hybridShortTimeoutS": hybrid_short_timeout_s,
+        "hybridShortPromptChars": hybrid_short_prompt_chars,
+        "hybridThresholdSource": {
+            "timeoutS": hybrid_timeout_source,
+            "promptChars": hybrid_prompt_source,
+        },
+    }
 
 
 def _merge_env(
@@ -499,6 +727,38 @@ def _proc_cmdline(pid: int) -> str:
         return ""
 
 
+def _extract_server_port_from_url(url: str) -> int | None:
+    m = re.match(
+        r"^[a-zA-Z][a-zA-Z0-9+.\-]*://(?:\[[^\]]+\]|[^:/?#]+):(\d+)(?:[/?#]|$)",
+        str(url or "").strip(),
+    )
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _pid_matches_server_url(pid: int, url: str) -> bool:
+    if pid <= 0:
+        return False
+    expected_port = _extract_server_port_from_url(url)
+    if expected_port is None:
+        return False
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return False
+    cmdline_lc = cmdline.lower()
+    if ("opencode" not in cmdline_lc) or ("serve" not in cmdline_lc):
+        return False
+    port_txt = str(expected_port)
+    return bool(
+        re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc)
+        or re.search(rf"--port\s+{re.escape(port_txt)}\b", cmdline_lc)
+    )
+
+
 def _pick_free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
@@ -543,6 +803,18 @@ def _resolve_executable(cmd: str) -> str | None:
             found2 = which(candidate)
             if found2:
                 return str(Path(found2).resolve())
+    return None
+
+
+def _resolve_executable_for_workdir(cmd: str, workdir: Path) -> str | None:
+    resolved = _resolve_executable(cmd)
+    if resolved:
+        return resolved
+    p = Path(cmd)
+    if not p.is_absolute():
+        candidate = (workdir / p).resolve()
+        if candidate.is_file():
+            return str(candidate)
     return None
 
 
@@ -713,12 +985,315 @@ class OpencodeHttpClient:
 # ============================
 
 
-def _server_health(url_base: str, auth: HttpAuth | None) -> dict[str, Any] | None:
+def _server_health_probe(url_base: str, auth: HttpAuth | None) -> dict[str, Any]:
+    """
+    Probe /global/health with coarse failure classification.
+
+    status:
+    - healthy: endpoint reachable and reports healthy=true
+    - unhealthy: endpoint reachable but healthy!=true
+    - auth-error: HTTP 401/403 (credentials mismatch / missing)
+    - unknown: transport/protocol failures (timeout, refused, parse, etc.)
+    """
     c = OpencodeHttpClient(url_base, auth=auth, timeout_s=2.0)
-    js = c.health()
+    try:
+        _, js = c._request_json("GET", "/global/health", None, timeout_s=2.0)
+    except RuntimeError as e:
+        msg = str(e)
+        if ("HTTP 401" in msg) or ("HTTP 403" in msg):
+            return {"status": "auth-error", "error": msg}
+        return {"status": "unknown", "error": msg}
+    except Exception as e:
+        return {"status": "unknown", "error": f"{type(e).__name__}: {e}"}
+
     if isinstance(js, dict) and js.get("healthy") is True:
-        return js
+        return {"status": "healthy", "payload": js}
+    if isinstance(js, dict):
+        return {"status": "unhealthy", "payload": js}
+    return {"status": "unknown", "error": "invalid health payload"}
+
+
+def _server_health(url_base: str, auth: HttpAuth | None) -> dict[str, Any] | None:
+    probe = _server_health_probe(url_base, auth)
+    payload = probe.get("payload")
+    if str(probe.get("status")) == "healthy" and isinstance(payload, dict):
+        return payload
     return None
+
+
+def _scan_running_job_server_urls(
+    *,
+    current_project_key: str | None = None,
+    limit: int = ORPHAN_REAPER_SCAN_LIMIT,
+) -> tuple[set[str], set[str]]:
+    """
+    Scan recent run job.json files and return:
+    - active_urls: server URLs currently referenced by live running workers
+    - crashed_owner_urls: server URLs referenced by running jobs whose worker PID is dead,
+      serverStartedNew=true, and (when current_project_key is set) belong to the same project.
+    """
+    active_urls: set[str] = set()
+    crashed_owner_urls: set[str] = set()
+    runs_dir = _runs_dir()
+    if not runs_dir.exists():
+        return active_urls, crashed_owner_urls
+
+    entries: list[tuple[float, Path]] = []
+    try:
+        for p in runs_dir.iterdir():
+            if not p.is_dir():
+                continue
+            try:
+                mtime = float(p.stat().st_mtime)
+            except Exception:
+                continue
+            entries.append((mtime, p))
+    except Exception:
+        return active_urls, crashed_owner_urls
+
+    entries.sort(key=lambda t: t[0], reverse=True)
+    if limit > 0:
+        entries = entries[:limit]
+
+    for _, run_dir in entries:
+        job = _load_json(run_dir / "job.json")
+        if not isinstance(job, dict):
+            continue
+        url = job.get("serverUrl")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        finish = _load_json(run_dir / "finish.json")
+        if isinstance(finish, dict):
+            err = finish.get("error")
+            if isinstance(err, dict):
+                err_name = str(err.get("name") or "").strip().lower()
+                if err_name == "canceled":
+                    # Do not treat canceled runs as crashed-owner evidence.
+                    continue
+        state = str(job.get("state") or "").strip().lower()
+        if state != "running":
+            continue
+
+        job_project_key: str | None = None
+        if current_project_key is not None:
+            try:
+                workdir_val = job.get("workdir")
+                if isinstance(workdir_val, str) and workdir_val.strip():
+                    job_project_key = _project_key(Path(workdir_val))
+            except Exception:
+                job_project_key = None
+
+        pid = 0
+        try:
+            raw = job.get("pid")
+            if isinstance(raw, (int, str)):
+                pid = int(raw or 0)
+        except Exception:
+            pid = 0
+
+        if pid > 0 and _pid_running(pid):
+            active_urls.add(url)
+        elif bool(job.get("serverStartedNew")):
+            if (current_project_key is None) or (
+                job_project_key == current_project_key
+            ):
+                crashed_owner_urls.add(url)
+
+    return active_urls, crashed_owner_urls
+
+
+def reap_orphan_server_for_project(
+    *,
+    workdir: Path,
+    auth: HttpAuth | None,
+    idle_s: float,
+) -> dict[str, Any]:
+    """
+    Startup reaper for per-project server state.
+
+    Rules:
+    - Reap immediately when state PID is dead or server is unhealthy.
+    - Reap immediately when we find a crashed owner job (running state + dead PID + serverStartedNew=true).
+    - Optional fallback: reap healthy idle server when no live worker references it and age >= idle_s.
+    """
+    st_path = _server_state_path(workdir)
+    lock_path = _server_lock_path(workdir)
+
+    with _FileLock(lock_path):
+        st = _load_json(st_path) or {}
+        if not (isinstance(st, dict) and isinstance(st.get("url"), str)):
+            return {
+                "checked": False,
+                "reaped": False,
+                "reason": "no-state",
+                "statePath": str(st_path),
+            }
+
+        url = str(st["url"])
+        pid = 0
+        try:
+            raw_pid = st.get("pid")
+            if isinstance(raw_pid, (int, str)):
+                pid = int(raw_pid or 0)
+        except Exception:
+            pid = 0
+
+        def _clear_state() -> None:
+            try:
+                st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        if pid <= 0:
+            _clear_state()
+            return {
+                "checked": True,
+                "reaped": True,
+                "reason": "invalid-pid",
+                "url": url,
+                "pid": pid,
+                "statePath": str(st_path),
+            }
+
+        if not _pid_running(pid):
+            _clear_state()
+            return {
+                "checked": True,
+                "reaped": True,
+                "reason": "dead-pid",
+                "url": url,
+                "pid": pid,
+                "statePath": str(st_path),
+            }
+
+        health_probe = _server_health_probe(url, auth)
+        health_status = str(health_probe.get("status") or "").strip().lower()
+        if health_status == "unhealthy":
+            if not _pid_matches_server_url(pid, url):
+                return {
+                    "checked": True,
+                    "reaped": False,
+                    "reason": "unhealthy-owner-unverified",
+                    "url": url,
+                    "pid": pid,
+                    "healthStatus": health_status,
+                    "statePath": str(st_path),
+                }
+            try:
+                _kill_tree(pid)
+            except Exception:
+                pass
+            _clear_state()
+            return {
+                "checked": True,
+                "reaped": True,
+                "reason": "unhealthy-server",
+                "url": url,
+                "pid": pid,
+                "healthStatus": health_status,
+                "statePath": str(st_path),
+            }
+        if health_status != "healthy":
+            # Unknown probe result (including auth mismatch) is not sufficient
+            # evidence to kill a potentially healthy server process.
+            return {
+                "checked": True,
+                "reaped": False,
+                "reason": "health-unknown",
+                "url": url,
+                "pid": pid,
+                "healthStatus": health_status,
+                "healthError": health_probe.get("error"),
+                "statePath": str(st_path),
+            }
+
+        active_urls, crashed_owner_urls = _scan_running_job_server_urls(
+            current_project_key=_project_key(workdir)
+        )
+        if url in active_urls:
+            return {
+                "checked": True,
+                "reaped": False,
+                "reason": "active-worker",
+                "url": url,
+                "pid": pid,
+                "statePath": str(st_path),
+            }
+
+        started_at_ms = 0
+        try:
+            raw_started = st.get("startedAt")
+            if isinstance(raw_started, (int, str)):
+                started_at_ms = int(raw_started or 0)
+        except Exception:
+            started_at_ms = 0
+        age_s = (
+            max(0.0, (float(_now_ms()) - float(started_at_ms)) / 1000.0)
+            if started_at_ms > 0
+            else None
+        )
+
+        if url in crashed_owner_urls:
+            if not _pid_matches_server_url(pid, url):
+                return {
+                    "checked": True,
+                    "reaped": False,
+                    "reason": "crashed-owner-unverified",
+                    "url": url,
+                    "pid": pid,
+                    "ageS": age_s,
+                    "statePath": str(st_path),
+                }
+            try:
+                _kill_tree(pid)
+            except Exception:
+                pass
+            _clear_state()
+            return {
+                "checked": True,
+                "reaped": True,
+                "reason": "crashed-owner",
+                "url": url,
+                "pid": pid,
+                "ageS": age_s,
+                "statePath": str(st_path),
+            }
+
+        if idle_s > 0 and age_s is not None and age_s >= idle_s:
+            if not _pid_matches_server_url(pid, url):
+                return {
+                    "checked": True,
+                    "reaped": False,
+                    "reason": "idle-timeout-unverified",
+                    "url": url,
+                    "pid": pid,
+                    "ageS": age_s,
+                    "statePath": str(st_path),
+                }
+            try:
+                _kill_tree(pid)
+            except Exception:
+                pass
+            _clear_state()
+            return {
+                "checked": True,
+                "reaped": True,
+                "reason": "idle-timeout",
+                "url": url,
+                "pid": pid,
+                "ageS": age_s,
+                "statePath": str(st_path),
+            }
+
+        return {
+            "checked": True,
+            "reaped": False,
+            "reason": "healthy-kept",
+            "url": url,
+            "pid": pid,
+            "ageS": age_s,
+            "statePath": str(st_path),
+        }
 
 
 class _FileLock:
@@ -789,7 +1364,9 @@ def ensure_server(
             if health:
                 st["version"] = health.get("version")
                 _write_json(st_path, st)
-                return st
+                out = dict(st)
+                out["startedNew"] = False
+                return out
 
             # If we have a recorded PID and it is still alive, do not spawn another server.
             # Starting multiple servers for the same project is noisy on Windows and can confuse callers.
@@ -854,9 +1431,12 @@ def ensure_server(
             "projectRoot": str(_find_git_root(workdir)),
             "logPath": str(log_path),
             "command": cmd,
+            "managedBy": "opencode-subtask",
         }
         _write_json(st_path, state)
-        return state
+        out = dict(state)
+        out["startedNew"] = True
+        return out
 
 
 def attach_existing_server(
@@ -885,17 +1465,19 @@ def attach_existing_server(
 
 def stop_server(workdir: Path) -> dict[str, Any]:
     st_path = _server_state_path(workdir)
-    st = _load_json(st_path) or {}
-    pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
-    ok = False
-    if pid and _pid_running(pid):
-        _kill_tree(pid)
-        ok = True
-    try:
-        st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    return {"ok": ok, "pid": pid, "statePath": str(st_path)}
+    lock_path = _server_lock_path(workdir)
+    with _FileLock(lock_path):
+        st = _load_json(st_path) or {}
+        pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
+        ok = False
+        if pid and _pid_running(pid):
+            _kill_tree(pid)
+            ok = True
+        try:
+            st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return {"ok": ok, "pid": pid, "statePath": str(st_path)}
 
 
 # ============================
@@ -1069,6 +1651,7 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
             subprocess.check_output(
                 ["git", "-C", str(workdir), "rev-parse", "--is-inside-work-tree"],
                 stderr=subprocess.DEVNULL,
+                timeout=DEFAULT_GIT_TIMEOUT_S,
             )
             .decode("utf-8", errors="replace")
             .strip()
@@ -1082,6 +1665,7 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
         raw = subprocess.check_output(
             ["git", "-C", str(workdir), "status", "--porcelain", "-z"],
             stderr=subprocess.DEVNULL,
+            timeout=DEFAULT_GIT_TIMEOUT_S,
         )
         parts = raw.split(b"\x00")
         changed: list[str] = []
@@ -1108,6 +1692,7 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
             names = subprocess.check_output(
                 ["git", "-C", str(workdir), "diff", "--name-only"],
                 stderr=subprocess.DEVNULL,
+                timeout=DEFAULT_GIT_TIMEOUT_S,
             ).decode("utf-8", errors="replace")
             changed = [x.strip() for x in names.splitlines() if x.strip()]
             return sorted(set(changed)), []
@@ -1122,6 +1707,7 @@ def _git_patch(workdir: Path, artifacts_dir: Path) -> str | None:
         diff = subprocess.check_output(
             ["git", "-C", str(workdir), "diff"],
             stderr=subprocess.DEVNULL,
+            timeout=DEFAULT_GIT_TIMEOUT_S,
         ).decode("utf-8", errors="replace")
         if not diff.strip():
             return None
@@ -2005,17 +2591,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     # Prompt
-    if args.prompt_file:
-        prompt = _read_text(Path(args.prompt_file).expanduser().resolve())
-    elif args.prompt_text is not None:
-        if args.prompt:
-            _exit_with_error(
-                "PromptConflict",
-                "Use either --prompt or positional prompt args, not both.",
-            )
-        prompt = str(args.prompt_text)
-    else:
-        prompt = _join_prompt(args.prompt)
+    prompt = _resolve_prompt_input(args)
+
+    # Merge env early so profile thresholds can honor --env / --env-file overrides.
+    env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+    requested_engine = str(getattr(args, "engine", "auto"))
+    profile_info = _apply_execution_profile(args, prompt, env)
 
     prompt = _apply_persona_policy(prompt, args.persona_mode, args.persona_line)
 
@@ -2042,6 +2623,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         "updatedAt": _now_ms(),
         "pid": os.getpid(),
         "engine": args.engine,
+        "stopServerAfterRunMode": str(getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)),
+        "serverStartedNew": False,
+        "httpAttempted": False,
+        "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
     }
     _write_json(job_path, job_obj)
 
@@ -2056,7 +2641,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             pass
 
     # Env
-    env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
     # Defensive defaults (no-op if ignored by OpenCode)
     env.setdefault("OPENCODE_CLIENT", "opencode-subtask")
     if args.disable_claude_code:
@@ -2064,12 +2648,44 @@ def cmd_run(args: argparse.Namespace) -> int:
     _apply_permission_mode(env, args.permission_mode)
 
     auth = _get_http_auth_from_env(env)
+    reaper_info: dict[str, Any] | None = None
+    reaper_idle_s = float(
+        getattr(args, "orphan_reaper_idle_s", DEFAULT_ORPHAN_REAPER_IDLE_S)
+    )
+    if reaper_idle_s < 0:
+        _exit_with_error(
+            "BadConfig",
+            f"--orphan-reaper-idle-s must be >= 0, got: {reaper_idle_s}",
+        )
+    if (
+        bool(getattr(args, "orphan_reaper", True))
+        and (requested_engine in ("http", "auto"))
+        and (args.attach is None)
+        and bool(args.attach_server)
+    ):
+        try:
+            reaper_info = reap_orphan_server_for_project(
+                workdir=workdir,
+                auth=auth,
+                idle_s=reaper_idle_s,
+            )
+        except Exception as e:
+            reaper_info = {
+                "checked": True,
+                "reaped": False,
+                "reason": "reaper-error",
+                "error": f"{type(e).__name__}: {e}",
+            }
+        _update_job({"orphanReaper": reaper_info})
 
     # Server attach/ensure
     server_state: dict[str, Any] | None = None
     attach_url = args.attach
     server_error: dict[str, Any] | None = None
     server_started_new = False
+    stop_server_mode = str(
+        getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
+    ).strip().lower()
 
     # Need opencode binary if we might call CLI engine OR we need to start a server.
     opencode_bin: str | None = None
@@ -2078,7 +2694,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     if need_opencode_bin:
         default_cmd = args.opencode
-        opencode_bin = _resolve_executable(default_cmd)
+        opencode_bin = _resolve_executable_for_workdir(default_cmd, workdir)
         if not opencode_bin:
             out = _finish_obj(
                 ok=False,
@@ -2134,6 +2750,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 server_state = attach_existing_server(workdir=workdir, auth=auth)
                 if server_state:
                     attach_url = str(server_state.get("url"))
+                    server_started_new = False
                 else:
                     server_state = ensure_server(
                         opencode_bin=opencode_bin,
@@ -2144,7 +2761,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         env=env,
                         auth=auth,
                     )
-                    server_started_new = True
+                    server_started_new = bool(server_state.get("startedNew")) if isinstance(server_state, dict) else False
                     attach_url = str(server_state.get("url"))
             except Exception as e:
                 server_error = {"name": type(e).__name__, "message": str(e)}
@@ -2155,13 +2772,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 server_state = attach_existing_server(workdir=workdir, auth=auth)
                 if server_state:
                     attach_url = str(server_state.get("url"))
+                    server_started_new = False
             except Exception as e:
                 server_error = {"name": type(e).__name__, "message": str(e)}
                 server_state = None
                 attach_url = None
 
+    _update_job({"serverStartedNew": server_started_new})
     if attach_url:
-        _update_job({"serverUrl": attach_url})
+        _update_job({"serverUrl": attach_url, "serverStartedNew": server_started_new})
 
     # Decide engine
     chosen = args.engine
@@ -2179,10 +2798,35 @@ def cmd_run(args: argparse.Namespace) -> int:
     ):
         cli_attach_url = None
 
+    def _ensure_opencode_bin_for_cli() -> str | None:
+        nonlocal opencode_bin
+        if opencode_bin:
+            return opencode_bin
+        resolved = _resolve_executable_for_workdir(str(args.opencode), workdir)
+        if not resolved:
+            return None
+        opencode_bin = resolved
+        return opencode_bin
+
     def run_cli() -> RunOutcome:
-        assert opencode_bin is not None
+        cli_bin = _ensure_opencode_bin_for_cli()
+        if not cli_bin:
+            return RunOutcome(
+                ok=False,
+                exit_code=127,
+                timed_out=False,
+                engine="cli",
+                fallback_from=None,
+                session_id=None,
+                full_text="",
+                metrics=None,
+                error={
+                    "name": "OpencodeNotFound",
+                    "message": f"Could not find opencode executable: {args.opencode}",
+                },
+            )
         return _run_cli(
-            opencode_bin=opencode_bin,
+            opencode_bin=cli_bin,
             workdir=workdir,
             env=env,
             attach_url=cli_attach_url,
@@ -2241,13 +2885,26 @@ def cmd_run(args: argparse.Namespace) -> int:
             on_session_id=lambda sid: _update_job({"sessionId": sid}),
         )
 
+    http_was_attempted = False
     if chosen == "cli":
         outcome = run_cli()
     elif chosen == "http":
-        outcome = run_http()
+        http_was_attempted = True
+        _update_job({"httpAttempted": True})
+        o1 = run_http()
+        if o1.ok:
+            outcome = o1
+        elif requested_engine == "auto":
+            fallback_from = "http"
+            outcome = run_cli()
+            outcome.fallback_from = "http"  # type: ignore[attr-defined]
+        else:
+            outcome = o1
     else:
         # auto: prefer http if we have a server URL; otherwise cli.
         if attach_url:
+            http_was_attempted = True
+            _update_job({"httpAttempted": True})
             o1 = run_http()
             if o1.ok:
                 outcome = o1
@@ -2309,6 +2966,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             "fallbackFrom": fallback_from,
             "serverError": server_error,
             "serverUrl": attach_url,
+            "serverStartedNew": server_started_new,
+            "stopServerAfterRunMode": stop_server_mode,
+            "executionProfile": profile_info,
+            "orphanReaper": reaper_info,
             "serverHealth": (
                 OpencodeHttpClient(
                     attach_url, auth=_get_http_auth_from_env(env)
@@ -2359,6 +3020,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         job_obj2["state"] = "finished"
         job_obj2["updatedAt"] = _now_ms()
         job_obj2["ok"] = ok
+        job_obj2["serverStartedNew"] = server_started_new
+        job_obj2["httpAttempted"] = http_was_attempted
+        job_obj2["stopServerAfterRunMode"] = stop_server_mode
         if outcome.session_id:
             job_obj2["sessionId"] = outcome.session_id
         if attach_url:
@@ -2366,18 +3030,51 @@ def cmd_run(args: argparse.Namespace) -> int:
         _write_json(job_path, job_obj2)
 
     # Optional: stop the per-project server after completion.
-    # This helps avoid long-running servers accumulating memory across many runs.
-    # We only do this when the HTTP engine was actually used for the run to avoid
-    # surprising side effects for CLI-only executions.
-    if getattr(args, "stop_server_after_run", False) and outcome.engine == "http":
+    should_stop_server = False
+    if http_was_attempted:
+        attached_server_url = (
+            str(server_state.get("url"))
+            if isinstance(server_state, dict) and server_state.get("url")
+            else None
+        )
+        if (not attached_server_url) and attach_url:
+            # Support explicit --attach local per-project server URLs where
+            # server_state may be unset.
+            st_local = _load_json(_server_state_path(workdir)) or {}
+            if isinstance(st_local, dict) and st_local.get("url"):
+                attached_server_url = str(st_local.get("url"))
+        # Safety gate: only stop the exact local per-project server selected
+        # for this invocation. This avoids affecting unrelated/remote attach targets.
+        is_local_selected_server = bool(
+            attach_url
+            and attached_server_url
+            and str(attach_url) == str(attached_server_url)
+        )
+        if stop_server_mode == "always":
+            should_stop_server = is_local_selected_server
+        elif stop_server_mode == "if-started":
+            # Safety gate: only stop the exact local server this invocation started.
+            should_stop_server = bool(
+                server_started_new
+                and is_local_selected_server
+            )
+        elif stop_server_mode == "never":
+            should_stop_server = False
+        else:
+            _exit_with_error(
+                "BadConfig",
+                "Invalid --stop-server-after-run mode. Expected one of: if-started, always, never.",
+            )
+
+    if should_stop_server:
         try:
             st = stop_server(workdir)
             sys.stderr.write(
-                f"[opencode-subtask] NOTE: stop-server-after-run: ok={st.get('ok')} pid={st.get('pid')}\n"
+                f"[opencode-subtask] NOTE: stop-server-after-run({stop_server_mode}): ok={st.get('ok')} pid={st.get('pid')}\n"
             )
         except Exception as e:
             sys.stderr.write(
-                f"[opencode-subtask] WARN: stop-server-after-run failed: {type(e).__name__}: {e}\n"
+                f"[opencode-subtask] WARN: stop-server-after-run({stop_server_mode}) failed: {type(e).__name__}: {e}\n"
             )
 
     sys.stdout.write(_json_line(out) + "\n")
@@ -2390,7 +3087,9 @@ def cmd_start(args: argparse.Namespace) -> int:
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    prompt = _join_prompt(args.prompt)
+    # Prompt
+    prompt = _resolve_prompt_input(args)
+
     prompt = _apply_persona_policy(prompt, args.persona_mode, args.persona_line)
     # Note: the worker (`run`) will append the output contract unless --no-contract is set.
 
@@ -2407,11 +3106,18 @@ def cmd_start(args: argparse.Namespace) -> int:
             "runId": run_id,
             "workdir": str(workdir),
             "state": "queued",
+            "stopServerAfterRunMode": str(getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)),
+            "serverStartedNew": False,
+            "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
             "createdAt": _now_ms(),
             "updatedAt": _now_ms(),
         },
     )
     _write_text(wrapper_log_path, "")
+
+    opencode_arg = _resolve_executable_for_workdir(str(args.opencode), workdir) or str(
+        args.opencode
+    )
 
     # Build worker command (explicitly pass run_id/artifacts_dir/opencode path and flags).
     py = sys.executable
@@ -2426,7 +3132,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--artifacts-dir",
         str(artifacts_dir),
         "--opencode",
-        args.opencode,
+        opencode_arg,
         "--engine",
         args.engine,
         "--timeout",
@@ -2437,12 +3143,19 @@ def cmd_start(args: argparse.Namespace) -> int:
         str(args.max_artifact_bytes),
         "--permission-mode",
         args.permission_mode,
+        "--execution-profile",
+        str(args.execution_profile),
+        "--stop-server-after-run",
+        str(args.stop_server_after_run),
+        "--orphan-reaper-idle-s",
+        str(args.orphan_reaper_idle_s),
     ]
 
     # booleans
     worker_cmd.append("--quiet" if args.quiet else "--no-quiet")
     worker_cmd.append("--save-events" if args.save_events else "--no-save-events")
     worker_cmd.append("--save-text" if args.save_text else "--no-save-text")
+    worker_cmd.append("--orphan-reaper" if args.orphan_reaper else "--no-orphan-reaper")
     worker_cmd.append(
         "--disable-claude-code"
         if args.disable_claude_code
@@ -2469,8 +3182,17 @@ def cmd_start(args: argparse.Namespace) -> int:
         worker_cmd.append("--attach-server")
     else:
         worker_cmd.append("--no-attach-server")
-    if getattr(args, "stop_server_after_run", False):
-        worker_cmd.append("--stop-server-after-run")
+    if getattr(args, "hybrid_short_timeout_s", None) is not None:
+        worker_cmd.extend(
+            ["--hybrid-short-timeout-s", str(getattr(args, "hybrid_short_timeout_s"))]
+        )
+    if getattr(args, "hybrid_short_prompt_chars", None) is not None:
+        worker_cmd.extend(
+            [
+                "--hybrid-short-prompt-chars",
+                str(getattr(args, "hybrid_short_prompt_chars")),
+            ]
+        )
     worker_cmd.extend(
         [
             "--server-hostname",
@@ -2760,7 +3482,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 },
             )
             sys.stdout.write(_json_line(out) + "\n")
-            return 0
+            return 1
 
         time.sleep(float(args.poll_interval))
 
@@ -2785,6 +3507,21 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         if isinstance(job, dict) and job.get("sessionId")
         else None
     )
+    http_attempted = (
+        bool(job.get("httpAttempted"))
+        if isinstance(job, dict)
+        else False
+    )
+    stop_server_mode = str(
+        job.get("stopServerAfterRunMode", DEFAULT_STOP_SERVER_AFTER_RUN)
+    ).strip().lower() if isinstance(job, dict) else DEFAULT_STOP_SERVER_AFTER_RUN
+    server_started_new = (
+        bool(job.get("serverStartedNew"))
+        if isinstance(job, dict)
+        else False
+    )
+    stop_attempted = False
+    stop_ok: bool | None = None
 
     ok = False
     if pid and _pid_running(pid):
@@ -2803,6 +3540,49 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             ok = True
         except Exception:
             pass
+
+    # If worker was canceled before normal completion, best-effort apply
+    # stop-server-after-run policy to avoid orphaning a freshly-started server.
+    should_stop_server = False
+    wd = (
+        Path(str(job.get("workdir")))
+        if isinstance(job, dict) and job.get("workdir")
+        else Path.cwd()
+    )
+    if http_attempted or server_started_new:
+        st_local = _load_json(_server_state_path(wd)) or {}
+        local_server_url = (
+            str(st_local.get("url"))
+            if isinstance(st_local, dict) and st_local.get("url")
+            else None
+        )
+        # Safety gate: only stop the currently tracked local per-project server.
+        # For the "started but not yet attempted HTTP" timing window, serverUrl
+        # may still be missing in job state; allow local match via startedNew.
+        is_local_selected_server = bool(
+            local_server_url
+            and (
+                (server_url and str(server_url) == str(local_server_url))
+                or (server_started_new and not server_url)
+            )
+        )
+        if stop_server_mode == "always":
+            should_stop_server = bool(
+                is_local_selected_server and (http_attempted or server_started_new)
+            )
+        elif stop_server_mode == "if-started":
+            should_stop_server = bool(server_started_new and is_local_selected_server)
+        elif stop_server_mode == "never":
+            should_stop_server = False
+
+    if should_stop_server:
+        stop_attempted = True
+        try:
+            st = stop_server(wd)
+            stop_ok = bool(st.get("ok")) if isinstance(st, dict) else False
+            ok = ok or bool(stop_ok)
+        except Exception:
+            stop_ok = False
 
     # If no finish exists, write a minimal one so wait won't hang.
     if not finish_path.exists():
@@ -2836,6 +3616,21 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         )
         _write_json(finish_path, out)
 
+    # Persist cancel state so future orphan scans do not classify this job as a crash.
+    if isinstance(job, dict):
+        try:
+            job2 = dict(job)
+            now_ms = _now_ms()
+            job2["state"] = "canceled"
+            job2["updatedAt"] = now_ms
+            job2["canceledAt"] = now_ms
+            job2["ok"] = ok
+            job2["stopServerAttempted"] = stop_attempted
+            job2["stopServerOk"] = stop_ok
+            _write_json(job_path, job2)
+        except Exception:
+            pass
+
     out2 = {
         "type": "opencode-subtask-cancel",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
@@ -2844,6 +3639,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "ok": ok,
         "pid": pid or None,
         "sessionId": session_id,
+        "stopServerAttempted": stop_attempted,
+        "stopServerOk": stop_ok,
     }
     sys.stdout.write(_json_line(out2) + "\n")
     return 0 if ok else 1
@@ -2853,11 +3650,14 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
     env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
     auth = _get_http_auth_from_env(env)
-    opencode_bin = _resolve_executable(args.opencode)
+    opencode_bin = _resolve_executable_for_workdir(args.opencode, workdir)
     if not opencode_bin:
         sys.stdout.write(
             _json_line(
                 {
+                    "type": "opencode-subtask-server",
+                    "schemaVersion": ADAPTER_SCHEMA_VERSION,
+                    "timestamp": _now_ms(),
                     "ok": False,
                     "error": {"name": "OpencodeNotFound", "message": args.opencode},
                 }
@@ -2875,12 +3675,20 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
             env=env,
             auth=auth,
         )
-        out = {"type": "opencode-subtask-server", "ok": True, "server": st}
+        out = {
+            "type": "opencode-subtask-server",
+            "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "timestamp": _now_ms(),
+            "ok": True,
+            "server": st,
+        }
         sys.stdout.write(_json_line(out) + "\n")
         return 0
     except Exception as e:
         out = {
             "type": "opencode-subtask-server",
+            "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "timestamp": _now_ms(),
             "ok": False,
             "error": {"name": type(e).__name__, "message": str(e)},
         }
@@ -2891,7 +3699,12 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
 def cmd_stop_server(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
     out = stop_server(workdir)
-    out2 = {"type": "opencode-subtask-stop-server", **out}
+    out2 = {
+        "type": "opencode-subtask-stop-server",
+        "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "timestamp": _now_ms(),
+        **out,
+    }
     sys.stdout.write(_json_line(out2) + "\n")
     return 0 if out.get("ok") else 1
 
@@ -2987,10 +3800,33 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--stop-server-after-run",
-        dest="stop_server_after_run",
+        choices=["if-started", "always", "never"],
+        default=DEFAULT_STOP_SERVER_AFTER_RUN,
+        help=(
+            "(HTTP engine) Auto-stop policy after run. "
+            "if-started: stop only if this invocation started a new per-project server; "
+            "always: stop whenever HTTP engine was used; "
+            "never: never auto-stop."
+        ),
+    )
+    p.add_argument(
+        "--orphan-reaper",
+        dest="orphan_reaper",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="(HTTP engine) Stop the per-project opencode server after completion (best-effort). Useful in long loops to avoid server memory growth.",
+        default=True,
+        help=(
+            "On run start, reap orphan per-project servers left by crashed/hard-killed workers. "
+            "(default: true)"
+        ),
+    )
+    p.add_argument(
+        "--orphan-reaper-idle-s",
+        type=float,
+        default=DEFAULT_ORPHAN_REAPER_IDLE_S,
+        help=(
+            "Fallback idle timeout for reaping healthy but unreferenced per-project servers. "
+            "Set 0 to disable idle-timeout reaping."
+        ),
     )
 
     # Session continuity (optional). These map to `opencode run` flags and only affect the CLI engine.
@@ -3066,6 +3902,35 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         choices=["inherit", "allow", "noninteractive"],
         default="inherit",
         help="Permission handling. HTTP engine auto-replies via API when possible.",
+    )
+    p.add_argument(
+        "--execution-profile",
+        choices=["legacy", "hybrid", "latency", "checkpoint"],
+        default=DEFAULT_EXECUTION_PROFILE,
+        help=(
+            "Routing policy for engine/artifacts. "
+            "hybrid(default): short->HTTP+lighter artifacts, long->CLI+full artifacts; "
+            "latency: prefer HTTP+lighter artifacts; checkpoint: prefer CLI+full artifacts; "
+            "legacy: keep pre-policy behavior."
+        ),
+    )
+    p.add_argument(
+        "--hybrid-short-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "hybrid profile threshold: classify as short only if --timeout <= this value. "
+            "Precedence: flag > env(OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S) > default."
+        ),
+    )
+    p.add_argument(
+        "--hybrid-short-prompt-chars",
+        type=int,
+        default=None,
+        help=(
+            "hybrid profile threshold: classify as short only if prompt chars <= this value. "
+            "Precedence: flag > env(OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS) > default."
+        ),
     )
     p.add_argument(
         "--disable-claude-code",
