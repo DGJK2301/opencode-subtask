@@ -289,7 +289,16 @@ def _resolve_prompt_input(args: argparse.Namespace) -> str:
         )
 
     if has_file:
-        return _read_text(Path(args.prompt_file).expanduser().resolve())
+        prompt_file_path = Path(str(args.prompt_file)).expanduser().resolve()
+        try:
+            return _read_text(prompt_file_path)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _exit_with_error(
+                "PromptFileReadError",
+                f"Could not read --prompt-file {prompt_file_path}: {type(e).__name__}: {e}",
+            )
     if has_text:
         return str(args.prompt_text)
     return _join_prompt(prompt_parts)
@@ -757,6 +766,23 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
         re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc)
         or re.search(rf"--port\s+{re.escape(port_txt)}\b", cmdline_lc)
     )
+
+
+def _pid_matches_subtask_worker(pid: int, run_id: str | None = None) -> bool:
+    if pid <= 0:
+        return False
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return False
+    cmdline_lc = cmdline.lower()
+    if "opencode_subtask.py" not in cmdline_lc:
+        return False
+    if not re.search(r"(^|\s)run(\s|$)", cmdline_lc):
+        return False
+    rid = str(run_id or "").strip().lower()
+    if rid and rid not in cmdline_lc:
+        return False
+    return True
 
 
 def _pick_free_port(host: str) -> int:
@@ -1468,9 +1494,10 @@ def stop_server(workdir: Path) -> dict[str, Any]:
     lock_path = _server_lock_path(workdir)
     with _FileLock(lock_path):
         st = _load_json(st_path) or {}
+        url = str(st.get("url") or "") if isinstance(st, dict) else ""
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
-        if pid and _pid_running(pid):
+        if pid and _pid_running(pid) and url and _pid_matches_server_url(pid, url):
             _kill_tree(pid)
             ok = True
         try:
@@ -2420,6 +2447,10 @@ def _run_http(
                                 f"OutputTooLarge: {which_file}\n".encode("utf-8")
                             )
                             stderr_fp.flush()
+                        except Exception:
+                            pass
+                        try:
+                            client.abort(session_id)
                         except Exception:
                             pass
                         stop_evt.set()
@@ -3522,9 +3553,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
     stop_attempted = False
     stop_ok: bool | None = None
+    job_run_id = (
+        str(job.get("runId") or run_id) if isinstance(job, dict) else str(run_id)
+    )
 
     ok = False
-    if pid and _pid_running(pid):
+    if pid and _pid_running(pid) and _pid_matches_subtask_worker(pid, job_run_id):
         try:
             _kill_tree(pid)
             ok = True
