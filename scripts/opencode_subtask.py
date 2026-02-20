@@ -1234,6 +1234,16 @@ def reap_orphan_server_for_project(
         )
 
         if url in crashed_owner_urls:
+            if not _pid_matches_server_url(pid, url):
+                return {
+                    "checked": True,
+                    "reaped": False,
+                    "reason": "crashed-owner-unverified",
+                    "url": url,
+                    "pid": pid,
+                    "ageS": age_s,
+                    "statePath": str(st_path),
+                }
             try:
                 _kill_tree(pid)
             except Exception:
@@ -1250,6 +1260,16 @@ def reap_orphan_server_for_project(
             }
 
         if idle_s > 0 and age_s is not None and age_s >= idle_s:
+            if not _pid_matches_server_url(pid, url):
+                return {
+                    "checked": True,
+                    "reaped": False,
+                    "reason": "idle-timeout-unverified",
+                    "url": url,
+                    "pid": pid,
+                    "ageS": age_s,
+                    "statePath": str(st_path),
+                }
             try:
                 _kill_tree(pid)
             except Exception:
@@ -2607,6 +2627,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "serverStartedNew": False,
         "httpAttempted": False,
         "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
+        and (requested_engine in ("http", "auto"))
     }
     _write_json(job_path, job_obj)
 
