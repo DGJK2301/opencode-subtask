@@ -949,11 +949,39 @@ class OpencodeHttpClient:
 # ============================
 
 
-def _server_health(url_base: str, auth: HttpAuth | None) -> dict[str, Any] | None:
+def _server_health_probe(url_base: str, auth: HttpAuth | None) -> dict[str, Any]:
+    """
+    Probe /global/health with coarse failure classification.
+
+    status:
+    - healthy: endpoint reachable and reports healthy=true
+    - unhealthy: endpoint reachable but healthy!=true
+    - auth-error: HTTP 401/403 (credentials mismatch / missing)
+    - unknown: transport/protocol failures (timeout, refused, parse, etc.)
+    """
     c = OpencodeHttpClient(url_base, auth=auth, timeout_s=2.0)
-    js = c.health()
+    try:
+        _, js = c._request_json("GET", "/global/health", None, timeout_s=2.0)
+    except RuntimeError as e:
+        msg = str(e)
+        if ("HTTP 401" in msg) or ("HTTP 403" in msg):
+            return {"status": "auth-error", "error": msg}
+        return {"status": "unknown", "error": msg}
+    except Exception as e:
+        return {"status": "unknown", "error": f"{type(e).__name__}: {e}"}
+
     if isinstance(js, dict) and js.get("healthy") is True:
-        return js
+        return {"status": "healthy", "payload": js}
+    if isinstance(js, dict):
+        return {"status": "unhealthy", "payload": js}
+    return {"status": "unknown", "error": "invalid health payload"}
+
+
+def _server_health(url_base: str, auth: HttpAuth | None) -> dict[str, Any] | None:
+    probe = _server_health_probe(url_base, auth)
+    payload = probe.get("payload")
+    if str(probe.get("status")) == "healthy" and isinstance(payload, dict):
+        return payload
     return None
 
 
@@ -996,6 +1024,14 @@ def _scan_running_job_server_urls(
         url = job.get("serverUrl")
         if not isinstance(url, str) or not url.strip():
             continue
+        finish = _load_json(run_dir / "finish.json")
+        if isinstance(finish, dict):
+            err = finish.get("error")
+            if isinstance(err, dict):
+                err_name = str(err.get("name") or "").strip().lower()
+                if err_name == "canceled":
+                    # Do not treat canceled runs as crashed-owner evidence.
+                    continue
         state = str(job.get("state") or "").strip().lower()
         if state != "running":
             continue
@@ -1080,8 +1116,9 @@ def reap_orphan_server_for_project(
                 "statePath": str(st_path),
             }
 
-        health = _server_health(url, auth)
-        if not health:
+        health_probe = _server_health_probe(url, auth)
+        health_status = str(health_probe.get("status") or "").strip().lower()
+        if health_status == "unhealthy":
             try:
                 _kill_tree(pid)
             except Exception:
@@ -1093,6 +1130,20 @@ def reap_orphan_server_for_project(
                 "reason": "unhealthy-server",
                 "url": url,
                 "pid": pid,
+                "healthStatus": health_status,
+                "statePath": str(st_path),
+            }
+        if health_status != "healthy":
+            # Unknown probe result (including auth mismatch) is not sufficient
+            # evidence to kill a potentially healthy server process.
+            return {
+                "checked": True,
+                "reaped": False,
+                "reason": "health-unknown",
+                "url": url,
+                "pid": pid,
+                "healthStatus": health_status,
+                "healthError": health_probe.get("error"),
                 "statePath": str(st_path),
             }
 
@@ -2878,6 +2929,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             if isinstance(server_state, dict) and server_state.get("url")
             else None
         )
+        if (not attached_server_url) and attach_url:
+            # Support explicit --attach local per-project server URLs where
+            # server_state may be unset.
+            st_local = _load_json(_server_state_path(workdir)) or {}
+            if isinstance(st_local, dict) and st_local.get("url"):
+                attached_server_url = str(st_local.get("url"))
         # Safety gate: only stop the exact local per-project server selected
         # for this invocation. This avoids affecting unrelated/remote attach targets.
         is_local_selected_server = bool(
@@ -3442,6 +3499,21 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             debug=None,
         )
         _write_json(finish_path, out)
+
+    # Persist cancel state so future orphan scans do not classify this job as a crash.
+    if isinstance(job, dict):
+        try:
+            job2 = dict(job)
+            now_ms = _now_ms()
+            job2["state"] = "canceled"
+            job2["updatedAt"] = now_ms
+            job2["canceledAt"] = now_ms
+            job2["ok"] = ok
+            job2["stopServerAttempted"] = stop_attempted
+            job2["stopServerOk"] = stop_ok
+            _write_json(job_path, job2)
+        except Exception:
+            pass
 
     out2 = {
         "type": "opencode-subtask-cancel",
