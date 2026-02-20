@@ -712,9 +712,20 @@ def _proc_cmdline(pid: int) -> str:
     if pid <= 0:
         return ""
     if os.name != "nt":
+        proc_cmdline = Path(f"/proc/{pid}/cmdline")
+        if proc_cmdline.exists():
+            try:
+                raw = proc_cmdline.read_bytes()
+                return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+            except Exception:
+                pass
+        # macOS/BSD fallback where /proc may be unavailable.
         try:
-            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-            return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="],
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="replace")
+            return out.strip()
         except Exception:
             return ""
     # Windows: wmic is deprecated but still common; fall back to tasklist if needed.
@@ -1497,14 +1508,30 @@ def stop_server(workdir: Path) -> dict[str, Any]:
         url = str(st.get("url") or "") if isinstance(st, dict) else ""
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
-        if pid and _pid_running(pid) and url and _pid_matches_server_url(pid, url):
-            _kill_tree(pid)
-            ok = True
-        try:
-            st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        return {"ok": ok, "pid": pid, "statePath": str(st_path)}
+        kept_state = False
+        reason = "no-pid"
+        if pid and _pid_running(pid):
+            if url and _pid_matches_server_url(pid, url):
+                _kill_tree(pid)
+                ok = True
+                reason = "killed"
+            else:
+                kept_state = True
+                reason = "owner-unverified"
+        elif pid:
+            reason = "pid-not-running"
+        if not kept_state:
+            try:
+                st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return {
+            "ok": ok,
+            "pid": pid,
+            "statePath": str(st_path),
+            "keptState": kept_state,
+            "reason": reason,
+        }
 
 
 # ============================
