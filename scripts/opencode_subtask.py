@@ -2627,7 +2627,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         "serverStartedNew": False,
         "httpAttempted": False,
         "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
-        and (requested_engine in ("http", "auto"))
     }
     _write_json(job_path, job_obj)
 
@@ -2660,6 +2659,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     if (
         bool(getattr(args, "orphan_reaper", True))
+        and (requested_engine in ("http", "auto"))
         and (args.attach is None)
         and bool(args.attach_server)
     ):
