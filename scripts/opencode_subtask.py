@@ -796,6 +796,21 @@ def _pid_matches_subtask_worker(pid: int, run_id: str | None = None) -> bool:
     return True
 
 
+def _should_count_job_pid_as_active_worker(pid: int, run_id: str | None) -> bool:
+    """
+    Determine whether a running PID should be treated as an active opencode-subtask worker.
+    Conservative behavior: if command line cannot be read, treat as active to avoid unsafe reaping.
+    """
+    if pid <= 0:
+        return False
+    if not _pid_running(pid):
+        return False
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return True
+    return _pid_matches_subtask_worker(pid, run_id)
+
+
 def _pick_free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
@@ -1128,7 +1143,14 @@ def _scan_running_job_server_urls(
         except Exception:
             pid = 0
 
-        if pid > 0 and _pid_running(pid):
+        job_run_id: str | None = None
+        raw_run_id = job.get("runId")
+        if isinstance(raw_run_id, (str, int)):
+            txt_run_id = str(raw_run_id).strip()
+            if txt_run_id:
+                job_run_id = txt_run_id
+
+        if _should_count_job_pid_as_active_worker(pid, job_run_id):
             active_urls.add(url)
         elif bool(job.get("serverStartedNew")):
             if (current_project_key is None) or (
@@ -1508,7 +1530,6 @@ def stop_server(workdir: Path) -> dict[str, Any]:
         url = str(st.get("url") or "") if isinstance(st, dict) else ""
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
-        kept_state = False
         reason = "no-pid"
         if pid and _pid_running(pid):
             if url and _pid_matches_server_url(pid, url):
@@ -1516,20 +1537,18 @@ def stop_server(workdir: Path) -> dict[str, Any]:
                 ok = True
                 reason = "killed"
             else:
-                kept_state = True
-                reason = "owner-unverified"
+                reason = "owner-unverified-state-cleared"
         elif pid:
             reason = "pid-not-running"
-        if not kept_state:
-            try:
-                st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        try:
+            st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         return {
             "ok": ok,
             "pid": pid,
             "statePath": str(st_path),
-            "keptState": kept_state,
+            "keptState": False,
             "reason": reason,
         }
 
