@@ -318,7 +318,9 @@ Shutdown note:
 - `if-started` only stops when this invocation created the per-project server; `always` stops regardless of who started it.
 - Safety gate: `always` / `if-started` only stop the currently tracked **local** per-project server URL (prevents stopping unrelated or remote `--attach` targets).
 - `cancel` applies the same policy from persisted job state (`httpAttempted`, `serverStartedNew`, `stopServerAfterRunMode`) to reduce orphaned per-project servers.
+- `cancel` persists `job.json.state=canceled` (plus `canceledAt`) so startup orphan scans do not misclassify canceled jobs as crashes.
 - Startup reaper uses recent `job.json` evidence and server health: it reaps dead/unhealthy servers immediately, reaps strong crashed-owner orphans, and optionally reaps idle healthy servers after `--orphan-reaper-idle-s`.
+- Startup reaper treats failed health probes (including auth mismatch) as unknown evidence and does not kill solely on probe failure.
 
 ## Execution Profile (`--execution-profile`)
 
