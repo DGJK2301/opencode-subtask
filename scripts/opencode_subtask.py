@@ -2731,10 +2731,35 @@ def cmd_run(args: argparse.Namespace) -> int:
     ):
         cli_attach_url = None
 
+    def _ensure_opencode_bin_for_cli() -> str | None:
+        nonlocal opencode_bin
+        if opencode_bin:
+            return opencode_bin
+        resolved = _resolve_executable_for_workdir(str(args.opencode), workdir)
+        if not resolved:
+            return None
+        opencode_bin = resolved
+        return opencode_bin
+
     def run_cli() -> RunOutcome:
-        assert opencode_bin is not None
+        cli_bin = _ensure_opencode_bin_for_cli()
+        if not cli_bin:
+            return RunOutcome(
+                ok=False,
+                exit_code=127,
+                timed_out=False,
+                engine="cli",
+                fallback_from=None,
+                session_id=None,
+                full_text="",
+                metrics=None,
+                error={
+                    "name": "OpencodeNotFound",
+                    "message": f"Could not find opencode executable: {args.opencode}",
+                },
+            )
         return _run_cli(
-            opencode_bin=opencode_bin,
+            opencode_bin=cli_bin,
             workdir=workdir,
             env=env,
             attach_url=cli_attach_url,
@@ -3452,12 +3477,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     # If worker was canceled before normal completion, best-effort apply
     # stop-server-after-run policy to avoid orphaning a freshly-started server.
     should_stop_server = False
-    if http_attempted:
-        wd = (
-            Path(str(job.get("workdir")))
-            if isinstance(job, dict) and job.get("workdir")
-            else Path.cwd()
-        )
+    wd = (
+        Path(str(job.get("workdir")))
+        if isinstance(job, dict) and job.get("workdir")
+        else Path.cwd()
+    )
+    if http_attempted or server_started_new:
         st_local = _load_json(_server_state_path(wd)) or {}
         local_server_url = (
             str(st_local.get("url"))
@@ -3465,11 +3490,19 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             else None
         )
         # Safety gate: only stop the currently tracked local per-project server.
+        # For the "started but not yet attempted HTTP" timing window, serverUrl
+        # may still be missing in job state; allow local match via startedNew.
         is_local_selected_server = bool(
-            server_url and local_server_url and str(server_url) == str(local_server_url)
+            local_server_url
+            and (
+                (server_url and str(server_url) == str(local_server_url))
+                or (server_started_new and not server_url)
+            )
         )
         if stop_server_mode == "always":
-            should_stop_server = is_local_selected_server
+            should_stop_server = bool(
+                is_local_selected_server and (http_attempted or server_started_new)
+            )
         elif stop_server_mode == "if-started":
             should_stop_server = bool(server_started_new and is_local_selected_server)
         elif stop_server_mode == "never":
