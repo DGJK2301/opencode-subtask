@@ -804,7 +804,9 @@ def _server_pid_ownership_status(pid: int, url: str) -> str:
     return "mismatch"
 
 
-def _pid_matches_subtask_worker(pid: int, run_id: str | None = None) -> bool:
+def _pid_matches_subtask_worker(
+    pid: int, run_id: str | None = None, *, require_run_id: bool = False
+) -> bool:
     if pid <= 0:
         return False
     cmdline = _proc_cmdline(pid)
@@ -816,8 +818,15 @@ def _pid_matches_subtask_worker(pid: int, run_id: str | None = None) -> bool:
     if not re.search(r"(^|\s)run(\s|$)", cmdline_lc):
         return False
     rid = str(run_id or "").strip().lower()
-    if rid and rid not in cmdline_lc:
-        return False
+    if rid:
+        if require_run_id:
+            if rid not in cmdline_lc:
+                return False
+        else:
+            # Foreground `run` may auto-generate runId internally and argv may not
+            # contain it; only enforce runId when argv explicitly carries --run-id.
+            if ("--run-id" in cmdline_lc) and (rid not in cmdline_lc):
+                return False
     return True
 
 
@@ -3636,7 +3645,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
 
     ok = False
-    if pid and _pid_running(pid) and _pid_matches_subtask_worker(pid, job_run_id):
+    if pid and _pid_running(pid) and _pid_matches_subtask_worker(
+        pid, job_run_id, require_run_id=True
+    ):
         try:
             _kill_tree(pid)
             ok = True
