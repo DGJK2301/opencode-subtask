@@ -3707,8 +3707,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         except Exception:
             stop_ok = False
 
-    # If no finish exists, write a minimal one so wait won't hang.
-    if not finish_path.exists():
+    # Write a cancel finish only when cancellation actually succeeded.
+    if ok and not finish_path.exists():
         out = _finish_obj(
             ok=False,
             exit_code=130,
@@ -3739,14 +3739,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         )
         _write_json(finish_path, out)
 
-    # Persist cancel state so future orphan scans do not classify this job as a crash.
+    # Persist cancel telemetry. Mark state=canceled only if cancel actually succeeded.
     if isinstance(job, dict):
         try:
             job2 = dict(job)
             now_ms = _now_ms()
-            job2["state"] = "canceled"
+            job2["cancelAttemptedAt"] = now_ms
+            if ok:
+                job2["state"] = "canceled"
+                job2["canceledAt"] = now_ms
             job2["updatedAt"] = now_ms
-            job2["canceledAt"] = now_ms
             job2["ok"] = ok
             job2["stopServerAttempted"] = stop_attempted
             job2["stopServerOk"] = stop_ok
