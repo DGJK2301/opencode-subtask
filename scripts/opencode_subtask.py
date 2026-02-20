@@ -770,7 +770,7 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
     if not cmdline:
         return False
     cmdline_lc = cmdline.lower()
-    if ("opencode" not in cmdline_lc) or ("serve" not in cmdline_lc):
+    if "serve" not in cmdline_lc:
         return False
     port_txt = str(expected_port)
     return bool(
@@ -794,7 +794,7 @@ def _server_pid_ownership_status(pid: int, url: str) -> str:
     if not cmdline:
         return "unknown"
     cmdline_lc = cmdline.lower()
-    if ("opencode" not in cmdline_lc) or ("serve" not in cmdline_lc):
+    if "serve" not in cmdline_lc:
         return "mismatch"
     port_txt = str(expected_port)
     if re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc) or re.search(
@@ -3646,7 +3646,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     ok = False
     if pid and _pid_running(pid) and _pid_matches_subtask_worker(
-        pid, job_run_id, require_run_id=True
+        pid, job_run_id, require_run_id=False
     ):
         try:
             _kill_tree(pid)
