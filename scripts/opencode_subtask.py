@@ -786,22 +786,66 @@ def _extract_server_port_from_url(url: str) -> int | None:
         return None
 
 
-def _has_serve_token(cmdline: str) -> bool:
+def _split_cmdline_tokens(cmdline: str) -> list[str]:
     txt = str(cmdline or "").strip()
     if not txt:
-        return False
+        return []
     try:
-        tokens = shlex.split(txt, posix=(os.name != "nt"))
+        return shlex.split(txt, posix=(os.name != "nt"))
     except Exception:
-        tokens = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', txt)
+        return re.findall(r'"[^"]*"|\'[^\']*\'|\S+', txt)
+
+
+def _normalize_cmd_token(tok: str) -> str:
+    t = str(tok or "").strip().strip("\"'").lower()
+    if t.startswith("commandline="):
+        t = t[len("commandline=") :]
+    return t
+
+
+def _has_serve_token(cmdline: str) -> bool:
+    tokens = _split_cmdline_tokens(cmdline)
     for tok in tokens:
-        t = str(tok).strip().strip("\"'").lower()
+        t = _normalize_cmd_token(tok)
         if t == "serve":
             return True
     return False
 
 
-def _pid_matches_server_url(pid: int, url: str) -> bool:
+def _expected_server_exec_token(st: dict[str, Any] | None) -> str | None:
+    if not isinstance(st, dict):
+        return None
+    cmd = st.get("command")
+    raw = ""
+    if isinstance(cmd, list) and cmd:
+        raw = str(cmd[0] or "").strip()
+    elif isinstance(cmd, str) and cmd.strip():
+        toks = _split_cmdline_tokens(cmd)
+        if toks:
+            raw = str(toks[0] or "").strip()
+    if not raw:
+        return None
+    return Path(raw).name.strip().lower() or None
+
+
+def _has_server_identity_token(cmdline: str, expected_exec_token: str | None) -> bool:
+    tokens = _split_cmdline_tokens(cmdline)
+    expected = str(expected_exec_token or "").strip().lower()
+    for tok in tokens:
+        t = _normalize_cmd_token(tok)
+        if not t:
+            continue
+        t_name = Path(t).name.lower()
+        if expected and (t == expected or t_name == expected):
+            return True
+        if ("opencode" in t) or ("opencode" in t_name):
+            return True
+    return False
+
+
+def _pid_matches_server_url(
+    pid: int, url: str, expected_exec_token: str | None = None
+) -> bool:
     if pid <= 0:
         return False
     expected_port = _extract_server_port_from_url(url)
@@ -813,6 +857,8 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
     cmdline_lc = cmdline.lower()
     if not _has_serve_token(cmdline_lc):
         return False
+    if not _has_server_identity_token(cmdline_lc, expected_exec_token):
+        return False
     port_txt = str(expected_port)
     return bool(
         re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc)
@@ -820,7 +866,9 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
     )
 
 
-def _server_pid_ownership_status(pid: int, url: str) -> str:
+def _server_pid_ownership_status(
+    pid: int, url: str, expected_exec_token: str | None = None
+) -> str:
     """
     Classify ownership check result for a tracked server PID.
     Returns: "verified" | "mismatch" | "unknown"
@@ -836,6 +884,8 @@ def _server_pid_ownership_status(pid: int, url: str) -> str:
         return "unknown"
     cmdline_lc = cmdline.lower()
     if not _has_serve_token(cmdline_lc):
+        return "mismatch"
+    if not _has_server_identity_token(cmdline_lc, expected_exec_token):
         return "mismatch"
     port_txt = str(expected_port)
     if re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc) or re.search(
@@ -1264,6 +1314,7 @@ def reap_orphan_server_for_project(
             }
 
         url = str(st["url"])
+        expected_exec_token = _expected_server_exec_token(st)
         pid = 0
         try:
             raw_pid = st.get("pid")
@@ -1303,7 +1354,7 @@ def reap_orphan_server_for_project(
         health_probe = _server_health_probe(url, auth)
         health_status = str(health_probe.get("status") or "").strip().lower()
         if health_status == "unhealthy":
-            if not _pid_matches_server_url(pid, url):
+            if not _pid_matches_server_url(pid, url, expected_exec_token):
                 return {
                     "checked": True,
                     "reaped": False,
@@ -1368,7 +1419,7 @@ def reap_orphan_server_for_project(
         )
 
         if url in crashed_owner_urls:
-            if not _pid_matches_server_url(pid, url):
+            if not _pid_matches_server_url(pid, url, expected_exec_token):
                 return {
                     "checked": True,
                     "reaped": False,
@@ -1394,7 +1445,7 @@ def reap_orphan_server_for_project(
             }
 
         if idle_s > 0 and age_s is not None and age_s >= idle_s:
-            if not _pid_matches_server_url(pid, url):
+            if not _pid_matches_server_url(pid, url, expected_exec_token):
                 return {
                     "checked": True,
                     "reaped": False,
@@ -1610,12 +1661,13 @@ def stop_server(workdir: Path) -> dict[str, Any]:
     with _FileLock(lock_path):
         st = _load_json(st_path) or {}
         url = str(st.get("url") or "") if isinstance(st, dict) else ""
+        expected_exec_token = _expected_server_exec_token(st if isinstance(st, dict) else None)
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
         kept_state = False
         reason = "no-pid"
         if pid and _pid_running(pid):
-            own = _server_pid_ownership_status(pid, url)
+            own = _server_pid_ownership_status(pid, url, expected_exec_token)
             if own == "verified":
                 _kill_tree(pid)
                 ok = True
