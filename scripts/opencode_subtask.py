@@ -39,9 +39,12 @@ from typing import Any, Final, Iterable, Never, NoReturn
 
 ADAPTER_SCHEMA_VERSION: Final[int] = 1
 
-DEFAULT_TIMEOUT_S: Final[float] = 900.0
+DEFAULT_TIMEOUT_S: Final[float] = 600.0
 DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
 DEFAULT_GIT_TIMEOUT_S: Final[float] = 20.0
+DEFAULT_STALE_IDLE_S: Final[float] = 600.0
+DEFAULT_DEAD_WORKER_GRACE_S: Final[float] = 180.0
+DEFAULT_CANCEL_STUCK_GRACE_S: Final[float] = 180.0
 DEFAULT_EXECUTION_PROFILE: Final[str] = "hybrid"
 HYBRID_SHORT_TIMEOUT_S: Final[float] = 240.0
 HYBRID_SHORT_PROMPT_CHARS: Final[int] = 1600
@@ -3461,6 +3464,145 @@ def _progress_snapshot(artifacts_dir: Path) -> dict[str, Any]:
     return prog
 
 
+def _job_ms(job: dict[str, Any], key: str) -> int:
+    raw = job.get(key)
+    if isinstance(raw, (int, str)):
+        try:
+            return int(raw)
+        except Exception:
+            return 0
+    return 0
+
+
+def _emit_synthesized_missing_finish(
+    *,
+    run_id: str,
+    artifacts_dir: Path,
+    finish_path: Path,
+    job_path: Path,
+    job: dict[str, Any],
+    error_name: str,
+    error_message: str,
+) -> dict[str, Any]:
+    wd = (
+        Path(str(job.get("workdir")))
+        if isinstance(job, dict) and job.get("workdir")
+        else Path.cwd()
+    )
+    out = _finish_obj(
+        ok=False,
+        exit_code=1,
+        timed_out=False,
+        run_id=run_id,
+        workdir=wd,
+        engine="watchdog",
+        fallback_from=None,
+        server=None,
+        session_id=(
+            str(job.get("sessionId"))
+            if isinstance(job, dict) and job.get("sessionId")
+            else None
+        ),
+        summary="",
+        summary_truncated=False,
+        result_digest=None,
+        changed_files=[],
+        untracked_files=[],
+        artifacts_dir=artifacts_dir,
+        artifacts={
+            "dir": str(artifacts_dir),
+            "jobPath": job_path.name,
+            "finishPath": finish_path.name,
+        },
+        metrics=None,
+        error={"name": error_name, "message": error_message},
+        include_debug=False,
+        debug=None,
+    )
+    if not finish_path.exists():
+        _write_json(finish_path, out)
+    try:
+        job2 = dict(job)
+        now_ms = _now_ms()
+        job2["state"] = "failed"
+        job2["failedAt"] = now_ms
+        job2["updatedAt"] = now_ms
+        job2["lastError"] = {"name": error_name, "message": error_message}
+        _write_json(job_path, job2)
+    except Exception:
+        pass
+    return out
+
+
+def _maybe_finalize_stale_running_job(
+    *,
+    run_id: str,
+    artifacts_dir: Path,
+    finish_path: Path,
+    job_path: Path,
+    job: dict[str, Any],
+    pid: int | None,
+    progress: dict[str, Any],
+    stale_idle_s: float,
+    dead_worker_grace_s: float,
+    cancel_stuck_grace_s: float,
+) -> dict[str, Any] | None:
+    if finish_path.exists():
+        return None
+    state = str(job.get("state") or "").strip().lower()
+    if state and state not in ("running", "queued"):
+        return None
+    idle_for = progress.get("idleForSeconds")
+    idle_s = float(idle_for) if isinstance(idle_for, (int, float)) else None
+    now_ms = _now_ms()
+
+    last_touch_ms = max(
+        _job_ms(job, "updatedAt"),
+        _job_ms(job, "createdAt"),
+        _job_ms(job, "cancelAttemptedAt"),
+    )
+    age_since_touch_s = (
+        max(0.0, (float(now_ms) - float(last_touch_ms)) / 1000.0)
+        if last_touch_ms > 0
+        else 0.0
+    )
+
+    pid_alive = bool(pid and _pid_running(pid))
+    if not pid_alive:
+        if idle_s is None:
+            if age_since_touch_s < dead_worker_grace_s:
+                return None
+        elif idle_s < stale_idle_s:
+            return None
+        return _emit_synthesized_missing_finish(
+            run_id=run_id,
+            artifacts_dir=artifacts_dir,
+            finish_path=finish_path,
+            job_path=job_path,
+            job=job,
+            error_name="WorkerNotRunning",
+            error_message="worker process not running and finish.json missing",
+        )
+
+    cancel_attempted_ms = _job_ms(job, "cancelAttemptedAt")
+    if cancel_attempted_ms <= 0:
+        return None
+    if idle_s is None or idle_s < stale_idle_s:
+        return None
+    cancel_age_s = max(0.0, (float(now_ms) - float(cancel_attempted_ms)) / 1000.0)
+    if cancel_age_s < cancel_stuck_grace_s:
+        return None
+    return _emit_synthesized_missing_finish(
+        run_id=run_id,
+        artifacts_dir=artifacts_dir,
+        finish_path=finish_path,
+        job_path=job_path,
+        job=job,
+        error_name="StuckAfterCancel",
+        error_message="no heartbeat progress after cancel attempt and finish.json missing",
+    )
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
         _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
@@ -3504,13 +3646,30 @@ def cmd_status(args: argparse.Namespace) -> int:
     job = _load_json(job_path) or {}
     pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
     status = str(job.get("state") or "running") if isinstance(job, dict) else "running"
+    progress = _progress_snapshot(artifacts_dir)
+    if isinstance(job, dict):
+        synthesized = _maybe_finalize_stale_running_job(
+            run_id=run_id,
+            artifacts_dir=artifacts_dir,
+            finish_path=finish_path,
+            job_path=job_path,
+            job=job,
+            pid=pid if pid else None,
+            progress=progress,
+            stale_idle_s=DEFAULT_STALE_IDLE_S,
+            dead_worker_grace_s=DEFAULT_DEAD_WORKER_GRACE_S,
+            cancel_stuck_grace_s=DEFAULT_CANCEL_STUCK_GRACE_S,
+        )
+        if isinstance(synthesized, dict):
+            sys.stdout.write(_json_line(synthesized) + "\n")
+            return 1
     if (
         pid
         and not _pid_running(pid)
         and not finish_path.exists()
         and status != "finished"
     ):
-        status = "failed"
+        status = "running"
 
     out = _status_obj(
         run_id=run_id,
@@ -3530,8 +3689,15 @@ def cmd_status(args: argparse.Namespace) -> int:
             result_path=artifacts_dir / "result.json",
             patch_path=None,
         ),
-        progress=_progress_snapshot(artifacts_dir),
-        error=None,
+        progress=progress,
+        error=(
+            {
+                "name": "WorkerMissingPending",
+                "message": "pid is not running; waiting stale-window before synthesizing finish",
+            }
+            if (pid and not _pid_running(pid) and not finish_path.exists())
+            else None
+        ),
     )
     sys.stdout.write(_json_line(out) + "\n")
     return 0
@@ -3595,34 +3761,30 @@ def cmd_wait(args: argparse.Namespace) -> int:
             continue
 
         pid = None
+        job = _load_json(job_path) or {}
         if job_path.exists():
-            job = _load_json(job_path) or {}
             if isinstance(job, dict) and job.get("pid"):
                 try:
                     pid = int(job.get("pid"))
                 except Exception:
                     pid = None
-        if pid and not _pid_running(pid):
-            out = _status_obj(
+        progress = _progress_snapshot(artifacts_dir)
+        if isinstance(job, dict):
+            synthesized = _maybe_finalize_stale_running_job(
                 run_id=run_id,
-                status="failed",
-                pid=pid,
-                workdir=None,
                 artifacts_dir=artifacts_dir,
-                artifacts={
-                    "dir": str(artifacts_dir),
-                    "jobPath": job_path.name,
-                    "finishPath": finish_path.name,
-                    "wrapperLogPath": "wrapper.log",
-                },
-                progress=_progress_snapshot(artifacts_dir),
-                error={
-                    "name": "WorkerNotRunning",
-                    "message": "worker process not running and finish.json missing",
-                },
+                finish_path=finish_path,
+                job_path=job_path,
+                job=job,
+                pid=pid,
+                progress=progress,
+                stale_idle_s=DEFAULT_STALE_IDLE_S,
+                dead_worker_grace_s=DEFAULT_DEAD_WORKER_GRACE_S,
+                cancel_stuck_grace_s=DEFAULT_CANCEL_STUCK_GRACE_S,
             )
-            sys.stdout.write(_json_line(out) + "\n")
-            return 1
+            if isinstance(synthesized, dict):
+                sys.stdout.write(_json_line(synthesized) + "\n")
+                return 1
 
         if time.monotonic() >= deadline:
             out = _status_obj(
@@ -3636,7 +3798,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                     "jobPath": job_path.name,
                     "finishPath": finish_path.name,
                 },
-                progress=_progress_snapshot(artifacts_dir),
+                progress=progress,
                 error={
                     "name": "WaitTimeout",
                     "message": f"timeout waiting for finish.json (timeout={args.timeout}s)",
@@ -3706,6 +3868,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             ok = True
         except Exception:
             pass
+    pid_alive_after_cancel = bool(pid and _pid_running(pid))
 
     # If worker was canceled before normal completion, best-effort apply
     # stop-server-after-run policy to avoid orphaning a freshly-started server.
@@ -3751,10 +3914,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             stop_ok = False
 
     # Write a cancel finish only when cancellation actually succeeded.
-    if ok and not finish_path.exists():
+    if (ok or not pid_alive_after_cancel) and not finish_path.exists():
         out = _finish_obj(
             ok=False,
-            exit_code=130,
+            exit_code=130 if ok else 1,
             timed_out=False,
             run_id=run_id,
             workdir=Path(str(job.get("workdir")))
@@ -3776,7 +3939,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 "finishPath": finish_path.name,
             },
             metrics=None,
-            error={"name": "Canceled", "message": "job canceled by adapter"},
+            error=(
+                {"name": "Canceled", "message": "job canceled by adapter"}
+                if ok
+                else {
+                    "name": "CancelNoActiveWorker",
+                    "message": "cancel requested but no active worker process remained",
+                }
+            ),
             include_debug=False,
             debug=None,
         )
@@ -3791,6 +3961,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             if ok:
                 job2["state"] = "canceled"
                 job2["canceledAt"] = now_ms
+            elif not pid_alive_after_cancel:
+                job2["state"] = "failed"
+                job2["failedAt"] = now_ms
             job2["updatedAt"] = now_ms
             job2["ok"] = ok
             job2["stopServerAttempted"] = stop_attempted
