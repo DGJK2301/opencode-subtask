@@ -680,10 +680,17 @@ def _pid_running(pid: int) -> bool:
             return False
     try:
         out = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
             stderr=subprocess.DEVNULL,
         ).decode("utf-8", errors="replace")
-        return str(pid) in out
+        pid_txt = re.escape(str(pid))
+        for raw_line in out.splitlines():
+            line = raw_line.strip()
+            if not line or line.upper().startswith("INFO:"):
+                continue
+            if re.search(rf'^"[^"]*","{pid_txt}"(?:,|$)', line):
+                return True
+        return False
     except Exception:
         return False
 
@@ -742,7 +749,22 @@ def _proc_cmdline(pid: int) -> str:
             ],
             stderr=subprocess.DEVNULL,
         ).decode("utf-8", errors="replace")
-        return out
+        if out and ("CommandLine" in out):
+            return out
+    except Exception:
+        pass
+    # Windows 11+ fallback where wmic may be unavailable.
+    try:
+        ps_cmd = (
+            f'$p=Get-CimInstance Win32_Process -Filter "ProcessId={pid}" '
+            '| Select-Object -First 1 -ExpandProperty CommandLine; '
+            'if ($p) { [Console]::Out.Write($p) }'
+        )
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        return out.strip()
     except Exception:
         return ""
 
@@ -1407,6 +1429,7 @@ class _FileLock:
             import msvcrt  # type: ignore
 
             # lock 1 byte
+            self.fp.seek(0)
             msvcrt.locking(self.fp.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl  # type: ignore
@@ -1488,15 +1511,21 @@ def ensure_server(
         else:
             popen_kwargs["start_new_session"] = True
 
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_fp,
-            stderr=log_fp,
-            cwd=str(workdir),
-            env=env,
-            **popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fp,
+                stderr=log_fp,
+                cwd=str(workdir),
+                env=env,
+                **popen_kwargs,
+            )
+        finally:
+            try:
+                log_fp.close()
+            except Exception:
+                pass
 
         url = f"http://{hostname}:{port}"
         deadline = time.monotonic() + max(wait_s, 0.1)
@@ -1783,7 +1812,10 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
         parts = raw.split(b"\x00")
         changed: list[str] = []
         untracked: list[str] = []
-        for entry in parts:
+        i = 0
+        while i < len(parts):
+            entry = parts[i]
+            i += 1
             if not entry:
                 continue
             try:
@@ -1797,6 +1829,17 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
             if code == "??":
                 untracked.append(path)
             else:
+                if code and code[0] in ("R", "C"):
+                    # porcelain -z for rename/copy emits: XY<sp>src NUL dst NUL
+                    if i < len(parts):
+                        try:
+                            dst = parts[i].decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            dst = ""
+                        i += 1
+                        if dst:
+                            changed.append(dst)
+                            continue
                 changed.append(path)
         return sorted(set(changed)), sorted(set(untracked))
     except Exception:
