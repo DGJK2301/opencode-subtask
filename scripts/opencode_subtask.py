@@ -803,6 +803,30 @@ def _normalize_cmd_token(tok: str) -> str:
     return t
 
 
+def _extract_flag_value(cmdline: str, flag: str) -> str | None:
+    """
+    Extract a CLI flag value from command line tokens.
+    Supports both: `--flag value` and `--flag=value`.
+    Returns normalized lowercase value when present, otherwise None.
+    """
+    tokens = _split_cmdline_tokens(cmdline)
+    f = str(flag or "").strip().lower()
+    i = 0
+    while i < len(tokens):
+        t = _normalize_cmd_token(tokens[i])
+        if not t:
+            i += 1
+            continue
+        if t == f:
+            if i + 1 < len(tokens):
+                return _normalize_cmd_token(tokens[i + 1])
+            return ""
+        if t.startswith(f + "="):
+            return _normalize_cmd_token(t[len(f) + 1 :])
+        i += 1
+    return None
+
+
 def _has_serve_token(cmdline: str) -> bool:
     tokens = _split_cmdline_tokens(cmdline)
     for tok in tokens:
@@ -810,6 +834,13 @@ def _has_serve_token(cmdline: str) -> bool:
         if t == "serve":
             return True
     return False
+
+
+def _looks_like_opencode_identity(tok: str) -> bool:
+    n = Path(str(tok or "")).name.lower()
+    if not n:
+        return False
+    return bool(re.search(r"(^|[^a-z0-9])opencode([^a-z0-9]|$)", n))
 
 
 def _expected_server_exec_token(st: dict[str, Any] | None) -> str | None:
@@ -831,15 +862,40 @@ def _expected_server_exec_token(st: dict[str, Any] | None) -> str | None:
 def _has_server_identity_token(cmdline: str, expected_exec_token: str | None) -> bool:
     tokens = _split_cmdline_tokens(cmdline)
     expected = str(expected_exec_token or "").strip().lower()
+    generic_exec = {
+        "python",
+        "python.exe",
+        "python3",
+        "python3.exe",
+        "py",
+        "py.exe",
+        "node",
+        "node.exe",
+        "bash",
+        "sh",
+        "zsh",
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+    }
+    expected_matched = False
+    opencode_matched = False
     for tok in tokens:
         t = _normalize_cmd_token(tok)
         if not t:
             continue
         t_name = Path(t).name.lower()
         if expected and (t == expected or t_name == expected):
-            return True
-        if ("opencode" in t) or ("opencode" in t_name):
-            return True
+            expected_matched = True
+        if _looks_like_opencode_identity(t) or _looks_like_opencode_identity(t_name):
+            opencode_matched = True
+    if opencode_matched:
+        return True
+    if expected and expected_matched and (expected not in generic_exec):
+        return True
     return False
 
 
@@ -910,13 +966,14 @@ def _pid_matches_subtask_worker(
         return False
     rid = str(run_id or "").strip().lower()
     if rid:
+        rid_arg = _extract_flag_value(cmdline_lc, "--run-id")
         if require_run_id:
-            if rid not in cmdline_lc:
+            if rid_arg != rid:
                 return False
         else:
             # Foreground `run` may auto-generate runId internally and argv may not
             # contain it; only enforce runId when argv explicitly carries --run-id.
-            if ("--run-id" in cmdline_lc) and (rid not in cmdline_lc):
+            if (rid_arg is not None) and (rid_arg != rid):
                 return False
     return True
 
