@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -785,6 +786,21 @@ def _extract_server_port_from_url(url: str) -> int | None:
         return None
 
 
+def _has_serve_token(cmdline: str) -> bool:
+    txt = str(cmdline or "").strip()
+    if not txt:
+        return False
+    try:
+        tokens = shlex.split(txt, posix=(os.name != "nt"))
+    except Exception:
+        tokens = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', txt)
+    for tok in tokens:
+        t = str(tok).strip().strip("\"'").lower()
+        if t == "serve":
+            return True
+    return False
+
+
 def _pid_matches_server_url(pid: int, url: str) -> bool:
     if pid <= 0:
         return False
@@ -795,7 +811,7 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
     if not cmdline:
         return False
     cmdline_lc = cmdline.lower()
-    if "serve" not in cmdline_lc:
+    if not _has_serve_token(cmdline_lc):
         return False
     port_txt = str(expected_port)
     return bool(
@@ -819,7 +835,7 @@ def _server_pid_ownership_status(pid: int, url: str) -> str:
     if not cmdline:
         return "unknown"
     cmdline_lc = cmdline.lower()
-    if "serve" not in cmdline_lc:
+    if not _has_serve_token(cmdline_lc):
         return "mismatch"
     port_txt = str(expected_port)
     if re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc) or re.search(
@@ -3913,8 +3929,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         except Exception:
             stop_ok = False
 
-    # Write a cancel finish only when cancellation actually succeeded.
-    if (ok or not pid_alive_after_cancel) and not finish_path.exists():
+    # Write a terminal cancel finish when we succeeded, or when there is no
+    # remaining signal path (e.g., queued run with no pid/session).
+    no_signal_path = (not pid_alive_after_cancel) and (not session_id)
+    if (ok or no_signal_path) and not finish_path.exists():
         out = _finish_obj(
             ok=False,
             exit_code=130 if ok else 1,
