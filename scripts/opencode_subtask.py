@@ -289,7 +289,16 @@ def _resolve_prompt_input(args: argparse.Namespace) -> str:
         )
 
     if has_file:
-        return _read_text(Path(args.prompt_file).expanduser().resolve())
+        prompt_file_path = Path(str(args.prompt_file)).expanduser().resolve()
+        try:
+            return _read_text(prompt_file_path)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _exit_with_error(
+                "PromptFileReadError",
+                f"Could not read --prompt-file {prompt_file_path}: {type(e).__name__}: {e}",
+            )
     if has_text:
         return str(args.prompt_text)
     return _join_prompt(prompt_parts)
@@ -703,9 +712,20 @@ def _proc_cmdline(pid: int) -> str:
     if pid <= 0:
         return ""
     if os.name != "nt":
+        proc_cmdline = Path(f"/proc/{pid}/cmdline")
+        if proc_cmdline.exists():
+            try:
+                raw = proc_cmdline.read_bytes()
+                return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+            except Exception:
+                pass
+        # macOS/BSD fallback where /proc may be unavailable.
         try:
-            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-            return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="],
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="replace")
+            return out.strip()
         except Exception:
             return ""
     # Windows: wmic is deprecated but still common; fall back to tasklist if needed.
@@ -750,13 +770,79 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
     if not cmdline:
         return False
     cmdline_lc = cmdline.lower()
-    if ("opencode" not in cmdline_lc) or ("serve" not in cmdline_lc):
+    if "serve" not in cmdline_lc:
         return False
     port_txt = str(expected_port)
     return bool(
         re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc)
         or re.search(rf"--port\s+{re.escape(port_txt)}\b", cmdline_lc)
     )
+
+
+def _server_pid_ownership_status(pid: int, url: str) -> str:
+    """
+    Classify ownership check result for a tracked server PID.
+    Returns: "verified" | "mismatch" | "unknown"
+    - unknown: cannot read cmdline or cannot infer expected port safely
+    """
+    if pid <= 0:
+        return "mismatch"
+    expected_port = _extract_server_port_from_url(url)
+    if expected_port is None:
+        return "unknown"
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return "unknown"
+    cmdline_lc = cmdline.lower()
+    if "serve" not in cmdline_lc:
+        return "mismatch"
+    port_txt = str(expected_port)
+    if re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc) or re.search(
+        rf"--port\s+{re.escape(port_txt)}\b", cmdline_lc
+    ):
+        return "verified"
+    return "mismatch"
+
+
+def _pid_matches_subtask_worker(
+    pid: int, run_id: str | None = None, *, require_run_id: bool = False
+) -> bool:
+    if pid <= 0:
+        return False
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return False
+    cmdline_lc = cmdline.lower()
+    if "opencode_subtask.py" not in cmdline_lc:
+        return False
+    if not re.search(r"(^|\s)run(\s|$)", cmdline_lc):
+        return False
+    rid = str(run_id or "").strip().lower()
+    if rid:
+        if require_run_id:
+            if rid not in cmdline_lc:
+                return False
+        else:
+            # Foreground `run` may auto-generate runId internally and argv may not
+            # contain it; only enforce runId when argv explicitly carries --run-id.
+            if ("--run-id" in cmdline_lc) and (rid not in cmdline_lc):
+                return False
+    return True
+
+
+def _should_count_job_pid_as_active_worker(pid: int, run_id: str | None) -> bool:
+    """
+    Determine whether a running PID should be treated as an active opencode-subtask worker.
+    Conservative behavior: if command line cannot be read, treat as active to avoid unsafe reaping.
+    """
+    if pid <= 0:
+        return False
+    if not _pid_running(pid):
+        return False
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return True
+    return _pid_matches_subtask_worker(pid, run_id)
 
 
 def _pick_free_port(host: str) -> int:
@@ -1091,7 +1177,14 @@ def _scan_running_job_server_urls(
         except Exception:
             pid = 0
 
-        if pid > 0 and _pid_running(pid):
+        job_run_id: str | None = None
+        raw_run_id = job.get("runId")
+        if isinstance(raw_run_id, (str, int)):
+            txt_run_id = str(raw_run_id).strip()
+            if txt_run_id:
+                job_run_id = txt_run_id
+
+        if _should_count_job_pid_as_active_worker(pid, job_run_id):
             active_urls.add(url)
         elif bool(job.get("serverStartedNew")):
             if (current_project_key is None) or (
@@ -1468,16 +1561,36 @@ def stop_server(workdir: Path) -> dict[str, Any]:
     lock_path = _server_lock_path(workdir)
     with _FileLock(lock_path):
         st = _load_json(st_path) or {}
+        url = str(st.get("url") or "") if isinstance(st, dict) else ""
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
+        kept_state = False
+        reason = "no-pid"
         if pid and _pid_running(pid):
-            _kill_tree(pid)
-            ok = True
-        try:
-            st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        return {"ok": ok, "pid": pid, "statePath": str(st_path)}
+            own = _server_pid_ownership_status(pid, url)
+            if own == "verified":
+                _kill_tree(pid)
+                ok = True
+                reason = "killed"
+            elif own == "unknown":
+                kept_state = True
+                reason = "owner-unverified-state-kept"
+            else:
+                reason = "owner-mismatch-state-cleared"
+        elif pid:
+            reason = "pid-not-running"
+        if not kept_state:
+            try:
+                st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return {
+            "ok": ok,
+            "pid": pid,
+            "statePath": str(st_path),
+            "keptState": kept_state,
+            "reason": reason,
+        }
 
 
 # ============================
@@ -2422,6 +2535,10 @@ def _run_http(
                             stderr_fp.flush()
                         except Exception:
                             pass
+                        try:
+                            client.abort(session_id)
+                        except Exception:
+                            pass
                         stop_evt.set()
                         break
 
@@ -2649,6 +2766,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     auth = _get_http_auth_from_env(env)
     reaper_info: dict[str, Any] | None = None
+    effective_engine = str(getattr(args, "engine", requested_engine)).strip().lower()
     reaper_idle_s = float(
         getattr(args, "orphan_reaper_idle_s", DEFAULT_ORPHAN_REAPER_IDLE_S)
     )
@@ -2659,7 +2777,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     if (
         bool(getattr(args, "orphan_reaper", True))
-        and (requested_engine in ("http", "auto"))
+        and (effective_engine in ("http", "auto"))
         and (args.attach is None)
         and bool(args.attach_server)
     ):
@@ -3522,9 +3640,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
     stop_attempted = False
     stop_ok: bool | None = None
+    job_run_id = (
+        str(job.get("runId") or run_id) if isinstance(job, dict) else str(run_id)
+    )
 
     ok = False
-    if pid and _pid_running(pid):
+    if pid and _pid_running(pid) and _pid_matches_subtask_worker(
+        pid, job_run_id, require_run_id=False
+    ):
         try:
             _kill_tree(pid)
             ok = True
@@ -3584,8 +3707,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         except Exception:
             stop_ok = False
 
-    # If no finish exists, write a minimal one so wait won't hang.
-    if not finish_path.exists():
+    # Write a cancel finish only when cancellation actually succeeded.
+    if ok and not finish_path.exists():
         out = _finish_obj(
             ok=False,
             exit_code=130,
@@ -3616,14 +3739,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         )
         _write_json(finish_path, out)
 
-    # Persist cancel state so future orphan scans do not classify this job as a crash.
+    # Persist cancel telemetry. Mark state=canceled only if cancel actually succeeded.
     if isinstance(job, dict):
         try:
             job2 = dict(job)
             now_ms = _now_ms()
-            job2["state"] = "canceled"
+            job2["cancelAttemptedAt"] = now_ms
+            if ok:
+                job2["state"] = "canceled"
+                job2["canceledAt"] = now_ms
             job2["updatedAt"] = now_ms
-            job2["canceledAt"] = now_ms
             job2["ok"] = ok
             job2["stopServerAttempted"] = stop_attempted
             job2["stopServerOk"] = stop_ok
