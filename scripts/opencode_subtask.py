@@ -3973,9 +3973,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
     stop_attempted = False
     stop_ok: bool | None = None
+    job_run_id = (
+        str(job.get("runId") or run_id) if isinstance(job, dict) else str(run_id)
+    )
 
     ok = False
-    if pid and _pid_running(pid):
+    if pid and _pid_running(pid) and _pid_matches_subtask_worker(
+        pid, job_run_id, require_run_id=False
+    ):
         try:
             _kill_tree(pid)
             ok = True
