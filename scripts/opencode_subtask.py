@@ -754,6 +754,7 @@ def _proc_cmdline(pid: int) -> str:
             out = subprocess.check_output(
                 ["ps", "-p", str(pid), "-o", "command="],
                 stderr=subprocess.DEVNULL,
+                timeout=5.0,
             ).decode("utf-8", errors="replace")
             return out.strip()
         except Exception:
@@ -771,6 +772,7 @@ def _proc_cmdline(pid: int) -> str:
                 "/VALUE",
             ],
             stderr=subprocess.DEVNULL,
+            timeout=5.0,
         ).decode("utf-8", errors="replace")
         if out and ("CommandLine" in out):
             return out
@@ -786,6 +788,7 @@ def _proc_cmdline(pid: int) -> str:
         out = subprocess.check_output(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
             stderr=subprocess.DEVNULL,
+            timeout=5.0,
         ).decode("utf-8", errors="replace")
         return out.strip()
     except Exception:
