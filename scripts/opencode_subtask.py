@@ -1197,6 +1197,11 @@ class OpencodeHttpClient:
         except Exception:
             pass
 
+    def abort_checked(self, session_id: str, *, timeout_s: float = 5.0) -> None:
+        # Same endpoint as abort(), but lets exceptions propagate for callers
+        # that need a reliable success/failure signal.
+        self._request_json("POST", f"/session/{session_id}/abort", {}, timeout_s=timeout_s)
+
     def reply_permission(
         self,
         session_id: str,
@@ -4000,14 +4005,20 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             ok = False
 
     # Best-effort abort session if recorded.
+    abort_error: str | None = None
     if server_url and session_id:
         env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
         auth = _get_http_auth_from_env(env)
         try:
-            OpencodeHttpClient(server_url, auth=auth, timeout_s=5.0).abort(session_id)
+            OpencodeHttpClient(server_url, auth=auth, timeout_s=5.0).abort_checked(
+                session_id, timeout_s=5.0
+            )
             ok = True
-        except Exception:
-            pass
+        except Exception as e:
+            abort_error = f"{type(e).__name__}: {e}"
+            abort_error = " ".join(str(abort_error).split())
+            if len(abort_error) > 500:
+                abort_error = abort_error[:497] + "..."
     pid_alive_after_cancel = bool(pid and _pid_running(pid))
 
     # If worker was canceled before normal completion, best-effort apply
@@ -4054,9 +4065,23 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             stop_ok = False
 
     # Write a terminal cancel finish when we succeeded, or when there is no
-    # remaining signal path (e.g., queued run with no pid/session).
-    no_signal_path = (not pid_alive_after_cancel) and (not (server_url and session_id))
+    # remaining signal path. If the worker PID is already gone, there is no
+    # way for a normal finish.json to be produced; always converge here so
+    # upstream wait/status does not hang on timeouts.
+    no_signal_path = not pid_alive_after_cancel
     if (ok or no_signal_path) and not finish_path.exists():
+        if ok:
+            cancel_error = {"name": "Canceled", "message": "job canceled by adapter"}
+        elif abort_error:
+            cancel_error = {
+                "name": "CancelAbortFailed",
+                "message": f"worker not running; session abort failed: {abort_error}",
+            }
+        else:
+            cancel_error = {
+                "name": "CancelNoActiveWorker",
+                "message": "cancel requested but no active worker process remained",
+            }
         out = _finish_obj(
             ok=False,
             exit_code=130 if ok else 1,
@@ -4081,14 +4106,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 "finishPath": finish_path.name,
             },
             metrics=None,
-            error=(
-                {"name": "Canceled", "message": "job canceled by adapter"}
-                if ok
-                else {
-                    "name": "CancelNoActiveWorker",
-                    "message": "cancel requested but no active worker process remained",
-                }
-            ),
+            error=cancel_error,
             include_debug=False,
             debug=None,
         )
