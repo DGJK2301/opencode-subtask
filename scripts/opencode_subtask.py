@@ -682,15 +682,19 @@ def _resolve_artifacts_dir(
 # ============================
 
 
-def _pid_running(pid: int) -> bool:
+def _pid_running_state(pid: int) -> tuple[bool, bool]:
+    """
+    Return (is_running, probe_known). probe_known=False means the probe itself
+    was inconclusive (for example, command timeout).
+    """
     if pid <= 0:
-        return False
+        return (False, True)
     if os.name != "nt":
         try:
             os.kill(pid, 0)
-            return True
+            return (True, True)
         except OSError:
-            return False
+            return (False, True)
     try:
         out = subprocess.check_output(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
@@ -703,15 +707,23 @@ def _pid_running(pid: int) -> bool:
             if not line or line.upper().startswith("INFO:"):
                 continue
             if re.search(rf'^"[^"]*","{pid_txt}"(?:,|$)', line):
-                return True
-        return False
+                return (True, True)
+        return (False, True)
     except subprocess.TimeoutExpired:
-        # Be conservative: if we cannot reliably query tasklist, assume the PID
-        # is still running (avoids false-negative liveness that could cause
-        # premature finish.json synthesis).
-        return True
+        return (False, False)
     except Exception:
-        return False
+        return (False, False)
+
+
+def _pid_running(pid: int) -> bool:
+    alive, known = _pid_running_state(pid)
+    if known:
+        return alive
+    if os.name == "nt":
+        # Global conservative default for uncertain Windows probes. Some
+        # call sites (such as cancel latch) handle probe-known separately.
+        return True
+    return alive
 
 
 def _kill_tree(pid: int) -> bool:
@@ -4035,7 +4047,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             abort_error = " ".join(str(abort_error).split())
             if len(abort_error) > 500:
                 abort_error = abort_error[:497] + "..."
-    pid_alive_after_cancel = bool(pid and _pid_running(pid))
+    pid_alive_after_cancel = False
+    pid_probe_known_after_cancel = True
+    if pid:
+        pid_alive_probe, pid_probe_known_after_cancel = _pid_running_state(pid)
+        # Keep conservative behavior for state transitions when probe is unknown.
+        pid_alive_after_cancel = pid_alive_probe if pid_probe_known_after_cancel else True
     # Treat successful signal delivery as a successful cancel request even if
     # the process has not exited yet at this immediate probe.
     ok = bool(abort_ok or (kill_attempted and kill_signal_delivered))
@@ -4086,7 +4103,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     # path. If the worker PID is already gone, there is no way for a normal
     # finish.json to be produced; always converge here so upstream wait/status
     # does not hang on timeouts.
-    no_signal_path = not pid_alive_after_cancel
+    # If liveness probe itself is unknown, do not block terminal finish latch.
+    # That prevents long wait/status hangs after cancel on Windows probe timeouts.
+    no_signal_path = (not pid_alive_after_cancel) or (not pid_probe_known_after_cancel)
     if (ok or no_signal_path) and not finish_path.exists():
         if ok:
             cancel_error = {"name": "Canceled", "message": "job canceled by adapter"}
