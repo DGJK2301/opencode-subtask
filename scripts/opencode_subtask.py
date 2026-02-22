@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -39,9 +40,12 @@ from typing import Any, Final, Iterable, Never, NoReturn
 
 ADAPTER_SCHEMA_VERSION: Final[int] = 1
 
-DEFAULT_TIMEOUT_S: Final[float] = 900.0
+DEFAULT_TIMEOUT_S: Final[float] = 600.0
 DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
 DEFAULT_GIT_TIMEOUT_S: Final[float] = 20.0
+DEFAULT_STALE_IDLE_S: Final[float] = 600.0
+DEFAULT_DEAD_WORKER_GRACE_S: Final[float] = 180.0
+DEFAULT_CANCEL_STUCK_GRACE_S: Final[float] = 180.0
 DEFAULT_EXECUTION_PROFILE: Final[str] = "hybrid"
 HYBRID_SHORT_TIMEOUT_S: Final[float] = 240.0
 HYBRID_SHORT_PROMPT_CHARS: Final[int] = 1600
@@ -680,10 +684,17 @@ def _pid_running(pid: int) -> bool:
             return False
     try:
         out = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
             stderr=subprocess.DEVNULL,
         ).decode("utf-8", errors="replace")
-        return str(pid) in out
+        pid_txt = re.escape(str(pid))
+        for raw_line in out.splitlines():
+            line = raw_line.strip()
+            if not line or line.upper().startswith("INFO:"):
+                continue
+            if re.search(rf'^"[^"]*","{pid_txt}"(?:,|$)', line):
+                return True
+        return False
     except Exception:
         return False
 
@@ -742,7 +753,22 @@ def _proc_cmdline(pid: int) -> str:
             ],
             stderr=subprocess.DEVNULL,
         ).decode("utf-8", errors="replace")
-        return out
+        if out and ("CommandLine" in out):
+            return out
+    except Exception:
+        pass
+    # Windows 11+ fallback where wmic may be unavailable.
+    try:
+        ps_cmd = (
+            f'$p=Get-CimInstance Win32_Process -Filter "ProcessId={pid}" '
+            '| Select-Object -First 1 -ExpandProperty CommandLine; '
+            'if ($p) { [Console]::Out.Write($p) }'
+        )
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        return out.strip()
     except Exception:
         return ""
 
@@ -760,7 +786,122 @@ def _extract_server_port_from_url(url: str) -> int | None:
         return None
 
 
-def _pid_matches_server_url(pid: int, url: str) -> bool:
+def _split_cmdline_tokens(cmdline: str) -> list[str]:
+    txt = str(cmdline or "").strip()
+    if not txt:
+        return []
+    try:
+        return shlex.split(txt, posix=(os.name != "nt"))
+    except Exception:
+        return re.findall(r'"[^"]*"|\'[^\']*\'|\S+', txt)
+
+
+def _normalize_cmd_token(tok: str) -> str:
+    t = str(tok or "").strip().strip("\"'").lower()
+    if t.startswith("commandline="):
+        t = t[len("commandline=") :]
+    return t
+
+
+def _extract_flag_value(cmdline: str, flag: str) -> str | None:
+    """
+    Extract a CLI flag value from command line tokens.
+    Supports both: `--flag value` and `--flag=value`.
+    Returns normalized lowercase value when present, otherwise None.
+    """
+    tokens = _split_cmdline_tokens(cmdline)
+    f = str(flag or "").strip().lower()
+    i = 0
+    while i < len(tokens):
+        t = _normalize_cmd_token(tokens[i])
+        if not t:
+            i += 1
+            continue
+        if t == f:
+            if i + 1 < len(tokens):
+                return _normalize_cmd_token(tokens[i + 1])
+            return ""
+        if t.startswith(f + "="):
+            return _normalize_cmd_token(t[len(f) + 1 :])
+        i += 1
+    return None
+
+
+def _has_serve_token(cmdline: str) -> bool:
+    tokens = _split_cmdline_tokens(cmdline)
+    for tok in tokens:
+        t = _normalize_cmd_token(tok)
+        if t == "serve":
+            return True
+    return False
+
+
+def _looks_like_opencode_identity(tok: str) -> bool:
+    n = Path(str(tok or "")).name.lower()
+    if not n:
+        return False
+    return bool(re.search(r"(^|[^a-z0-9])opencode([^a-z0-9]|$)", n))
+
+
+def _expected_server_exec_token(st: dict[str, Any] | None) -> str | None:
+    if not isinstance(st, dict):
+        return None
+    cmd = st.get("command")
+    raw = ""
+    if isinstance(cmd, list) and cmd:
+        raw = str(cmd[0] or "").strip()
+    elif isinstance(cmd, str) and cmd.strip():
+        toks = _split_cmdline_tokens(cmd)
+        if toks:
+            raw = str(toks[0] or "").strip()
+    if not raw:
+        return None
+    return Path(raw).name.strip().lower() or None
+
+
+def _has_server_identity_token(cmdline: str, expected_exec_token: str | None) -> bool:
+    tokens = _split_cmdline_tokens(cmdline)
+    expected = str(expected_exec_token or "").strip().lower()
+    generic_exec = {
+        "python",
+        "python.exe",
+        "python3",
+        "python3.exe",
+        "py",
+        "py.exe",
+        "node",
+        "node.exe",
+        "bash",
+        "sh",
+        "zsh",
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+    }
+    expected_matched = False
+    opencode_matched = False
+    for tok in tokens:
+        t = _normalize_cmd_token(tok)
+        if not t:
+            continue
+        t_name = Path(t).name.lower()
+        if expected and (t == expected or t_name == expected):
+            expected_matched = True
+        if _looks_like_opencode_identity(t) or _looks_like_opencode_identity(t_name):
+            opencode_matched = True
+    if opencode_matched:
+        return True
+    if expected and expected_matched and (expected not in generic_exec):
+        return True
+    return False
+
+
+def _pid_matches_server_url(
+    pid: int, url: str, expected_exec_token: str | None = None
+) -> bool:
     if pid <= 0:
         return False
     expected_port = _extract_server_port_from_url(url)
@@ -770,7 +911,9 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
     if not cmdline:
         return False
     cmdline_lc = cmdline.lower()
-    if "serve" not in cmdline_lc:
+    if not _has_serve_token(cmdline_lc):
+        return False
+    if not _has_server_identity_token(cmdline_lc, expected_exec_token):
         return False
     port_txt = str(expected_port)
     return bool(
@@ -779,7 +922,9 @@ def _pid_matches_server_url(pid: int, url: str) -> bool:
     )
 
 
-def _server_pid_ownership_status(pid: int, url: str) -> str:
+def _server_pid_ownership_status(
+    pid: int, url: str, expected_exec_token: str | None = None
+) -> str:
     """
     Classify ownership check result for a tracked server PID.
     Returns: "verified" | "mismatch" | "unknown"
@@ -794,7 +939,9 @@ def _server_pid_ownership_status(pid: int, url: str) -> str:
     if not cmdline:
         return "unknown"
     cmdline_lc = cmdline.lower()
-    if "serve" not in cmdline_lc:
+    if not _has_serve_token(cmdline_lc):
+        return "mismatch"
+    if not _has_server_identity_token(cmdline_lc, expected_exec_token):
         return "mismatch"
     port_txt = str(expected_port)
     if re.search(rf"--port\s*=\s*{re.escape(port_txt)}\b", cmdline_lc) or re.search(
@@ -802,6 +949,28 @@ def _server_pid_ownership_status(pid: int, url: str) -> str:
     ):
         return "verified"
     return "mismatch"
+
+
+def _cmdline_matches_subtask_worker(
+    cmdline: str, run_id: str | None = None, *, require_run_id: bool = False
+) -> bool:
+    cmdline_lc = cmdline.lower()
+    if "opencode_subtask.py" not in cmdline_lc:
+        return False
+    if not re.search(r"(^|\s)run(\s|$)", cmdline_lc):
+        return False
+    rid = str(run_id or "").strip().lower()
+    if rid:
+        rid_arg = _extract_flag_value(cmdline_lc, "--run-id")
+        if require_run_id:
+            if rid_arg != rid:
+                return False
+        else:
+            # Foreground `run` may auto-generate runId internally and argv may not
+            # contain it; only enforce runId when argv explicitly carries --run-id.
+            if (rid_arg is not None) and (rid_arg != rid):
+                return False
+    return True
 
 
 def _pid_matches_subtask_worker(
@@ -812,22 +981,9 @@ def _pid_matches_subtask_worker(
     cmdline = _proc_cmdline(pid)
     if not cmdline:
         return False
-    cmdline_lc = cmdline.lower()
-    if "opencode_subtask.py" not in cmdline_lc:
-        return False
-    if not re.search(r"(^|\s)run(\s|$)", cmdline_lc):
-        return False
-    rid = str(run_id or "").strip().lower()
-    if rid:
-        if require_run_id:
-            if rid not in cmdline_lc:
-                return False
-        else:
-            # Foreground `run` may auto-generate runId internally and argv may not
-            # contain it; only enforce runId when argv explicitly carries --run-id.
-            if ("--run-id" in cmdline_lc) and (rid not in cmdline_lc):
-                return False
-    return True
+    return _cmdline_matches_subtask_worker(
+        cmdline, run_id, require_run_id=require_run_id
+    )
 
 
 def _should_count_job_pid_as_active_worker(pid: int, run_id: str | None) -> bool:
@@ -842,7 +998,7 @@ def _should_count_job_pid_as_active_worker(pid: int, run_id: str | None) -> bool
     cmdline = _proc_cmdline(pid)
     if not cmdline:
         return True
-    return _pid_matches_subtask_worker(pid, run_id)
+    return _cmdline_matches_subtask_worker(cmdline, run_id)
 
 
 def _pick_free_port(host: str) -> int:
@@ -1223,6 +1379,7 @@ def reap_orphan_server_for_project(
             }
 
         url = str(st["url"])
+        expected_exec_token = _expected_server_exec_token(st)
         pid = 0
         try:
             raw_pid = st.get("pid")
@@ -1262,7 +1419,7 @@ def reap_orphan_server_for_project(
         health_probe = _server_health_probe(url, auth)
         health_status = str(health_probe.get("status") or "").strip().lower()
         if health_status == "unhealthy":
-            if not _pid_matches_server_url(pid, url):
+            if not _pid_matches_server_url(pid, url, expected_exec_token):
                 return {
                     "checked": True,
                     "reaped": False,
@@ -1327,7 +1484,7 @@ def reap_orphan_server_for_project(
         )
 
         if url in crashed_owner_urls:
-            if not _pid_matches_server_url(pid, url):
+            if not _pid_matches_server_url(pid, url, expected_exec_token):
                 return {
                     "checked": True,
                     "reaped": False,
@@ -1353,7 +1510,7 @@ def reap_orphan_server_for_project(
             }
 
         if idle_s > 0 and age_s is not None and age_s >= idle_s:
-            if not _pid_matches_server_url(pid, url):
+            if not _pid_matches_server_url(pid, url, expected_exec_token):
                 return {
                     "checked": True,
                     "reaped": False,
@@ -1407,6 +1564,7 @@ class _FileLock:
             import msvcrt  # type: ignore
 
             # lock 1 byte
+            self.fp.seek(0)
             msvcrt.locking(self.fp.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl  # type: ignore
@@ -1488,15 +1646,21 @@ def ensure_server(
         else:
             popen_kwargs["start_new_session"] = True
 
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_fp,
-            stderr=log_fp,
-            cwd=str(workdir),
-            env=env,
-            **popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fp,
+                stderr=log_fp,
+                cwd=str(workdir),
+                env=env,
+                **popen_kwargs,
+            )
+        finally:
+            try:
+                log_fp.close()
+            except Exception:
+                pass
 
         url = f"http://{hostname}:{port}"
         deadline = time.monotonic() + max(wait_s, 0.1)
@@ -1562,19 +1726,19 @@ def stop_server(workdir: Path) -> dict[str, Any]:
     with _FileLock(lock_path):
         st = _load_json(st_path) or {}
         url = str(st.get("url") or "") if isinstance(st, dict) else ""
+        expected_exec_token = _expected_server_exec_token(st if isinstance(st, dict) else None)
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
         kept_state = False
         reason = "no-pid"
         if pid and _pid_running(pid):
-            own = _server_pid_ownership_status(pid, url)
+            own = _server_pid_ownership_status(pid, url, expected_exec_token)
             if own == "verified":
                 _kill_tree(pid)
                 ok = True
                 reason = "killed"
             elif own == "unknown":
-                kept_state = True
-                reason = "owner-unverified-state-kept"
+                reason = "owner-unverified-state-cleared"
             else:
                 reason = "owner-mismatch-state-cleared"
         elif pid:
@@ -1783,7 +1947,10 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
         parts = raw.split(b"\x00")
         changed: list[str] = []
         untracked: list[str] = []
-        for entry in parts:
+        i = 0
+        while i < len(parts):
+            entry = parts[i]
+            i += 1
             if not entry:
                 continue
             try:
@@ -1797,6 +1964,15 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
             if code == "??":
                 untracked.append(path)
             else:
+                if code and code[0] in ("R", "C"):
+                    # porcelain -z rename/copy ordering is:
+                    #   XY<sp>dst NUL src NUL
+                    # Keep destination in changed-files, and consume trailing src token.
+                    if path:
+                        changed.append(path)
+                    if i < len(parts):
+                        i += 1
+                    continue
                 changed.append(path)
         return sorted(set(changed)), sorted(set(untracked))
     except Exception:
@@ -3418,6 +3594,142 @@ def _progress_snapshot(artifacts_dir: Path) -> dict[str, Any]:
     return prog
 
 
+def _job_ms(job: dict[str, Any], key: str) -> int:
+    raw = job.get(key)
+    if isinstance(raw, (int, str)):
+        try:
+            return int(raw)
+        except Exception:
+            return 0
+    return 0
+
+
+def _emit_synthesized_missing_finish(
+    *,
+    run_id: str,
+    artifacts_dir: Path,
+    finish_path: Path,
+    job_path: Path,
+    job: dict[str, Any],
+    error_name: str,
+    error_message: str,
+) -> dict[str, Any]:
+    wd = (
+        Path(str(job.get("workdir")))
+        if isinstance(job, dict) and job.get("workdir")
+        else Path.cwd()
+    )
+    out = _finish_obj(
+        ok=False,
+        exit_code=1,
+        timed_out=False,
+        run_id=run_id,
+        workdir=wd,
+        engine="watchdog",
+        fallback_from=None,
+        server=None,
+        session_id=(
+            str(job.get("sessionId"))
+            if isinstance(job, dict) and job.get("sessionId")
+            else None
+        ),
+        summary="",
+        summary_truncated=False,
+        result_digest=None,
+        changed_files=[],
+        untracked_files=[],
+        artifacts_dir=artifacts_dir,
+        artifacts={
+            "dir": str(artifacts_dir),
+            "jobPath": job_path.name,
+            "finishPath": finish_path.name,
+        },
+        metrics=None,
+        error={"name": error_name, "message": error_message},
+        include_debug=False,
+        debug=None,
+    )
+    if not finish_path.exists():
+        _write_json(finish_path, out)
+    try:
+        job2 = dict(job)
+        now_ms = _now_ms()
+        job2["state"] = "failed"
+        job2["failedAt"] = now_ms
+        job2["updatedAt"] = now_ms
+        job2["lastError"] = {"name": error_name, "message": error_message}
+        _write_json(job_path, job2)
+    except Exception:
+        pass
+    return out
+
+
+def _maybe_finalize_stale_running_job(
+    *,
+    run_id: str,
+    artifacts_dir: Path,
+    finish_path: Path,
+    job_path: Path,
+    job: dict[str, Any],
+    pid: int | None,
+    progress: dict[str, Any],
+    stale_idle_s: float,
+    dead_worker_grace_s: float,
+    cancel_stuck_grace_s: float,
+) -> dict[str, Any] | None:
+    if finish_path.exists():
+        return None
+    state = str(job.get("state") or "").strip().lower()
+    if state and state not in ("running", "queued"):
+        return None
+    idle_for = progress.get("idleForSeconds")
+    idle_s = float(idle_for) if isinstance(idle_for, (int, float)) else None
+    now_ms = _now_ms()
+
+    last_touch_ms = max(
+        _job_ms(job, "updatedAt"),
+        _job_ms(job, "createdAt"),
+        _job_ms(job, "cancelAttemptedAt"),
+    )
+    age_since_touch_s = (
+        max(0.0, (float(now_ms) - float(last_touch_ms)) / 1000.0)
+        if last_touch_ms > 0
+        else 0.0
+    )
+
+    pid_alive = bool(pid and _pid_running(pid))
+    if not pid_alive:
+        if age_since_touch_s < dead_worker_grace_s:
+            return None
+        return _emit_synthesized_missing_finish(
+            run_id=run_id,
+            artifacts_dir=artifacts_dir,
+            finish_path=finish_path,
+            job_path=job_path,
+            job=job,
+            error_name="WorkerNotRunning",
+            error_message="worker process not running and finish.json missing",
+        )
+
+    cancel_attempted_ms = _job_ms(job, "cancelAttemptedAt")
+    if cancel_attempted_ms <= 0:
+        return None
+    if idle_s is None or idle_s < stale_idle_s:
+        return None
+    cancel_age_s = max(0.0, (float(now_ms) - float(cancel_attempted_ms)) / 1000.0)
+    if cancel_age_s < cancel_stuck_grace_s:
+        return None
+    return _emit_synthesized_missing_finish(
+        run_id=run_id,
+        artifacts_dir=artifacts_dir,
+        finish_path=finish_path,
+        job_path=job_path,
+        job=job,
+        error_name="StuckAfterCancel",
+        error_message="no heartbeat progress after cancel attempt and finish.json missing",
+    )
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
         _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
@@ -3461,13 +3773,31 @@ def cmd_status(args: argparse.Namespace) -> int:
     job = _load_json(job_path) or {}
     pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
     status = str(job.get("state") or "running") if isinstance(job, dict) else "running"
+    progress = _progress_snapshot(artifacts_dir)
+    if isinstance(job, dict):
+        synthesized = _maybe_finalize_stale_running_job(
+            run_id=run_id,
+            artifacts_dir=artifacts_dir,
+            finish_path=finish_path,
+            job_path=job_path,
+            job=job,
+            pid=pid if pid else None,
+            progress=progress,
+            stale_idle_s=DEFAULT_STALE_IDLE_S,
+            dead_worker_grace_s=DEFAULT_DEAD_WORKER_GRACE_S,
+            cancel_stuck_grace_s=DEFAULT_CANCEL_STUCK_GRACE_S,
+        )
+        if isinstance(synthesized, dict):
+            sys.stdout.write(_json_line(synthesized) + "\n")
+            return 1
     if (
         pid
         and not _pid_running(pid)
         and not finish_path.exists()
         and status != "finished"
     ):
-        status = "failed"
+        if status in ("running", "queued"):
+            status = "failed"
 
     out = _status_obj(
         run_id=run_id,
@@ -3487,8 +3817,15 @@ def cmd_status(args: argparse.Namespace) -> int:
             result_path=artifacts_dir / "result.json",
             patch_path=None,
         ),
-        progress=_progress_snapshot(artifacts_dir),
-        error=None,
+        progress=progress,
+        error=(
+            {
+                "name": "WorkerMissingPending",
+                "message": "pid is not running; waiting stale-window before synthesizing finish",
+            }
+            if (pid and not _pid_running(pid) and not finish_path.exists())
+            else None
+        ),
     )
     sys.stdout.write(_json_line(out) + "\n")
     return 0
@@ -3552,34 +3889,30 @@ def cmd_wait(args: argparse.Namespace) -> int:
             continue
 
         pid = None
+        job = _load_json(job_path) or {}
         if job_path.exists():
-            job = _load_json(job_path) or {}
             if isinstance(job, dict) and job.get("pid"):
                 try:
                     pid = int(job.get("pid"))
                 except Exception:
                     pid = None
-        if pid and not _pid_running(pid):
-            out = _status_obj(
+        progress = _progress_snapshot(artifacts_dir)
+        if isinstance(job, dict):
+            synthesized = _maybe_finalize_stale_running_job(
                 run_id=run_id,
-                status="failed",
-                pid=pid,
-                workdir=None,
                 artifacts_dir=artifacts_dir,
-                artifacts={
-                    "dir": str(artifacts_dir),
-                    "jobPath": job_path.name,
-                    "finishPath": finish_path.name,
-                    "wrapperLogPath": "wrapper.log",
-                },
-                progress=_progress_snapshot(artifacts_dir),
-                error={
-                    "name": "WorkerNotRunning",
-                    "message": "worker process not running and finish.json missing",
-                },
+                finish_path=finish_path,
+                job_path=job_path,
+                job=job,
+                pid=pid,
+                progress=progress,
+                stale_idle_s=DEFAULT_STALE_IDLE_S,
+                dead_worker_grace_s=DEFAULT_DEAD_WORKER_GRACE_S,
+                cancel_stuck_grace_s=DEFAULT_CANCEL_STUCK_GRACE_S,
             )
-            sys.stdout.write(_json_line(out) + "\n")
-            return 1
+            if isinstance(synthesized, dict):
+                sys.stdout.write(_json_line(synthesized) + "\n")
+                return 1
 
         if time.monotonic() >= deadline:
             out = _status_obj(
@@ -3593,7 +3926,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                     "jobPath": job_path.name,
                     "finishPath": finish_path.name,
                 },
-                progress=_progress_snapshot(artifacts_dir),
+                progress=progress,
                 error={
                     "name": "WaitTimeout",
                     "message": f"timeout waiting for finish.json (timeout={args.timeout}s)",
@@ -3663,6 +3996,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             ok = True
         except Exception:
             pass
+    pid_alive_after_cancel = bool(pid and _pid_running(pid))
 
     # If worker was canceled before normal completion, best-effort apply
     # stop-server-after-run policy to avoid orphaning a freshly-started server.
@@ -3707,11 +4041,13 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         except Exception:
             stop_ok = False
 
-    # Write a cancel finish only when cancellation actually succeeded.
-    if ok and not finish_path.exists():
+    # Write a terminal cancel finish when we succeeded, or when there is no
+    # remaining signal path (e.g., queued run with no pid/session).
+    no_signal_path = (not pid_alive_after_cancel) and (not (server_url and session_id))
+    if (ok or no_signal_path) and not finish_path.exists():
         out = _finish_obj(
             ok=False,
-            exit_code=130,
+            exit_code=130 if ok else 1,
             timed_out=False,
             run_id=run_id,
             workdir=Path(str(job.get("workdir")))
@@ -3733,7 +4069,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 "finishPath": finish_path.name,
             },
             metrics=None,
-            error={"name": "Canceled", "message": "job canceled by adapter"},
+            error=(
+                {"name": "Canceled", "message": "job canceled by adapter"}
+                if ok
+                else {
+                    "name": "CancelNoActiveWorker",
+                    "message": "cancel requested but no active worker process remained",
+                }
+            ),
             include_debug=False,
             debug=None,
         )
@@ -3748,6 +4091,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             if ok:
                 job2["state"] = "canceled"
                 job2["canceledAt"] = now_ms
+            elif not pid_alive_after_cancel:
+                job2["state"] = "failed"
+                job2["failedAt"] = now_ms
             job2["updatedAt"] = now_ms
             job2["ok"] = ok
             job2["stopServerAttempted"] = stop_attempted
