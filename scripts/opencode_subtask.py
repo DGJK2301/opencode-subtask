@@ -714,28 +714,32 @@ def _pid_running(pid: int) -> bool:
         return False
 
 
-def _kill_tree(pid: int) -> None:
+def _kill_tree(pid: int) -> bool:
     if pid <= 0:
-        return
+        return False
     if os.name == "nt":
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=5.0,
             )
+            return proc.returncode == 0
         except subprocess.TimeoutExpired:
-            pass
-        return
+            return False
+        except Exception:
+            return False
     try:
         os.killpg(pid, signal.SIGTERM)
+        return True
     except Exception:
         try:
             os.kill(pid, signal.SIGTERM)
+            return True
         except Exception:
-            pass
+            return False
 
 
 def _proc_cmdline(pid: int) -> str:
@@ -4008,16 +4012,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
 
     kill_attempted = False
-    kill_requested = False
+    kill_signal_delivered = False
     if pid and _pid_running(pid) and _pid_matches_subtask_worker(
         pid, job_run_id, require_run_id=False
     ):
         kill_attempted = True
-        try:
-            _kill_tree(pid)
-            kill_requested = True
-        except Exception:
-            kill_requested = False
+        kill_signal_delivered = _kill_tree(pid)
 
     # Best-effort abort session if recorded.
     abort_ok = False
@@ -4036,7 +4036,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             if len(abort_error) > 500:
                 abort_error = abort_error[:497] + "..."
     pid_alive_after_cancel = bool(pid and _pid_running(pid))
-    ok = bool(abort_ok or (kill_attempted and kill_requested and not pid_alive_after_cancel))
+    # Treat successful signal delivery as a successful cancel request even if
+    # the process has not exited yet at this immediate probe.
+    ok = bool(abort_ok or (kill_attempted and kill_signal_delivered))
 
     # If worker was canceled before normal completion, best-effort apply
     # stop-server-after-run policy to avoid orphaning a freshly-started server.
