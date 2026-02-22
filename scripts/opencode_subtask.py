@@ -1957,16 +1957,14 @@ def _git_status(workdir: Path) -> tuple[list[str], list[str]]:
                 untracked.append(path)
             else:
                 if code and code[0] in ("R", "C"):
-                    # porcelain -z for rename/copy emits: XY<sp>src NUL dst NUL
+                    # porcelain -z rename/copy ordering is:
+                    #   XY<sp>dst NUL src NUL
+                    # Keep destination in changed-files, and consume trailing src token.
+                    if path:
+                        changed.append(path)
                     if i < len(parts):
-                        try:
-                            dst = parts[i].decode("utf-8", errors="replace").strip()
-                        except Exception:
-                            dst = ""
                         i += 1
-                        if dst:
-                            changed.append(dst)
-                            continue
+                    continue
                 changed.append(path)
         return sorted(set(changed)), sorted(set(untracked))
     except Exception:
