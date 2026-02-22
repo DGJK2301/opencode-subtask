@@ -3702,8 +3702,6 @@ def _maybe_finalize_stale_running_job(
         if idle_s is None:
             if age_since_touch_s < dead_worker_grace_s:
                 return None
-        elif idle_s < stale_idle_s:
-            return None
         return _emit_synthesized_missing_finish(
             run_id=run_id,
             artifacts_dir=artifacts_dir,
