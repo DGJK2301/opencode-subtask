@@ -712,12 +712,16 @@ def _kill_tree(pid: int) -> None:
     if pid <= 0:
         return
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5.0,
+            )
+        except subprocess.TimeoutExpired:
+            pass
         return
     try:
         os.killpg(pid, signal.SIGTERM)
