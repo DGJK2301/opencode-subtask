@@ -183,7 +183,7 @@ def _apply_persona_policy(prompt: str, persona_mode: str, persona_line: str) -> 
     if mode == "prepend":
         sys.stderr.write(
             "[opencode-subtask] NOTE: injected missing persona line. "
-            'Prefer starting prompts with: "Act as a [profession]...".\n'
+            "Prefer starting prompts with: \"Act as a [profession]...\".\n"
         )
         return persona + "\n" + (prompt or "")
 
@@ -441,9 +441,7 @@ def _apply_execution_profile(
     # Explicit modes.
     if profile == "latency":
         if getattr(args, "engine", "auto") == "auto":
-            if getattr(args, "attach", None) or bool(
-                getattr(args, "attach_server", True)
-            ):
+            if getattr(args, "attach", None) or bool(getattr(args, "attach_server", True)):
                 args.engine = "http"
             else:
                 args.engine = "cli"
@@ -483,9 +481,7 @@ def _apply_execution_profile(
     # hybrid
     if short_task:
         if getattr(args, "engine", "auto") == "auto":
-            if getattr(args, "attach", None) or bool(
-                getattr(args, "attach_server", True)
-            ):
+            if getattr(args, "attach", None) or bool(getattr(args, "attach_server", True)):
                 args.engine = "http"
             else:
                 args.engine = "cli"
@@ -716,16 +712,12 @@ def _kill_tree(pid: int) -> None:
     if pid <= 0:
         return
     if os.name == "nt":
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=5.0,
-            )
-        except subprocess.TimeoutExpired:
-            pass
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
         return
     try:
         os.killpg(pid, signal.SIGTERM)
@@ -778,8 +770,8 @@ def _proc_cmdline(pid: int) -> str:
     try:
         ps_cmd = (
             f'$p=Get-CimInstance Win32_Process -Filter "ProcessId={pid}" '
-            "| Select-Object -First 1 -ExpandProperty CommandLine; "
-            "if ($p) { [Console]::Out.Write($p) }"
+            '| Select-Object -First 1 -ExpandProperty CommandLine; '
+            'if ($p) { [Console]::Out.Write($p) }'
         )
         out = subprocess.check_output(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
@@ -1186,7 +1178,7 @@ class OpencodeHttpClient:
         except RuntimeError as e:
             # Back-compat: newer servers validate `model` as an object, older servers accept a string.
             # Retry only when the server clearly rejects the string type for `model`.
-            if model and '"path":["model"]' in str(e) and "expected object" in str(e):
+            if model and "\"path\":[\"model\"]" in str(e) and "expected object" in str(e):
                 body2 = dict(body)
                 provider_id, sep, model_id = model.partition("/")
                 if sep:
@@ -1208,9 +1200,7 @@ class OpencodeHttpClient:
     def abort_checked(self, session_id: str, *, timeout_s: float = 5.0) -> None:
         # Same endpoint as abort(), but lets exceptions propagate for callers
         # that need a reliable success/failure signal.
-        self._request_json(
-            "POST", f"/session/{session_id}/abort", {}, timeout_s=timeout_s
-        )
+        self._request_json("POST", f"/session/{session_id}/abort", {}, timeout_s=timeout_s)
 
     def reply_permission(
         self,
@@ -1593,15 +1583,7 @@ class _FileLock:
         else:
             import fcntl  # type: ignore
 
-            deadline = time.monotonic() + 10.0
-            while True:
-                try:
-                    fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except (IOError, OSError):
-                    if time.monotonic() > deadline:
-                        raise RuntimeError(f"timeout acquiring file lock: {self.path}")
-                    time.sleep(0.05)
+            fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -1758,9 +1740,7 @@ def stop_server(workdir: Path) -> dict[str, Any]:
     with _FileLock(lock_path):
         st = _load_json(st_path) or {}
         url = str(st.get("url") or "") if isinstance(st, dict) else ""
-        expected_exec_token = _expected_server_exec_token(
-            st if isinstance(st, dict) else None
-        )
+        expected_exec_token = _expected_server_exec_token(st if isinstance(st, dict) else None)
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
         kept_state = False
@@ -2950,9 +2930,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "updatedAt": _now_ms(),
         "pid": os.getpid(),
         "engine": args.engine,
-        "stopServerAfterRunMode": str(
-            getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
-        ),
+        "stopServerAfterRunMode": str(getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)),
         "serverStartedNew": False,
         "httpAttempted": False,
         "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
@@ -3013,11 +2991,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     attach_url = args.attach
     server_error: dict[str, Any] | None = None
     server_started_new = False
-    stop_server_mode = (
-        str(getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN))
-        .strip()
-        .lower()
-    )
+    stop_server_mode = str(
+        getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
+    ).strip().lower()
 
     # Need opencode binary if we might call CLI engine OR we need to start a server.
     opencode_bin: str | None = None
@@ -3093,11 +3069,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         env=env,
                         auth=auth,
                     )
-                    server_started_new = (
-                        bool(server_state.get("startedNew"))
-                        if isinstance(server_state, dict)
-                        else False
-                    )
+                    server_started_new = bool(server_state.get("startedNew")) if isinstance(server_state, dict) else False
                     attach_url = str(server_state.get("url"))
             except Exception as e:
                 server_error = {"name": type(e).__name__, "message": str(e)}
@@ -3390,7 +3362,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             should_stop_server = is_local_selected_server
         elif stop_server_mode == "if-started":
             # Safety gate: only stop the exact local server this invocation started.
-            should_stop_server = bool(server_started_new and is_local_selected_server)
+            should_stop_server = bool(
+                server_started_new
+                and is_local_selected_server
+            )
         elif stop_server_mode == "never":
             should_stop_server = False
         else:
@@ -3439,9 +3414,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             "runId": run_id,
             "workdir": str(workdir),
             "state": "queued",
-            "stopServerAfterRunMode": str(
-                getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
-            ),
+            "stopServerAfterRunMode": str(getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)),
             "serverStartedNew": False,
             "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
             "createdAt": _now_ms(),
@@ -3502,14 +3475,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         worker_cmd.append("--no-contract")
 
     # prompt persona policy (keep worker behavior consistent with start/run)
-    worker_cmd.extend(
-        [
-            "--persona-mode",
-            str(args.persona_mode),
-            "--persona-line",
-            str(args.persona_line),
-        ]
-    )
+    worker_cmd.extend(["--persona-mode", str(args.persona_mode), "--persona-line", str(args.persona_line)])
     if args.wrapper_log:
         worker_cmd.append("--wrapper-log")
     if args.workaround_agent_attach:
@@ -4009,16 +3975,18 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         if isinstance(job, dict) and job.get("sessionId")
         else None
     )
-    http_attempted = bool(job.get("httpAttempted")) if isinstance(job, dict) else False
-    stop_server_mode = (
-        str(job.get("stopServerAfterRunMode", DEFAULT_STOP_SERVER_AFTER_RUN))
-        .strip()
-        .lower()
+    http_attempted = (
+        bool(job.get("httpAttempted"))
         if isinstance(job, dict)
-        else DEFAULT_STOP_SERVER_AFTER_RUN
+        else False
     )
+    stop_server_mode = str(
+        job.get("stopServerAfterRunMode", DEFAULT_STOP_SERVER_AFTER_RUN)
+    ).strip().lower() if isinstance(job, dict) else DEFAULT_STOP_SERVER_AFTER_RUN
     server_started_new = (
-        bool(job.get("serverStartedNew")) if isinstance(job, dict) else False
+        bool(job.get("serverStartedNew"))
+        if isinstance(job, dict)
+        else False
     )
     stop_attempted = False
     stop_ok: bool | None = None
@@ -4027,10 +3995,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
 
     ok = False
-    if (
-        pid
-        and _pid_running(pid)
-        and _pid_matches_subtask_worker(pid, job_run_id, require_run_id=False)
+    if pid and _pid_running(pid) and _pid_matches_subtask_worker(
+        pid, job_run_id, require_run_id=False
     ):
         try:
             _kill_tree(pid)

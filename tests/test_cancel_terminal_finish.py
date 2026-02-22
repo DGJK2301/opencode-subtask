@@ -30,7 +30,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 "pid": 2147483647,  # extremely unlikely to exist
                 # Use an invalid port to force a deterministic abort failure without
                 # depending on network conditions.
-                "serverUrl": "http://127.0.0.1:0",
+                "serverUrl": "http://127.0.0.1:99999",
                 "sessionId": "ses_test",
                 "httpAttempted": True,
                 "serverStartedNew": False,
@@ -56,8 +56,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             # but it must still converge by writing a terminal finish.json.
             self.assertNotEqual(proc.returncode, 0)
             self.assertTrue(
-                finish_path.exists(),
-                f"finish.json was not written; stdout={proc.stdout!r}",
+                finish_path.exists(), f"finish.json was not written; stdout={proc.stdout!r}"
             )
             fin = json.loads(finish_path.read_text(encoding="utf-8"))
             self.assertEqual(fin.get("type"), "opencode-subtask-finish")
