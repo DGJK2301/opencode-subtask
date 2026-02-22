@@ -3793,7 +3793,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         and not finish_path.exists()
         and status != "finished"
     ):
-        status = "running"
+        if status in ("running", "queued"):
+            status = "failed"
 
     out = _status_obj(
         run_id=run_id,
@@ -4034,7 +4035,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     # Write a terminal cancel finish when we succeeded, or when there is no
     # remaining signal path (e.g., queued run with no pid/session).
-    no_signal_path = (not pid_alive_after_cancel) and (not session_id)
+    no_signal_path = (not pid_alive_after_cancel) and (not (server_url and session_id))
     if (ok or no_signal_path) and not finish_path.exists():
         out = _finish_obj(
             ok=False,
