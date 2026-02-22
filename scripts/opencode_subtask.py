@@ -951,14 +951,9 @@ def _server_pid_ownership_status(
     return "mismatch"
 
 
-def _pid_matches_subtask_worker(
-    pid: int, run_id: str | None = None, *, require_run_id: bool = False
+def _cmdline_matches_subtask_worker(
+    cmdline: str, run_id: str | None = None, *, require_run_id: bool = False
 ) -> bool:
-    if pid <= 0:
-        return False
-    cmdline = _proc_cmdline(pid)
-    if not cmdline:
-        return False
     cmdline_lc = cmdline.lower()
     if "opencode_subtask.py" not in cmdline_lc:
         return False
@@ -978,6 +973,19 @@ def _pid_matches_subtask_worker(
     return True
 
 
+def _pid_matches_subtask_worker(
+    pid: int, run_id: str | None = None, *, require_run_id: bool = False
+) -> bool:
+    if pid <= 0:
+        return False
+    cmdline = _proc_cmdline(pid)
+    if not cmdline:
+        return False
+    return _cmdline_matches_subtask_worker(
+        cmdline, run_id, require_run_id=require_run_id
+    )
+
+
 def _should_count_job_pid_as_active_worker(pid: int, run_id: str | None) -> bool:
     """
     Determine whether a running PID should be treated as an active opencode-subtask worker.
@@ -990,7 +998,7 @@ def _should_count_job_pid_as_active_worker(pid: int, run_id: str | None) -> bool
     cmdline = _proc_cmdline(pid)
     if not cmdline:
         return True
-    return _pid_matches_subtask_worker(pid, run_id)
+    return _cmdline_matches_subtask_worker(cmdline, run_id)
 
 
 def _pick_free_port(host: str) -> int:
