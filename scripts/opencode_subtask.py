@@ -51,6 +51,11 @@ HYBRID_SHORT_TIMEOUT_S: Final[float] = 240.0
 HYBRID_SHORT_PROMPT_CHARS: Final[int] = 1600
 DEFAULT_STOP_SERVER_AFTER_RUN: Final[str] = "if-started"
 DEFAULT_ORPHAN_REAPER_IDLE_S: Final[float] = 1800.0
+DEFAULT_CANCEL_TERM_GRACE_S: Final[float] = 2.0
+DEFAULT_CANCEL_KILL_GRACE_S: Final[float] = 2.0
+DEFAULT_CANCEL_ALLOW_UNKNOWN_KILL: Final[bool] = False
+DEFAULT_FILE_LOCK_TIMEOUT_S: Final[float] = 20.0
+DEFAULT_FILE_LOCK_POLL_S: Final[float] = 0.05
 # 0 => no cap (scan all run dirs) to avoid missing active long-lived workers.
 ORPHAN_REAPER_SCAN_LIMIT: Final[int] = 0
 
@@ -634,6 +639,14 @@ def _server_lock_path(workdir: Path) -> Path:
     return _servers_dir() / f"{_project_key(workdir)}.lock"
 
 
+def _state_lock_path(artifacts_dir: Path) -> Path:
+    return artifacts_dir / "state.lock"
+
+
+def _finish_lock_path(artifacts_dir: Path) -> Path:
+    return artifacts_dir / "finish.lock"
+
+
 def _win_hide_popen_kwargs(*, detached: bool) -> dict[str, Any]:
     """
     Best-effort to prevent Windows console windows from flashing open.
@@ -726,7 +739,7 @@ def _pid_running(pid: int) -> bool:
     return alive
 
 
-def _kill_tree(pid: int) -> bool:
+def _kill_tree(pid: int, *, sig: int | None = None) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
@@ -743,12 +756,13 @@ def _kill_tree(pid: int) -> bool:
             return False
         except Exception:
             return False
+    signal_to_send = int(sig) if sig is not None else int(signal.SIGTERM)
     try:
-        os.killpg(pid, signal.SIGTERM)
+        os.killpg(pid, signal_to_send)
         return True
     except Exception:
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal_to_send)
             return True
         except Exception:
             return False
@@ -1014,14 +1028,30 @@ def _cmdline_matches_subtask_worker(
 def _pid_matches_subtask_worker(
     pid: int, run_id: str | None = None, *, require_run_id: bool = False
 ) -> bool:
+    return (
+        _pid_subtask_worker_ownership_status(
+            pid, run_id, require_run_id=require_run_id
+        )
+        == "verified"
+    )
+
+
+def _pid_subtask_worker_ownership_status(
+    pid: int, run_id: str | None = None, *, require_run_id: bool = False
+) -> str:
+    """
+    Classify ownership for a tracked subtask worker PID.
+    Returns: "verified" | "mismatch" | "unknown"
+    - unknown: command line cannot be read
+    """
     if pid <= 0:
-        return False
+        return "mismatch"
     cmdline = _proc_cmdline(pid)
     if not cmdline:
-        return False
-    return _cmdline_matches_subtask_worker(
-        cmdline, run_id, require_run_id=require_run_id
-    )
+        return "unknown"
+    if _cmdline_matches_subtask_worker(cmdline, run_id, require_run_id=require_run_id):
+        return "verified"
+    return "mismatch"
 
 
 def _should_count_job_pid_as_active_worker(pid: int, run_id: str | None) -> bool:
@@ -1610,27 +1640,66 @@ def reap_orphan_server_for_project(
 class _FileLock:
     """
     Minimal cross-platform advisory lock on a file.
-    - Unix: fcntl.flock
-    - Windows: msvcrt.locking
+    - Unix: fcntl.flock (non-blocking + bounded retry)
+    - Windows: msvcrt.locking (non-blocking + bounded retry)
     """
 
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        timeout_s: float = DEFAULT_FILE_LOCK_TIMEOUT_S,
+        poll_s: float = DEFAULT_FILE_LOCK_POLL_S,
+    ):
         self.path = path
         self.fp = None
+        self.timeout_s = max(0.0, float(timeout_s))
+        self.poll_s = max(0.01, float(poll_s))
 
     def __enter__(self) -> "_FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.fp = open(self.path, "a+b")
-        if os.name == "nt":
-            import msvcrt  # type: ignore
+        deadline = time.monotonic() + self.timeout_s
+        try:
+            if os.name == "nt":
+                import msvcrt  # type: ignore
 
-            # lock 1 byte
-            self.fp.seek(0)
-            msvcrt.locking(self.fp.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl  # type: ignore
+                while True:
+                    self.fp.seek(0)
+                    try:
+                        msvcrt.locking(self.fp.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"lock timeout: {self.path}")
+                        time.sleep(
+                            min(
+                                self.poll_s,
+                                max(0.01, deadline - time.monotonic()),
+                            )
+                        )
+            else:
+                import fcntl  # type: ignore
 
-            fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX)
+                while True:
+                    try:
+                        fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"lock timeout: {self.path}")
+                        time.sleep(
+                            min(
+                                self.poll_s,
+                                max(0.01, deadline - time.monotonic()),
+                            )
+                        )
+        except Exception:
+            try:
+                self.fp.close()
+            except Exception:
+                pass
+            self.fp = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -1652,6 +1721,63 @@ class _FileLock:
             except Exception:
                 pass
             self.fp = None
+
+
+def _write_job_locked(job_path: Path, artifacts_dir: Path, obj: dict[str, Any]) -> None:
+    with _FileLock(_state_lock_path(artifacts_dir)):
+        _write_json(job_path, obj)
+
+
+def _update_job_fields_locked(
+    job_path: Path, artifacts_dir: Path, fields: dict[str, Any]
+) -> dict[str, Any] | None:
+    try:
+        with _FileLock(_state_lock_path(artifacts_dir)):
+            job = _load_json(job_path) or {}
+            if not isinstance(job, dict):
+                job = {}
+            job.update(fields)
+            job["updatedAt"] = _now_ms()
+            _write_json(job_path, job)
+            return job
+    except Exception:
+        return None
+
+
+def _write_finish_once(
+    *,
+    artifacts_dir: Path,
+    finish_path: Path,
+    finish_obj: dict[str, Any],
+) -> tuple[bool, str, dict[str, Any] | None]:
+    with _FileLock(_finish_lock_path(artifacts_dir)):
+        if finish_path.exists():
+            existing = _load_json(finish_path)
+            if isinstance(existing, dict):
+                return False, "exists", existing
+            return False, "unreadable", None
+        _write_json(finish_path, finish_obj)
+        return True, "written", None
+
+
+def _wait_for_pid_dead(pid: int, timeout_s: float, poll_s: float = 0.1) -> bool:
+    if pid <= 0:
+        return True
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        alive, known = _pid_running_state(pid)
+        if known and not alive:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(max(poll_s, 0.01), max(0.01, deadline - time.monotonic())))
+
+
+def _finish_unreadable_error() -> dict[str, str]:
+    return {
+        "name": "FinishUnreadable",
+        "message": "finish.json exists but is not readable JSON",
+    }
 
 
 def ensure_server(
@@ -2985,17 +3111,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         "httpAttempted": False,
         "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
     }
-    _write_json(job_path, job_obj)
+    _write_job_locked(job_path, artifacts_dir, job_obj)
 
     def _update_job(fields: dict[str, Any]) -> None:
-        try:
-            job = _load_json(job_path) or {}
-            if isinstance(job, dict):
-                job.update(fields)
-                job["updatedAt"] = _now_ms()
-                _write_json(job_path, job)
-        except Exception:
-            pass
+        _update_job_fields_locked(job_path, artifacts_dir, fields)
 
     # Env
     # Defensive defaults (no-op if ignored by OpenCode)
@@ -3047,8 +3166,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Need opencode binary if we might call CLI engine OR we need to start a server.
     opencode_bin: str | None = None
-    need_opencode_bin = (args.engine in ("cli", "auto")) or (
-        not attach_url and args.attach_server
+    need_opencode_bin = (args.engine == "cli") or (
+        (args.engine == "http") and (not attach_url) and args.attach_server
     )
     if need_opencode_bin:
         default_cmd = args.opencode
@@ -3090,7 +3209,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 include_debug=args.include_debug,
                 debug=None,
             )
-            _write_json(finish_path, out)
+            _write_finish_once(
+                artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
+            )
             sys.stdout.write(_json_line(out) + "\n")
             return 127
 
@@ -3371,21 +3492,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         debug=debug,
     )
 
-    _write_json(finish_path, out)
-    # Update job state
-    job_obj2 = _load_json(job_path) or {}
-    if isinstance(job_obj2, dict):
-        job_obj2["state"] = "finished"
-        job_obj2["updatedAt"] = _now_ms()
-        job_obj2["ok"] = ok
-        job_obj2["serverStartedNew"] = server_started_new
-        job_obj2["httpAttempted"] = http_was_attempted
-        job_obj2["stopServerAfterRunMode"] = stop_server_mode
+    finish_written, _, existing_finish = _write_finish_once(
+        artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
+    )
+    if (not finish_written) and isinstance(existing_finish, dict):
+        out = existing_finish
+    # Update job state only if this worker won the terminal finish write.
+    if finish_written:
+        fields: dict[str, Any] = {
+            "state": "finished",
+            "ok": ok,
+            "serverStartedNew": server_started_new,
+            "httpAttempted": http_was_attempted,
+            "stopServerAfterRunMode": stop_server_mode,
+        }
         if outcome.session_id:
-            job_obj2["sessionId"] = outcome.session_id
+            fields["sessionId"] = outcome.session_id
         if attach_url:
-            job_obj2["serverUrl"] = attach_url
-        _write_json(job_path, job_obj2)
+            fields["serverUrl"] = attach_url
+        _update_job_fields_locked(job_path, artifacts_dir, fields)
 
     # Optional: stop the per-project server after completion.
     should_stop_server = False
@@ -3435,8 +3560,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 f"[opencode-subtask] WARN: stop-server-after-run({stop_server_mode}) failed: {type(e).__name__}: {e}\n"
             )
 
+    final_ok = bool(out.get("ok") is True) if isinstance(out, dict) else bool(ok)
     sys.stdout.write(_json_line(out) + "\n")
-    return 0 if ok else 1
+    return 0 if final_ok else 1
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -3458,13 +3584,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     finish_path = artifacts_dir / "finish.json"
     wrapper_log_path = artifacts_dir / "wrapper.log"
 
-    _write_json(
+    _write_job_locked(
         job_path,
+        artifacts_dir,
         {
             "runId": run_id,
             "workdir": str(workdir),
             "state": "queued",
-            "stopServerAfterRunMode": str(getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)),
+            "stopServerAfterRunMode": str(
+                getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
+            ),
             "serverStartedNew": False,
             "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
             "createdAt": _now_ms(),
@@ -3602,12 +3731,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
 
     # update job
-    job = _load_json(job_path) or {}
-    if isinstance(job, dict):
-        job["state"] = "running"
-        job["pid"] = proc.pid
-        job["updatedAt"] = _now_ms()
-        _write_json(job_path, job)
+    _update_job_fields_locked(
+        job_path,
+        artifacts_dir,
+        {
+            "state": "running",
+            "pid": proc.pid,
+        },
+    )
 
     out = _start_obj(
         run_id=run_id,
@@ -3713,18 +3844,20 @@ def _emit_synthesized_missing_finish(
         include_debug=False,
         debug=None,
     )
-    if not finish_path.exists():
-        _write_json(finish_path, out)
-    try:
-        job2 = dict(job)
-        now_ms = _now_ms()
-        job2["state"] = "failed"
-        job2["failedAt"] = now_ms
-        job2["updatedAt"] = now_ms
-        job2["lastError"] = {"name": error_name, "message": error_message}
-        _write_json(job_path, job2)
-    except Exception:
-        pass
+    finish_written, _, existing_finish = _write_finish_once(
+        artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
+    )
+    if (not finish_written) and isinstance(existing_finish, dict):
+        out = existing_finish
+    _update_job_fields_locked(
+        job_path,
+        artifacts_dir,
+        {
+            "state": "failed",
+            "failedAt": _now_ms(),
+            "lastError": {"name": error_name, "message": error_message},
+        },
+    )
     return out
 
 
@@ -3744,7 +3877,7 @@ def _maybe_finalize_stale_running_job(
     if finish_path.exists():
         return None
     state = str(job.get("state") or "").strip().lower()
-    if state and state not in ("running", "queued"):
+    if state and state not in ("running", "queued", "canceled", "cancelled", "failed"):
         return None
     idle_for = progress.get("idleForSeconds")
     idle_s = float(idle_for) if isinstance(idle_for, (int, float)) else None
@@ -3811,6 +3944,29 @@ def cmd_status(args: argparse.Namespace) -> int:
         if isinstance(fin, dict):
             sys.stdout.write(_json_line(fin) + "\n")
             return 0 if fin.get("ok") is True else 1
+        out = _status_obj(
+            run_id=run_id,
+            status="failed",
+            pid=None,
+            workdir=None,
+            artifacts_dir=artifacts_dir,
+            artifacts=_artifacts_obj(
+                dir_path=artifacts_dir,
+                job_path=job_path,
+                finish_path=finish_path,
+                prompt_path=prompt_path,
+                events_path=artifacts_dir / "events.ndjson",
+                stderr_path=artifacts_dir / "stderr.log",
+                assistant_path=artifacts_dir / "assistant.txt",
+                wrapper_log_path=artifacts_dir / "wrapper.log",
+                result_path=artifacts_dir / "result.json",
+                patch_path=None,
+            ),
+            progress=_progress_snapshot(artifacts_dir),
+            error=_finish_unreadable_error(),
+        )
+        sys.stdout.write(_json_line(out) + "\n")
+        return 1
 
     if not job_path.exists():
         out = _status_obj(
@@ -3933,27 +4089,21 @@ def cmd_wait(args: argparse.Namespace) -> int:
             if isinstance(fin, dict):
                 sys.stdout.write(_json_line(fin) + "\n")
                 return 0 if fin.get("ok") is True else 1
-            if time.monotonic() >= deadline:
-                out = _status_obj(
-                    run_id=run_id,
-                    status="failed",
-                    pid=None,
-                    workdir=None,
-                    artifacts_dir=artifacts_dir,
-                    artifacts={
-                        "dir": str(artifacts_dir),
-                        "jobPath": job_path.name,
-                        "finishPath": finish_path.name,
-                    },
-                    error={
-                        "name": "FinishUnreadable",
-                        "message": "timeout waiting for a readable finish.json",
-                    },
-                )
-                sys.stdout.write(_json_line(out) + "\n")
-                return 1
-            time.sleep(float(args.poll_interval))
-            continue
+            out = _status_obj(
+                run_id=run_id,
+                status="failed",
+                pid=None,
+                workdir=None,
+                artifacts_dir=artifacts_dir,
+                artifacts={
+                    "dir": str(artifacts_dir),
+                    "jobPath": job_path.name,
+                    "finishPath": finish_path.name,
+                },
+                error=_finish_unreadable_error(),
+            )
+            sys.stdout.write(_json_line(out) + "\n")
+            return 1
 
         pid = None
         job = _load_json(job_path) or {}
@@ -4046,11 +4196,57 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     kill_attempted = False
     kill_signal_delivered = False
-    if pid and _pid_running(pid) and _pid_matches_subtask_worker(
-        pid, job_run_id, require_run_id=False
-    ):
-        kill_attempted = True
-        kill_signal_delivered = _kill_tree(pid)
+    termination_confirmed = False
+    termination_evidence = "unknown"
+    worker_ownership = "not_checked"
+    allow_unknown_kill = (
+        str(os.environ.get("OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL", ""))
+        .strip()
+        .lower()
+        in ("1", "true", "yes", "on")
+    )
+    if not allow_unknown_kill:
+        allow_unknown_kill = DEFAULT_CANCEL_ALLOW_UNKNOWN_KILL
+    cancel_phase = "none"
+    if pid <= 0:
+        termination_evidence = "no_pid"
+        worker_ownership = "no_pid"
+    else:
+        alive_before, known_before = _pid_running_state(pid)
+        if known_before and not alive_before:
+            termination_confirmed = True
+            termination_evidence = "pid_dead"
+            worker_ownership = "dead"
+        else:
+            worker_ownership = _pid_subtask_worker_ownership_status(
+                pid, job_run_id, require_run_id=False
+            )
+            if worker_ownership == "verified" or (
+                worker_ownership == "unknown" and allow_unknown_kill
+            ):
+                kill_attempted = True
+                cancel_phase = "term"
+                term_sent = _kill_tree(
+                    pid, sig=(signal.SIGTERM if os.name != "nt" else None)
+                )
+                kill_signal_delivered = term_sent
+                if term_sent and _wait_for_pid_dead(pid, DEFAULT_CANCEL_TERM_GRACE_S):
+                    termination_confirmed = True
+                    termination_evidence = "pid_dead"
+                else:
+                    cancel_phase = "kill"
+                    kill_sent = _kill_tree(
+                        pid, sig=(signal.SIGKILL if os.name != "nt" else None)
+                    )
+                    kill_signal_delivered = kill_signal_delivered or kill_sent
+                    if kill_sent and _wait_for_pid_dead(pid, DEFAULT_CANCEL_KILL_GRACE_S):
+                        termination_confirmed = True
+                        termination_evidence = "pid_dead"
+            else:
+                if worker_ownership == "unknown":
+                    termination_evidence = "owner_unknown_no_kill"
+                else:
+                    termination_evidence = "owner_mismatch"
 
     # Best-effort abort session if recorded.
     abort_ok = False
@@ -4068,14 +4264,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             abort_error = " ".join(str(abort_error).split())
             if len(abort_error) > 500:
                 abort_error = abort_error[:497] + "..."
-    pid_alive_after_cancel = False
-    if pid:
-        pid_alive_probe, probe_known_after_cancel = _pid_running_state(pid)
-        # Keep conservative behavior for state transitions when probe is unknown.
-        pid_alive_after_cancel = pid_alive_probe if probe_known_after_cancel else True
-    # Treat successful signal delivery as a successful cancel request even if
-    # the process has not exited yet at this immediate probe.
-    ok = bool(abort_ok or (kill_attempted and kill_signal_delivered))
+    if pid > 0:
+        ok = bool(termination_confirmed)
+    else:
+        ok = bool(abort_ok)
 
     # If worker was canceled before normal completion, best-effort apply
     # stop-server-after-run policy to avoid orphaning a freshly-started server.
@@ -4119,11 +4311,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         except Exception:
             stop_ok = False
 
-    # Write a terminal cancel finish when cancel succeeded, or when there is no
-    # remaining signal path because worker liveness is confirmed dead.
-    # Probe-unknown must not be treated as dead here.
-    no_signal_path = not pid_alive_after_cancel
-    if (ok or no_signal_path) and not finish_path.exists():
+    # Write terminal cancel finish when cancel is confirmed or there is no local
+    # worker signal path left.
+    no_signal_path = bool((pid <= 0) or termination_confirmed)
+    if ok or no_signal_path:
         if ok:
             cancel_error = {"name": "Canceled", "message": "job canceled by adapter"}
         elif abort_error:
@@ -4164,28 +4355,33 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             include_debug=False,
             debug=None,
         )
-        _write_json(finish_path, out)
+        _write_finish_once(
+            artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
+        )
 
     # Persist cancel telemetry.
     if isinstance(job, dict):
-        try:
-            job2 = dict(job)
-            now_ms = _now_ms()
-            job2["cancelAttemptedAt"] = now_ms
-            if not pid_alive_after_cancel:
-                if ok:
-                    job2["state"] = "canceled"
-                    job2["canceledAt"] = now_ms
-                else:
-                    job2["state"] = "failed"
-                    job2["failedAt"] = now_ms
-            job2["updatedAt"] = now_ms
-            job2["ok"] = ok
-            job2["stopServerAttempted"] = stop_attempted
-            job2["stopServerOk"] = stop_ok
-            _write_json(job_path, job2)
-        except Exception:
-            pass
+        now_ms = _now_ms()
+        fields: dict[str, Any] = {
+            "cancelAttemptedAt": now_ms,
+            "ok": ok,
+            "stopServerAttempted": stop_attempted,
+            "stopServerOk": stop_ok,
+            "terminationConfirmed": termination_confirmed,
+            "terminationEvidence": termination_evidence,
+            "workerOwnership": worker_ownership,
+            "allowUnknownOwnershipKill": allow_unknown_kill,
+            "cancelPhase": cancel_phase,
+            "killSignalDelivered": kill_signal_delivered,
+        }
+        if no_signal_path:
+            if ok:
+                fields["state"] = "canceled"
+                fields["canceledAt"] = now_ms
+            else:
+                fields["state"] = "failed"
+                fields["failedAt"] = now_ms
+        _update_job_fields_locked(job_path, artifacts_dir, fields)
 
     out2 = {
         "type": "opencode-subtask-cancel",
@@ -4195,6 +4391,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "ok": ok,
         "pid": pid or None,
         "sessionId": session_id,
+        "terminationConfirmed": termination_confirmed,
+        "terminationEvidence": termination_evidence,
+        "workerOwnership": worker_ownership,
+        "allowUnknownOwnershipKill": allow_unknown_kill,
+        "cancelPhase": cancel_phase,
+        "killSignalDelivered": kill_signal_delivered,
         "stopServerAttempted": stop_attempted,
         "stopServerOk": stop_ok,
     }
@@ -4561,97 +4763,116 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
+    try:
+        parser = _JsonArgumentParser(prog="opencode_subtask.py")
+        sub = parser.add_subparsers(dest="cmd", required=True)
 
-    parser = _JsonArgumentParser(prog="opencode_subtask.py")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+        p_run = sub.add_parser("run", help="Run a subtask (foreground).")
+        _add_common_run_flags(p_run)
+        p_run.add_argument(
+            "prompt",
+            nargs=argparse.REMAINDER,
+            help="Prompt args (use `--` before the prompt).",
+        )
+        p_run.set_defaults(func=cmd_run)
 
-    p_run = sub.add_parser("run", help="Run a subtask (foreground).")
-    _add_common_run_flags(p_run)
-    p_run.add_argument(
-        "prompt",
-        nargs=argparse.REMAINDER,
-        help="Prompt args (use `--` before the prompt).",
-    )
-    p_run.set_defaults(func=cmd_run)
+        p_start = sub.add_parser("start", help="Start a subtask in background.")
+        _add_common_run_flags(p_start)
+        p_start.add_argument(
+            "prompt",
+            nargs=argparse.REMAINDER,
+            help="Prompt args (use `--` before the prompt).",
+        )
+        p_start.set_defaults(func=cmd_start)
 
-    p_start = sub.add_parser("start", help="Start a subtask in background.")
-    _add_common_run_flags(p_start)
-    p_start.add_argument(
-        "prompt",
-        nargs=argparse.REMAINDER,
-        help="Prompt args (use `--` before the prompt).",
-    )
-    p_start.set_defaults(func=cmd_start)
+        p_wait = sub.add_parser("wait", help="Wait for a background job finish.json.")
+        p_wait.add_argument("--run-id", required=False, default=None)
+        p_wait.add_argument("--artifacts-dir", required=False, default=None)
+        p_wait.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+        p_wait.add_argument("--poll-interval", type=float, default=0.5)
+        p_wait.set_defaults(func=cmd_wait)
 
-    p_wait = sub.add_parser("wait", help="Wait for a background job finish.json.")
-    p_wait.add_argument("--run-id", required=False, default=None)
-    p_wait.add_argument("--artifacts-dir", required=False, default=None)
-    p_wait.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    p_wait.add_argument("--poll-interval", type=float, default=0.5)
-    p_wait.set_defaults(func=cmd_wait)
+        p_status = sub.add_parser("status", help="Show job status/progress.")
+        p_status.add_argument("--run-id", required=False, default=None)
+        p_status.add_argument("--artifacts-dir", required=False, default=None)
+        p_status.set_defaults(func=cmd_status)
 
-    p_status = sub.add_parser("status", help="Show job status/progress.")
-    p_status.add_argument("--run-id", required=False, default=None)
-    p_status.add_argument("--artifacts-dir", required=False, default=None)
-    p_status.set_defaults(func=cmd_status)
+        p_cancel = sub.add_parser(
+            "cancel", help="Cancel a job by killing worker and aborting session if known."
+        )
+        p_cancel.add_argument("--run-id", required=False, default=None)
+        p_cancel.add_argument("--artifacts-dir", required=False, default=None)
+        p_cancel.add_argument(
+            "--env",
+            action="append",
+            default=[],
+            help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env.",
+        )
+        p_cancel.add_argument(
+            "--env-file",
+            action="append",
+            default=[],
+            help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env-file.",
+        )
+        p_cancel.set_defaults(func=cmd_cancel)
 
-    p_cancel = sub.add_parser(
-        "cancel", help="Cancel a job by killing worker and aborting session if known."
-    )
-    p_cancel.add_argument("--run-id", required=False, default=None)
-    p_cancel.add_argument("--artifacts-dir", required=False, default=None)
-    p_cancel.add_argument(
-        "--env",
-        action="append",
-        default=[],
-        help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env.",
-    )
-    p_cancel.add_argument(
-        "--env-file",
-        action="append",
-        default=[],
-        help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env-file.",
-    )
-    p_cancel.set_defaults(func=cmd_cancel)
+        p_es = sub.add_parser(
+            "ensure-server", help="Ensure a per-project opencode server."
+        )
+        p_es.add_argument("--opencode", default="opencode")
+        p_es.add_argument("--workdir", default=".")
+        p_es.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME)
+        p_es.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
+        p_es.add_argument("--server-wait", type=float, default=DEFAULT_SERVER_WAIT_S)
+        p_es.add_argument("--env", action="append", default=[])
+        p_es.add_argument("--env-file", action="append", default=[])
+        p_es.set_defaults(func=cmd_ensure_server)
 
-    p_es = sub.add_parser("ensure-server", help="Ensure a per-project opencode server.")
-    p_es.add_argument("--opencode", default="opencode")
-    p_es.add_argument("--workdir", default=".")
-    p_es.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME)
-    p_es.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
-    p_es.add_argument("--server-wait", type=float, default=DEFAULT_SERVER_WAIT_S)
-    p_es.add_argument("--env", action="append", default=[])
-    p_es.add_argument("--env-file", action="append", default=[])
-    p_es.set_defaults(func=cmd_ensure_server)
+        p_ss = sub.add_parser("stop-server", help="Stop the per-project opencode server.")
+        p_ss.add_argument("--workdir", default=".")
+        p_ss.set_defaults(func=cmd_stop_server)
 
-    p_ss = sub.add_parser("stop-server", help="Stop the per-project opencode server.")
-    p_ss.add_argument("--workdir", default=".")
-    p_ss.set_defaults(func=cmd_stop_server)
+        p_pc = sub.add_parser(
+            "prune-cache",
+            help="Prune local run artifacts cache (disk). Safe-by-default: dry-run unless --apply.",
+        )
+        p_pc.add_argument(
+            "--keep-last",
+            type=int,
+            default=200,
+            help="Keep the most-recent N run artifact directories (by mtime).",
+        )
+        p_pc.add_argument(
+            "--apply",
+            action="store_true",
+            help="Actually delete; otherwise report-only (dry-run).",
+        )
+        p_pc.set_defaults(func=cmd_prune_cache)
 
-    p_pc = sub.add_parser(
-        "prune-cache",
-        help="Prune local run artifacts cache (disk). Safe-by-default: dry-run unless --apply.",
-    )
-    p_pc.add_argument(
-        "--keep-last",
-        type=int,
-        default=200,
-        help="Keep the most-recent N run artifact directories (by mtime).",
-    )
-    p_pc.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually delete; otherwise report-only (dry-run).",
-    )
-    p_pc.set_defaults(func=cmd_prune_cache)
+        args = parser.parse_args(argv)
 
-    args = parser.parse_args(argv)
+        # Apply deprecated alias: --no-attach => --no-attach-server
+        if hasattr(args, "no_attach_deprecated") and getattr(
+            args, "no_attach_deprecated"
+        ):
+            setattr(args, "attach_server", False)
 
-    # Apply deprecated alias: --no-attach => --no-attach-server
-    if hasattr(args, "no_attach_deprecated") and getattr(args, "no_attach_deprecated"):
-        setattr(args, "attach_server", False)
-
-    return int(args.func(args))  # type: ignore[misc]
+        return int(args.func(args))  # type: ignore[misc]
+    except SystemExit:
+        raise
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        msg = " ".join(str(msg).split())
+        if len(msg) > 1000:
+            msg = msg[:997] + "..."
+        obj = {
+            "type": "opencode-subtask-error",
+            "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "ok": False,
+            "error": {"name": "UnhandledException", "message": msg},
+        }
+        sys.stdout.write(_json_line(obj) + "\n")
+        return 1
 
 
 if __name__ == "__main__":

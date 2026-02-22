@@ -52,16 +52,121 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 text=True,
                 timeout=20,
             )
-            # cancel exits non-zero when it did not actively signal (kill/abort),
-            # but it must still converge by writing a terminal finish.json.
-            self.assertNotEqual(proc.returncode, 0)
+            # Dead worker means "already terminated" for cancel semantics:
+            # cancel should return success and still write terminal finish.json.
+            self.assertEqual(proc.returncode, 0, proc.stdout)
             self.assertTrue(
                 finish_path.exists(), f"finish.json was not written; stdout={proc.stdout!r}"
             )
             fin = json.loads(finish_path.read_text(encoding="utf-8"))
             self.assertEqual(fin.get("type"), "opencode-subtask-finish")
             self.assertIsInstance(fin.get("error"), dict)
-            self.assertEqual(fin["error"].get("name"), "CancelAbortFailed")
+            self.assertEqual(fin["error"].get("name"), "Canceled")
+
+    def test_status_fail_fast_when_finish_unreadable(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_unreadable_status_") as td:
+            artifacts_dir = Path(td)
+            finish_path = artifacts_dir / "finish.json"
+            finish_path.write_text("{not valid json", encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "status",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out.get("type"), "opencode-subtask-status")
+            self.assertEqual((out.get("error") or {}).get("name"), "FinishUnreadable")
+
+    def test_wait_fail_fast_when_finish_unreadable(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_unreadable_wait_") as td:
+            artifacts_dir = Path(td)
+            finish_path = artifacts_dir / "finish.json"
+            finish_path.write_text("{still not valid json", encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "wait",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                    "--timeout",
+                    "60",
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out.get("type"), "opencode-subtask-status")
+            self.assertEqual((out.get("error") or {}).get("name"), "FinishUnreadable")
+
+    def test_cancel_does_not_overwrite_existing_finish(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_no_overwrite_") as td:
+            artifacts_dir = Path(td)
+            job_path = artifacts_dir / "job.json"
+            finish_path = artifacts_dir / "finish.json"
+
+            original = {
+                "type": "opencode-subtask-finish",
+                "schemaVersion": 1,
+                "ok": True,
+                "runId": "existing",
+                "summary": "existing-finish",
+            }
+            finish_path.write_text(json.dumps(original, indent=2), encoding="utf-8")
+            before = finish_path.read_text(encoding="utf-8")
+
+            job = {
+                "runId": "test-run-no-overwrite",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "pid": 2147483647,
+            }
+            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0)
+            after = finish_path.read_text(encoding="utf-8")
+            self.assertEqual(after, before)
 
 
 if __name__ == "__main__":
