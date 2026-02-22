@@ -695,6 +695,7 @@ def _pid_running(pid: int) -> bool:
         out = subprocess.check_output(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
             stderr=subprocess.DEVNULL,
+            timeout=5.0,
         ).decode("utf-8", errors="replace")
         pid_txt = re.escape(str(pid))
         for raw_line in out.splitlines():
@@ -704,6 +705,11 @@ def _pid_running(pid: int) -> bool:
             if re.search(rf'^"[^"]*","{pid_txt}"(?:,|$)', line):
                 return True
         return False
+    except subprocess.TimeoutExpired:
+        # Be conservative: if we cannot reliably query tasklist, assume the PID
+        # is still running (avoids false-negative liveness that could cause
+        # premature finish.json synthesis).
+        return True
     except Exception:
         return False
 
@@ -4068,12 +4074,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         except Exception:
             stop_ok = False
 
-    # Write a terminal cancel finish when we succeeded, or when there is no
-    # remaining signal path. If the worker PID is already gone, there is no
-    # way for a normal finish.json to be produced; always converge here so
-    # upstream wait/status does not hang on timeouts.
+    # Write a terminal cancel finish only when there is no remaining signal
+    # path. If the worker PID is already gone, there is no way for a normal
+    # finish.json to be produced; always converge here so upstream wait/status
+    # does not hang on timeouts.
     no_signal_path = not pid_alive_after_cancel
-    if (ok or no_signal_path) and not finish_path.exists():
+    if no_signal_path and not finish_path.exists():
         if ok:
             cancel_error = {"name": "Canceled", "message": "job canceled by adapter"}
         elif abort_error:
@@ -4116,18 +4122,19 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         )
         _write_json(finish_path, out)
 
-    # Persist cancel telemetry. Mark state=canceled only if cancel actually succeeded.
+    # Persist cancel telemetry.
     if isinstance(job, dict):
         try:
             job2 = dict(job)
             now_ms = _now_ms()
             job2["cancelAttemptedAt"] = now_ms
-            if ok:
-                job2["state"] = "canceled"
-                job2["canceledAt"] = now_ms
-            elif not pid_alive_after_cancel:
-                job2["state"] = "failed"
-                job2["failedAt"] = now_ms
+            if not pid_alive_after_cancel:
+                if ok:
+                    job2["state"] = "canceled"
+                    job2["canceledAt"] = now_ms
+                else:
+                    job2["state"] = "failed"
+                    job2["failedAt"] = now_ms
             job2["updatedAt"] = now_ms
             job2["ok"] = ok
             job2["stopServerAttempted"] = stop_attempted
