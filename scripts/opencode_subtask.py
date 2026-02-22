@@ -4007,17 +4007,20 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         str(job.get("runId") or run_id) if isinstance(job, dict) else str(run_id)
     )
 
-    ok = False
+    kill_attempted = False
+    kill_requested = False
     if pid and _pid_running(pid) and _pid_matches_subtask_worker(
         pid, job_run_id, require_run_id=False
     ):
+        kill_attempted = True
         try:
             _kill_tree(pid)
-            ok = True
+            kill_requested = True
         except Exception:
-            ok = False
+            kill_requested = False
 
     # Best-effort abort session if recorded.
+    abort_ok = False
     abort_error: str | None = None
     if server_url and session_id:
         env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
@@ -4026,13 +4029,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             OpencodeHttpClient(server_url, auth=auth, timeout_s=5.0).abort_checked(
                 session_id, timeout_s=5.0
             )
-            ok = True
+            abort_ok = True
         except Exception as e:
             abort_error = f"{type(e).__name__}: {e}"
             abort_error = " ".join(str(abort_error).split())
             if len(abort_error) > 500:
                 abort_error = abort_error[:497] + "..."
     pid_alive_after_cancel = bool(pid and _pid_running(pid))
+    ok = bool(abort_ok or (kill_attempted and kill_requested and not pid_alive_after_cancel))
 
     # If worker was canceled before normal completion, best-effort apply
     # stop-server-after-run policy to avoid orphaning a freshly-started server.
@@ -4073,7 +4077,6 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         try:
             st = stop_server(wd)
             stop_ok = bool(st.get("ok")) if isinstance(st, dict) else False
-            ok = ok or bool(stop_ok)
         except Exception:
             stop_ok = False
 
