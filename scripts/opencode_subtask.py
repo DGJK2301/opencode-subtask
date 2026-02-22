@@ -1472,15 +1472,21 @@ def reap_orphan_server_for_project(
                     "healthStatus": health_status,
                     "statePath": str(st_path),
                 }
-            try:
-                _kill_tree(pid)
-            except Exception:
-                pass
-            _clear_state()
+            if _kill_tree(pid):
+                _clear_state()
+                return {
+                    "checked": True,
+                    "reaped": True,
+                    "reason": "unhealthy-server",
+                    "url": url,
+                    "pid": pid,
+                    "healthStatus": health_status,
+                    "statePath": str(st_path),
+                }
             return {
                 "checked": True,
-                "reaped": True,
-                "reason": "unhealthy-server",
+                "reaped": False,
+                "reason": "unhealthy-kill-failed",
                 "url": url,
                 "pid": pid,
                 "healthStatus": health_status,
@@ -1537,15 +1543,21 @@ def reap_orphan_server_for_project(
                     "ageS": age_s,
                     "statePath": str(st_path),
                 }
-            try:
-                _kill_tree(pid)
-            except Exception:
-                pass
-            _clear_state()
+            if _kill_tree(pid):
+                _clear_state()
+                return {
+                    "checked": True,
+                    "reaped": True,
+                    "reason": "crashed-owner",
+                    "url": url,
+                    "pid": pid,
+                    "ageS": age_s,
+                    "statePath": str(st_path),
+                }
             return {
                 "checked": True,
-                "reaped": True,
-                "reason": "crashed-owner",
+                "reaped": False,
+                "reason": "crashed-owner-kill-failed",
                 "url": url,
                 "pid": pid,
                 "ageS": age_s,
@@ -1563,15 +1575,21 @@ def reap_orphan_server_for_project(
                     "ageS": age_s,
                     "statePath": str(st_path),
                 }
-            try:
-                _kill_tree(pid)
-            except Exception:
-                pass
-            _clear_state()
+            if _kill_tree(pid):
+                _clear_state()
+                return {
+                    "checked": True,
+                    "reaped": True,
+                    "reason": "idle-timeout",
+                    "url": url,
+                    "pid": pid,
+                    "ageS": age_s,
+                    "statePath": str(st_path),
+                }
             return {
                 "checked": True,
-                "reaped": True,
-                "reason": "idle-timeout",
+                "reaped": False,
+                "reason": "idle-timeout-kill-failed",
                 "url": url,
                 "pid": pid,
                 "ageS": age_s,
@@ -1777,9 +1795,12 @@ def stop_server(workdir: Path) -> dict[str, Any]:
         if pid and _pid_running(pid):
             own = _server_pid_ownership_status(pid, url, expected_exec_token)
             if own == "verified":
-                _kill_tree(pid)
-                ok = True
-                reason = "killed"
+                ok = _kill_tree(pid)
+                if ok:
+                    reason = "killed"
+                else:
+                    kept_state = True
+                    reason = "kill-failed-state-kept"
             elif own == "unknown":
                 reason = "owner-unverified-state-cleared"
             else:
