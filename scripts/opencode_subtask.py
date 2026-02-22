@@ -682,19 +682,24 @@ def _resolve_artifacts_dir(
 # ============================
 
 
-def _pid_running(pid: int) -> bool:
+def _pid_running_state(pid: int) -> tuple[bool, bool]:
+    """
+    Return (is_running, probe_known). probe_known=False means the probe itself
+    was inconclusive (for example, command timeout).
+    """
     if pid <= 0:
-        return False
+        return (False, True)
     if os.name != "nt":
         try:
             os.kill(pid, 0)
-            return True
+            return (True, True)
         except OSError:
-            return False
+            return (False, True)
     try:
         out = subprocess.check_output(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
             stderr=subprocess.DEVNULL,
+            timeout=5.0,
         ).decode("utf-8", errors="replace")
         pid_txt = re.escape(str(pid))
         for raw_line in out.splitlines():
@@ -702,30 +707,51 @@ def _pid_running(pid: int) -> bool:
             if not line or line.upper().startswith("INFO:"):
                 continue
             if re.search(rf'^"[^"]*","{pid_txt}"(?:,|$)', line):
-                return True
-        return False
+                return (True, True)
+        return (False, True)
+    except subprocess.TimeoutExpired:
+        return (False, False)
     except Exception:
-        return False
+        return (False, False)
 
 
-def _kill_tree(pid: int) -> None:
-    if pid <= 0:
-        return
+def _pid_running(pid: int) -> bool:
+    alive, known = _pid_running_state(pid)
+    if known:
+        return alive
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        return
+        # Global conservative default for uncertain Windows probes. Some
+        # call sites (such as cancel latch) handle probe-known separately.
+        return True
+    return alive
+
+
+def _kill_tree(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5.0,
+            )
+            return proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+        except Exception:
+            return False
     try:
         os.killpg(pid, signal.SIGTERM)
+        return True
     except Exception:
         try:
             os.kill(pid, signal.SIGTERM)
+            return True
         except Exception:
-            pass
+            return False
 
 
 def _proc_cmdline(pid: int) -> str:
@@ -744,6 +770,7 @@ def _proc_cmdline(pid: int) -> str:
             out = subprocess.check_output(
                 ["ps", "-p", str(pid), "-o", "command="],
                 stderr=subprocess.DEVNULL,
+                timeout=5.0,
             ).decode("utf-8", errors="replace")
             return out.strip()
         except Exception:
@@ -761,6 +788,7 @@ def _proc_cmdline(pid: int) -> str:
                 "/VALUE",
             ],
             stderr=subprocess.DEVNULL,
+            timeout=5.0,
         ).decode("utf-8", errors="replace")
         if out and ("CommandLine" in out):
             return out
@@ -776,6 +804,7 @@ def _proc_cmdline(pid: int) -> str:
         out = subprocess.check_output(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
             stderr=subprocess.DEVNULL,
+            timeout=5.0,
         ).decode("utf-8", errors="replace")
         return out.strip()
     except Exception:
@@ -1197,6 +1226,11 @@ class OpencodeHttpClient:
         except Exception:
             pass
 
+    def abort_checked(self, session_id: str, *, timeout_s: float = 5.0) -> None:
+        # Same endpoint as abort(), but lets exceptions propagate for callers
+        # that need a reliable success/failure signal.
+        self._request_json("POST", f"/session/{session_id}/abort", {}, timeout_s=timeout_s)
+
     def reply_permission(
         self,
         session_id: str,
@@ -1438,15 +1472,21 @@ def reap_orphan_server_for_project(
                     "healthStatus": health_status,
                     "statePath": str(st_path),
                 }
-            try:
-                _kill_tree(pid)
-            except Exception:
-                pass
-            _clear_state()
+            if _kill_tree(pid):
+                _clear_state()
+                return {
+                    "checked": True,
+                    "reaped": True,
+                    "reason": "unhealthy-server",
+                    "url": url,
+                    "pid": pid,
+                    "healthStatus": health_status,
+                    "statePath": str(st_path),
+                }
             return {
                 "checked": True,
-                "reaped": True,
-                "reason": "unhealthy-server",
+                "reaped": False,
+                "reason": "unhealthy-kill-failed",
                 "url": url,
                 "pid": pid,
                 "healthStatus": health_status,
@@ -1503,15 +1543,21 @@ def reap_orphan_server_for_project(
                     "ageS": age_s,
                     "statePath": str(st_path),
                 }
-            try:
-                _kill_tree(pid)
-            except Exception:
-                pass
-            _clear_state()
+            if _kill_tree(pid):
+                _clear_state()
+                return {
+                    "checked": True,
+                    "reaped": True,
+                    "reason": "crashed-owner",
+                    "url": url,
+                    "pid": pid,
+                    "ageS": age_s,
+                    "statePath": str(st_path),
+                }
             return {
                 "checked": True,
-                "reaped": True,
-                "reason": "crashed-owner",
+                "reaped": False,
+                "reason": "crashed-owner-kill-failed",
                 "url": url,
                 "pid": pid,
                 "ageS": age_s,
@@ -1529,15 +1575,21 @@ def reap_orphan_server_for_project(
                     "ageS": age_s,
                     "statePath": str(st_path),
                 }
-            try:
-                _kill_tree(pid)
-            except Exception:
-                pass
-            _clear_state()
+            if _kill_tree(pid):
+                _clear_state()
+                return {
+                    "checked": True,
+                    "reaped": True,
+                    "reason": "idle-timeout",
+                    "url": url,
+                    "pid": pid,
+                    "ageS": age_s,
+                    "statePath": str(st_path),
+                }
             return {
                 "checked": True,
-                "reaped": True,
-                "reason": "idle-timeout",
+                "reaped": False,
+                "reason": "idle-timeout-kill-failed",
                 "url": url,
                 "pid": pid,
                 "ageS": age_s,
@@ -1743,9 +1795,12 @@ def stop_server(workdir: Path) -> dict[str, Any]:
         if pid and _pid_running(pid):
             own = _server_pid_ownership_status(pid, url, expected_exec_token)
             if own == "verified":
-                _kill_tree(pid)
-                ok = True
-                reason = "killed"
+                ok = _kill_tree(pid)
+                if ok:
+                    reason = "killed"
+                else:
+                    kept_state = True
+                    reason = "kill-failed-state-kept"
             elif own == "unknown":
                 reason = "owner-unverified-state-cleared"
             else:
@@ -3989,26 +4044,38 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         str(job.get("runId") or run_id) if isinstance(job, dict) else str(run_id)
     )
 
-    ok = False
+    kill_attempted = False
+    kill_signal_delivered = False
     if pid and _pid_running(pid) and _pid_matches_subtask_worker(
         pid, job_run_id, require_run_id=False
     ):
-        try:
-            _kill_tree(pid)
-            ok = True
-        except Exception:
-            ok = False
+        kill_attempted = True
+        kill_signal_delivered = _kill_tree(pid)
 
     # Best-effort abort session if recorded.
+    abort_ok = False
+    abort_error: str | None = None
     if server_url and session_id:
         env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
         auth = _get_http_auth_from_env(env)
         try:
-            OpencodeHttpClient(server_url, auth=auth, timeout_s=5.0).abort(session_id)
-            ok = True
-        except Exception:
-            pass
-    pid_alive_after_cancel = bool(pid and _pid_running(pid))
+            OpencodeHttpClient(server_url, auth=auth, timeout_s=5.0).abort_checked(
+                session_id, timeout_s=5.0
+            )
+            abort_ok = True
+        except Exception as e:
+            abort_error = f"{type(e).__name__}: {e}"
+            abort_error = " ".join(str(abort_error).split())
+            if len(abort_error) > 500:
+                abort_error = abort_error[:497] + "..."
+    pid_alive_after_cancel = False
+    if pid:
+        pid_alive_probe, probe_known_after_cancel = _pid_running_state(pid)
+        # Keep conservative behavior for state transitions when probe is unknown.
+        pid_alive_after_cancel = pid_alive_probe if probe_known_after_cancel else True
+    # Treat successful signal delivery as a successful cancel request even if
+    # the process has not exited yet at this immediate probe.
+    ok = bool(abort_ok or (kill_attempted and kill_signal_delivered))
 
     # If worker was canceled before normal completion, best-effort apply
     # stop-server-after-run policy to avoid orphaning a freshly-started server.
@@ -4049,14 +4116,26 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         try:
             st = stop_server(wd)
             stop_ok = bool(st.get("ok")) if isinstance(st, dict) else False
-            ok = ok or bool(stop_ok)
         except Exception:
             stop_ok = False
 
-    # Write a terminal cancel finish when we succeeded, or when there is no
-    # remaining signal path (e.g., queued run with no pid/session).
-    no_signal_path = (not pid_alive_after_cancel) and (not (server_url and session_id))
+    # Write a terminal cancel finish when cancel succeeded, or when there is no
+    # remaining signal path because worker liveness is confirmed dead.
+    # Probe-unknown must not be treated as dead here.
+    no_signal_path = not pid_alive_after_cancel
     if (ok or no_signal_path) and not finish_path.exists():
+        if ok:
+            cancel_error = {"name": "Canceled", "message": "job canceled by adapter"}
+        elif abort_error:
+            cancel_error = {
+                "name": "CancelAbortFailed",
+                "message": f"worker not running; session abort failed: {abort_error}",
+            }
+        else:
+            cancel_error = {
+                "name": "CancelNoActiveWorker",
+                "message": "cancel requested but no active worker process remained",
+            }
         out = _finish_obj(
             ok=False,
             exit_code=130 if ok else 1,
@@ -4081,31 +4160,25 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 "finishPath": finish_path.name,
             },
             metrics=None,
-            error=(
-                {"name": "Canceled", "message": "job canceled by adapter"}
-                if ok
-                else {
-                    "name": "CancelNoActiveWorker",
-                    "message": "cancel requested but no active worker process remained",
-                }
-            ),
+            error=cancel_error,
             include_debug=False,
             debug=None,
         )
         _write_json(finish_path, out)
 
-    # Persist cancel telemetry. Mark state=canceled only if cancel actually succeeded.
+    # Persist cancel telemetry.
     if isinstance(job, dict):
         try:
             job2 = dict(job)
             now_ms = _now_ms()
             job2["cancelAttemptedAt"] = now_ms
-            if ok:
-                job2["state"] = "canceled"
-                job2["canceledAt"] = now_ms
-            elif not pid_alive_after_cancel:
-                job2["state"] = "failed"
-                job2["failedAt"] = now_ms
+            if not pid_alive_after_cancel:
+                if ok:
+                    job2["state"] = "canceled"
+                    job2["canceledAt"] = now_ms
+                else:
+                    job2["state"] = "failed"
+                    job2["failedAt"] = now_ms
             job2["updatedAt"] = now_ms
             job2["ok"] = ok
             job2["stopServerAttempted"] = stop_attempted
