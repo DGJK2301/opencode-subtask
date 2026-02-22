@@ -4087,7 +4087,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     # finish.json to be produced; always converge here so upstream wait/status
     # does not hang on timeouts.
     no_signal_path = not pid_alive_after_cancel
-    if no_signal_path and not finish_path.exists():
+    if (ok or no_signal_path) and not finish_path.exists():
         if ok:
             cancel_error = {"name": "Canceled", "message": "job canceled by adapter"}
         elif abort_error:
