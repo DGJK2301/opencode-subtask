@@ -94,6 +94,15 @@ def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> Never
     sys.exit(exit_code)
 
 
+class _JsonArgumentParser(argparse.ArgumentParser):
+    """
+    ArgumentParser that preserves adapter stdout JSON contract on CLI parse errors.
+    """
+
+    def error(self, message: str) -> Never:  # pragma: no cover - thin adapter
+        _exit_with_error("BadArgs", message, exit_code=2)
+
+
 def _first_nonempty_line(s: str) -> str:
     # Be robust against BOM/zero-width characters that can appear when prompts
     # come from files/CLIs. These can otherwise break the "Act as ..." detector.
@@ -3714,7 +3723,10 @@ def _maybe_finalize_stale_running_job(
     cancel_attempted_ms = _job_ms(job, "cancelAttemptedAt")
     if cancel_attempted_ms <= 0:
         return None
-    if idle_s is None or idle_s < stale_idle_s:
+    # If no progress files exist yet, use job touch age as a conservative
+    # silence signal so canceled runs can still converge to a terminal finish.
+    silence_s = idle_s if idle_s is not None else age_since_touch_s
+    if silence_s < stale_idle_s:
         return None
     cancel_age_s = max(0.0, (float(now_ms) - float(cancel_attempted_ms)) / 1000.0)
     if cancel_age_s < cancel_stuck_grace_s:
@@ -4477,7 +4489,7 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
 
-    parser = argparse.ArgumentParser(prog="opencode_subtask.py")
+    parser = _JsonArgumentParser(prog="opencode_subtask.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="Run a subtask (foreground).")
