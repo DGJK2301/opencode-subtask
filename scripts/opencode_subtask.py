@@ -4048,11 +4048,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             if len(abort_error) > 500:
                 abort_error = abort_error[:497] + "..."
     pid_alive_after_cancel = False
-    pid_probe_known_after_cancel = True
     if pid:
-        pid_alive_probe, pid_probe_known_after_cancel = _pid_running_state(pid)
+        pid_alive_probe, probe_known_after_cancel = _pid_running_state(pid)
         # Keep conservative behavior for state transitions when probe is unknown.
-        pid_alive_after_cancel = pid_alive_probe if pid_probe_known_after_cancel else True
+        pid_alive_after_cancel = pid_alive_probe if probe_known_after_cancel else True
     # Treat successful signal delivery as a successful cancel request even if
     # the process has not exited yet at this immediate probe.
     ok = bool(abort_ok or (kill_attempted and kill_signal_delivered))
@@ -4099,13 +4098,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         except Exception:
             stop_ok = False
 
-    # Write a terminal cancel finish only when there is no remaining signal
-    # path. If the worker PID is already gone, there is no way for a normal
-    # finish.json to be produced; always converge here so upstream wait/status
-    # does not hang on timeouts.
-    # If liveness probe itself is unknown, do not block terminal finish latch.
-    # That prevents long wait/status hangs after cancel on Windows probe timeouts.
-    no_signal_path = (not pid_alive_after_cancel) or (not pid_probe_known_after_cancel)
+    # Write a terminal cancel finish when cancel succeeded, or when there is no
+    # remaining signal path because worker liveness is confirmed dead.
+    # Probe-unknown must not be treated as dead here.
+    no_signal_path = not pid_alive_after_cancel
     if (ok or no_signal_path) and not finish_path.exists():
         if ok:
             cancel_error = {"name": "Canceled", "message": "job canceled by adapter"}
