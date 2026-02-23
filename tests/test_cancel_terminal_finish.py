@@ -1,7 +1,10 @@
+import http.server
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -120,6 +123,78 @@ class TestCancelTerminalFinish(unittest.TestCase):
             out = json.loads(proc.stdout)
             self.assertEqual(out.get("type"), "opencode-subtask-status")
             self.assertEqual((out.get("error") or {}).get("name"), "FinishUnreadable")
+
+    def test_cancel_succeeds_when_abort_succeeds_with_stale_pid(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        class _AbortHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                if self.path == "/session/ses_test/abort":
+                    body = b"{}"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_error(404)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _AbortHandler)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory(prefix="ocsubtask_test_abort_ok_") as td:
+                artifacts_dir = Path(td)
+                job_path = artifacts_dir / "job.json"
+                finish_path = artifacts_dir / "finish.json"
+                job = {
+                    "runId": "test-run-abort-ok",
+                    "workdir": str(repo_root),
+                    "state": "running",
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    # Positive, live PID that is not this adapter worker.
+                    "pid": os.getpid(),
+                    "serverUrl": f"http://127.0.0.1:{srv.server_port}",
+                    "sessionId": "ses_test",
+                    "httpAttempted": True,
+                    "serverStartedNew": False,
+                    "stopServerAfterRunMode": "never",
+                }
+                job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(script),
+                        "cancel",
+                        "--artifacts-dir",
+                        str(artifacts_dir),
+                    ],
+                    cwd=str(repo_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout)
+                out = json.loads(proc.stdout)
+                self.assertTrue(out.get("ok"))
+                self.assertTrue(
+                    finish_path.exists(),
+                    f"finish.json was not written; stdout={proc.stdout!r}",
+                )
+                fin = json.loads(finish_path.read_text(encoding="utf-8"))
+                self.assertEqual(fin.get("type"), "opencode-subtask-finish")
+                self.assertEqual((fin.get("error") or {}).get("name"), "Canceled")
+        finally:
+            srv.shutdown()
+            th.join(timeout=5)
+            srv.server_close()
 
     def test_cancel_does_not_overwrite_existing_finish(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

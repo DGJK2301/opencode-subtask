@@ -4265,7 +4265,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             if len(abort_error) > 500:
                 abort_error = abort_error[:497] + "..."
     if pid > 0:
-        ok = bool(termination_confirmed)
+        # Treat either local worker termination OR successful remote session abort
+        # as a successful cancel outcome.
+        ok = bool(termination_confirmed or abort_ok)
     else:
         ok = bool(abort_ok)
 
