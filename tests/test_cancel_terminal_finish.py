@@ -15,10 +15,16 @@ class TestCancelTerminalFinish(unittest.TestCase):
     @staticmethod
     def _load_adapter_module(repo_root: Path):
         script = repo_root / "scripts" / "opencode_subtask.py"
-        spec = importlib.util.spec_from_file_location("opencode_subtask_module", script)
+        module_name = "opencode_subtask_module"
+        spec = importlib.util.spec_from_file_location(module_name, script)
         assert spec and spec.loader
         mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        sys.modules[module_name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
         return mod
 
     def test_cancel_writes_finish_when_worker_dead_and_abort_fails(self) -> None:
