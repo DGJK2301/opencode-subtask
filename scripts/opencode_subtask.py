@@ -3209,9 +3209,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 include_debug=args.include_debug,
                 debug=None,
             )
-            _write_finish_once(
+            finish_written, _, existing_finish = _write_finish_once(
                 artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
             )
+            if (not finish_written) and isinstance(existing_finish, dict):
+                out = existing_finish
+                final_ok = bool(out.get("ok") is True)
+                sys.stdout.write(_json_line(out) + "\n")
+                return 0 if final_ok else 1
             sys.stdout.write(_json_line(out) + "\n")
             return 127
 

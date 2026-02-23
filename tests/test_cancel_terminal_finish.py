@@ -243,6 +243,55 @@ class TestCancelTerminalFinish(unittest.TestCase):
             after = finish_path.read_text(encoding="utf-8")
             self.assertEqual(after, before)
 
+    def test_run_reuses_existing_finish_when_opencode_not_found(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_run_reuse_finish_") as td:
+            artifacts_dir = Path(td)
+            finish_path = artifacts_dir / "finish.json"
+            existing = {
+                "type": "opencode-subtask-finish",
+                "schemaVersion": 1,
+                "ok": True,
+                "runId": "reuse-run",
+                "summary": "already-finished",
+            }
+            finish_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+            before = finish_path.read_text(encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "run",
+                    "--workdir",
+                    str(repo_root),
+                    "--engine",
+                    "cli",
+                    "--run-id",
+                    "reuse-run",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                    "--opencode",
+                    "__definitely_missing_opencode_bin__",
+                    "--prompt",
+                    "Act as a senior software engineer.",
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out.get("type"), "opencode-subtask-finish")
+            self.assertEqual(out.get("runId"), "reuse-run")
+            self.assertTrue(out.get("ok"))
+            after = finish_path.read_text(encoding="utf-8")
+            self.assertEqual(after, before)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
