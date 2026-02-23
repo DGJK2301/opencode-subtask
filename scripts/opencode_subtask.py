@@ -1780,6 +1780,21 @@ def _finish_unreadable_error() -> dict[str, str]:
     }
 
 
+def _server_lock_timeout_s(wait_s: float | None = None) -> float:
+    base = float(DEFAULT_FILE_LOCK_TIMEOUT_S)
+    if wait_s is None:
+        return base
+    try:
+        w = float(wait_s)
+    except Exception:
+        return base
+    if w < 0:
+        w = 0.0
+    # Keep lock timeout aligned with startup health wait to avoid false timeout
+    # failures during legitimate concurrent ensure/attach calls.
+    return max(base, w + 5.0)
+
+
 def ensure_server(
     *,
     opencode_bin: str,
@@ -1794,7 +1809,7 @@ def ensure_server(
     log_path = _server_log_path(workdir)
     lock_path = _server_lock_path(workdir)
 
-    with _FileLock(lock_path):
+    with _FileLock(lock_path, timeout_s=_server_lock_timeout_s(wait_s)):
         st = _load_json(st_path) or {}
         if isinstance(st, dict) and isinstance(st.get("url"), str):
             url = str(st["url"])
@@ -1887,6 +1902,7 @@ def attach_existing_server(
     *,
     workdir: Path,
     auth: HttpAuth | None,
+    wait_s: float | None = None,
 ) -> dict[str, Any] | None:
     """
     Attach to an already-running per-project server if we have state and it is healthy.
@@ -1894,7 +1910,7 @@ def attach_existing_server(
     """
     st_path = _server_state_path(workdir)
     lock_path = _server_lock_path(workdir)
-    with _FileLock(lock_path):
+    with _FileLock(lock_path, timeout_s=_server_lock_timeout_s(wait_s)):
         st = _load_json(st_path) or {}
         if not (isinstance(st, dict) and isinstance(st.get("url"), str)):
             return None
@@ -3231,7 +3247,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 # Prefer reusing an already-running healthy server (if any) to avoid
                 # spawning multiple per-project servers and to make "stop-after-run"
                 # safe (we only stop servers that we started in this invocation).
-                server_state = attach_existing_server(workdir=workdir, auth=auth)
+                server_state = attach_existing_server(
+                    workdir=workdir, auth=auth, wait_s=float(args.server_wait)
+                )
                 if server_state:
                     attach_url = str(server_state.get("url"))
                     server_started_new = False
@@ -3253,7 +3271,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 attach_url = None
         elif args.engine == "auto":
             try:
-                server_state = attach_existing_server(workdir=workdir, auth=auth)
+                server_state = attach_existing_server(
+                    workdir=workdir, auth=auth, wait_s=float(args.server_wait)
+                )
                 if server_state:
                     attach_url = str(server_state.get("url"))
                     server_started_new = False
@@ -4201,6 +4221,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     kill_attempted = False
     kill_signal_delivered = False
+    probe_inconclusive_after_kill = False
     termination_confirmed = False
     termination_evidence = "unknown"
     worker_ownership = "not_checked"
@@ -4247,6 +4268,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                     if kill_sent and _wait_for_pid_dead(pid, DEFAULT_CANCEL_KILL_GRACE_S):
                         termination_confirmed = True
                         termination_evidence = "pid_dead"
+                if kill_attempted and (not termination_confirmed):
+                    alive_after, known_after = _pid_running_state(pid)
+                    if known_after:
+                        if not alive_after:
+                            termination_confirmed = True
+                            termination_evidence = "pid_dead"
+                    else:
+                        probe_inconclusive_after_kill = True
+                        if termination_evidence == "unknown":
+                            termination_evidence = "probe_unknown_after_kill"
             else:
                 if worker_ownership == "unknown":
                     termination_evidence = "owner_unknown_no_kill"
@@ -4272,7 +4303,15 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     if pid > 0:
         # Treat either local worker termination OR successful remote session abort
         # as a successful cancel outcome.
-        ok = bool(termination_confirmed or abort_ok)
+        ok = bool(
+            termination_confirmed
+            or abort_ok
+            or (
+                kill_attempted
+                and kill_signal_delivered
+                and probe_inconclusive_after_kill
+            )
+        )
     else:
         ok = bool(abort_ok)
 
@@ -4380,14 +4419,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             "allowUnknownOwnershipKill": allow_unknown_kill,
             "cancelPhase": cancel_phase,
             "killSignalDelivered": kill_signal_delivered,
+            "probeInconclusiveAfterKill": probe_inconclusive_after_kill,
         }
-        if no_signal_path:
-            if ok:
-                fields["state"] = "canceled"
-                fields["canceledAt"] = now_ms
-            else:
-                fields["state"] = "failed"
-                fields["failedAt"] = now_ms
+        if ok:
+            fields["state"] = "canceled"
+            fields["canceledAt"] = now_ms
+        elif no_signal_path:
+            fields["state"] = "failed"
+            fields["failedAt"] = now_ms
         _update_job_fields_locked(job_path, artifacts_dir, fields)
 
     out2 = {
@@ -4404,6 +4443,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "allowUnknownOwnershipKill": allow_unknown_kill,
         "cancelPhase": cancel_phase,
         "killSignalDelivered": kill_signal_delivered,
+        "probeInconclusiveAfterKill": probe_inconclusive_after_kill,
         "stopServerAttempted": stop_attempted,
         "stopServerOk": stop_ok,
     }

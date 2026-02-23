@@ -1,4 +1,6 @@
+import argparse
 import http.server
+import importlib.util
 import json
 import os
 import subprocess
@@ -10,6 +12,15 @@ from pathlib import Path
 
 
 class TestCancelTerminalFinish(unittest.TestCase):
+    @staticmethod
+    def _load_adapter_module(repo_root: Path):
+        script = repo_root / "scripts" / "opencode_subtask.py"
+        spec = importlib.util.spec_from_file_location("opencode_subtask_module", script)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
     def test_cancel_writes_finish_when_worker_dead_and_abort_fails(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         script = repo_root / "scripts" / "opencode_subtask.py"
@@ -291,6 +302,72 @@ class TestCancelTerminalFinish(unittest.TestCase):
             self.assertTrue(out.get("ok"))
             after = finish_path.read_text(encoding="utf-8")
             self.assertEqual(after, before)
+
+    def test_server_lock_timeout_scales_with_wait(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        base = float(mod.DEFAULT_FILE_LOCK_TIMEOUT_S)
+        self.assertEqual(mod._server_lock_timeout_s(None), base)
+        self.assertGreaterEqual(mod._server_lock_timeout_s(60.0), 65.0)
+        self.assertEqual(mod._server_lock_timeout_s(-5.0), base)
+
+    def test_cancel_treats_kill_signal_as_success_when_probe_inconclusive(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_probe_unknown_") as td:
+            artifacts_dir = Path(td)
+            (artifacts_dir / "job.json").write_text(
+                json.dumps(
+                    {
+                        "runId": "probe-unknown",
+                        "workdir": str(repo_root),
+                        "state": "running",
+                        "createdAt": 1,
+                        "updatedAt": 1,
+                        "pid": 12345,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            call_idx = {"n": 0}
+
+            def fake_pid_running_state(pid: int):
+                call_idx["n"] += 1
+                if call_idx["n"] == 1:
+                    return (True, True)  # alive before cancel
+                return (False, False)  # probe inconclusive after kill
+
+            orig_pid_running_state = mod._pid_running_state
+            orig_pid_owner = mod._pid_subtask_worker_ownership_status
+            orig_kill_tree = mod._kill_tree
+            orig_wait_dead = mod._wait_for_pid_dead
+            try:
+                mod._pid_running_state = fake_pid_running_state
+                mod._pid_subtask_worker_ownership_status = (
+                    lambda pid, run_id, require_run_id=False: "verified"
+                )
+                mod._kill_tree = lambda pid, sig=None: True
+                mod._wait_for_pid_dead = lambda pid, timeout_s, poll_s=0.1: False
+
+                rc = mod.cmd_cancel(
+                    argparse.Namespace(
+                        run_id=None,
+                        artifacts_dir=str(artifacts_dir),
+                        env=[],
+                        env_file=[],
+                    )
+                )
+                self.assertEqual(rc, 0)
+                fin = json.loads((artifacts_dir / "finish.json").read_text(encoding="utf-8"))
+                self.assertEqual((fin.get("error") or {}).get("name"), "Canceled")
+            finally:
+                mod._pid_running_state = orig_pid_running_state
+                mod._pid_subtask_worker_ownership_status = orig_pid_owner
+                mod._kill_tree = orig_kill_tree
+                mod._wait_for_pid_dead = orig_wait_dead
 
 
 if __name__ == "__main__":
