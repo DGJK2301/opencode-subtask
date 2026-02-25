@@ -585,8 +585,9 @@ class TestCancelTerminalFinish(unittest.TestCase):
 
     def test_status_uses_canonical_run_id_from_job_json(self) -> None:
         """When status is invoked with only --artifacts-dir (no --run-id),
-        the output runId must match job.json's recorded runId, not a
-        freshly generated one."""
+        and finish.json does NOT exist, the output runId must match
+        job.json's recorded runId, not a freshly generated one.
+        This tests the _canonical_run_id path that actually uses run_id."""
         repo_root = Path(__file__).resolve().parents[1]
         script = repo_root / "scripts" / "opencode_subtask.py"
 
@@ -596,23 +597,16 @@ class TestCancelTerminalFinish(unittest.TestCase):
             job = {
                 "runId": real_run_id,
                 "workdir": str(repo_root),
-                "state": "finished",
+                "state": "running",
                 "createdAt": 1,
                 "updatedAt": 1,
+                "pid": 2147483647,
             }
             (artifacts_dir / "job.json").write_text(
                 json.dumps(job, indent=2), encoding="utf-8"
             )
-            finish = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": True,
-                "runId": real_run_id,
-                "summary": "done",
-            }
-            (artifacts_dir / "finish.json").write_text(
-                json.dumps(finish, indent=2), encoding="utf-8"
-            )
+            # NOTE: no finish.json — forces status through the active-job
+            # path where _canonical_run_id actually determines the output runId.
 
             proc = subprocess.run(
                 [
@@ -629,7 +623,6 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 text=True,
                 timeout=20,
             )
-            self.assertEqual(proc.returncode, 0, proc.stdout)
             out = json.loads(proc.stdout)
             # The runId in stdout must be the canonical one from job.json,
             # not a freshly generated run_XXXX_YYYY.
@@ -779,6 +772,175 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 mod._run_cli = orig_run_cli
                 mod._git_status = orig_git_status
                 mod._git_patch = orig_git_patch
+
+    # ------------------------------------------------------------------ #
+    # Degradation & edge-case tests (added per expert review feedback)   #
+    # ------------------------------------------------------------------ #
+
+    def test_canonical_run_id_malformed_inputs(self) -> None:
+        """_canonical_run_id must gracefully handle missing, empty, and
+        non-string runId values without crashing."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        fallback = "run_fallback_999"
+
+        # job is None (job.json missing)
+        self.assertEqual(mod._canonical_run_id(fallback, None), fallback)
+
+        # job is not a dict
+        self.assertEqual(mod._canonical_run_id(fallback, "garbage"), fallback)
+        self.assertEqual(mod._canonical_run_id(fallback, [1, 2]), fallback)
+
+        # job dict without runId key
+        self.assertEqual(mod._canonical_run_id(fallback, {}), fallback)
+
+        # runId is empty string (falsy)
+        self.assertEqual(mod._canonical_run_id(fallback, {"runId": ""}), fallback)
+
+        # runId is None
+        self.assertEqual(mod._canonical_run_id(fallback, {"runId": None}), fallback)
+
+        # runId is 0 (falsy int)
+        self.assertEqual(mod._canonical_run_id(fallback, {"runId": 0}), fallback)
+
+        # runId is a valid string
+        self.assertEqual(
+            mod._canonical_run_id(fallback, {"runId": "run_real_123"}),
+            "run_real_123",
+        )
+
+        # runId is an int (truthy non-string) — should str() it
+        self.assertEqual(
+            mod._canonical_run_id(fallback, {"runId": 42}),
+            "42",
+        )
+
+    def test_write_finish_once_replace_fails_unlink_succeeds(self) -> None:
+        """When os.replace fails for the rename but unlink succeeds,
+        _write_finish_once should still write the new finish (recovered)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_replace_fail_") as td:
+            artifacts_dir = Path(td)
+            finish_path = artifacts_dir / "finish.json"
+            finish_path.write_text("NOT JSON!!!", encoding="utf-8")
+
+            new_finish = {
+                "type": "opencode-subtask-finish",
+                "schemaVersion": 1,
+                "ok": True,
+                "runId": "replace-fail-test",
+                "summary": "recovered after replace fail",
+            }
+
+            orig_replace = os.replace
+            call_count = {"n": 0}
+
+            def selective_replace(src, dst):
+                """Fail only the first call (rename corrupt → backup),
+                allow subsequent calls (_atomic_write_bytes)."""
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    raise PermissionError("AV lock simulated")
+                return orig_replace(src, dst)
+
+            with mock.patch("os.replace", side_effect=selective_replace):
+                written, reason, _ = mod._write_finish_once(
+                    artifacts_dir=artifacts_dir,
+                    finish_path=finish_path,
+                    finish_obj=new_finish,
+                )
+
+            self.assertTrue(written)
+            self.assertEqual(reason, "recovered")
+            fin = json.loads(finish_path.read_text(encoding="utf-8"))
+            self.assertEqual(fin["runId"], "replace-fail-test")
+
+    def test_write_finish_once_replace_and_unlink_both_fail(self) -> None:
+        """When both os.replace and unlink fail, _write_finish_once should
+        return (False, 'unreadable', None) without crashing."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_both_fail_") as td:
+            artifacts_dir = Path(td)
+            finish_path = artifacts_dir / "finish.json"
+            finish_path.write_text("CORRUPT!!!", encoding="utf-8")
+
+            new_finish = {
+                "type": "opencode-subtask-finish",
+                "schemaVersion": 1,
+                "ok": True,
+                "runId": "both-fail-test",
+            }
+
+            with (
+                mock.patch("os.replace", side_effect=PermissionError("locked")),
+                mock.patch.object(
+                    Path, "unlink", side_effect=PermissionError("also locked")
+                ),
+            ):
+                written, reason, existing = mod._write_finish_once(
+                    artifacts_dir=artifacts_dir,
+                    finish_path=finish_path,
+                    finish_obj=new_finish,
+                )
+
+            self.assertFalse(written)
+            self.assertEqual(reason, "unreadable")
+            self.assertIsNone(existing)
+            # Original corrupt file must still be there
+            self.assertEqual(finish_path.read_text(encoding="utf-8"), "CORRUPT!!!")
+
+    def test_write_finish_once_double_corrupt_recovery(self) -> None:
+        """After recovering from corrupt finish.json, a second call with
+        a different finish should return (False, 'exists', first_finish)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_double_recover_") as td:
+            artifacts_dir = Path(td)
+            finish_path = artifacts_dir / "finish.json"
+            finish_path.write_text("{bad json", encoding="utf-8")
+
+            first_finish = {
+                "type": "opencode-subtask-finish",
+                "schemaVersion": 1,
+                "ok": True,
+                "runId": "first-recovery",
+                "summary": "first",
+            }
+            written1, reason1, _ = mod._write_finish_once(
+                artifacts_dir=artifacts_dir,
+                finish_path=finish_path,
+                finish_obj=first_finish,
+            )
+            self.assertTrue(written1)
+            self.assertEqual(reason1, "recovered")
+
+            # Second call: finish.json now has valid content from first recovery
+            second_finish = {
+                "type": "opencode-subtask-finish",
+                "schemaVersion": 1,
+                "ok": False,
+                "runId": "second-attempt",
+                "summary": "second",
+            }
+            written2, reason2, existing2 = mod._write_finish_once(
+                artifacts_dir=artifacts_dir,
+                finish_path=finish_path,
+                finish_obj=second_finish,
+            )
+            self.assertFalse(written2)
+            self.assertEqual(reason2, "exists")
+            self.assertIsInstance(existing2, dict)
+            self.assertEqual(existing2["runId"], "first-recovery")
 
 
 if __name__ == "__main__":

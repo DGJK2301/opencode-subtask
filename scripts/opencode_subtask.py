@@ -1784,7 +1784,10 @@ def _write_finish_once(
                     finish_path.unlink()
                 except Exception:
                     return False, "unreadable", None
-            _write_json(finish_path, finish_obj)
+            try:
+                _write_json(finish_path, finish_obj)
+            except Exception:
+                return False, "write_failed", None
             return True, "recovered", None
         _write_json(finish_path, finish_obj)
         return True, "written", None
@@ -4582,6 +4585,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     # Write terminal cancel finish when cancel is confirmed or there is no local
     # worker signal path left.
+    cancel_fin_written = False
+    cancel_fin_reason = "skipped"
     no_signal_path = bool((pid <= 0) or termination_confirmed)
     if ok or no_signal_path:
         if ok:
@@ -4653,6 +4658,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             "killSignalDelivered": kill_signal_delivered,
             "probeInconclusiveAfterKill": probe_inconclusive_after_kill,
             "cancelUnverified": cancel_unverified,
+            "cancelFinWritten": cancel_fin_written,
+            "cancelFinReason": cancel_fin_reason,
         }
         if ok:
             fields["state"] = "canceled"
