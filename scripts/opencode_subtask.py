@@ -694,6 +694,19 @@ def _resolve_artifacts_dir(
     return rid, ad
 
 
+def _canonical_run_id(run_id: str, job: Any) -> str:
+    """Return the authoritative run_id: prefer job.json's recorded runId.
+
+    When status/wait/cancel are invoked with only ``--artifacts-dir`` (no
+    ``--run-id``), :func:`_resolve_artifacts_dir` generates a fresh run_id
+    that won't match the real worker's ID stored in job.json.  This helper
+    resolves the discrepancy by preferring the job-recorded value.
+    """
+    if isinstance(job, dict) and job.get("runId"):
+        return str(job["runId"])
+    return run_id
+
+
 # ============================
 # Process helpers
 # ============================
@@ -1759,7 +1772,20 @@ def _write_finish_once(
             existing = _load_json(finish_path)
             if isinstance(existing, dict):
                 return False, "exists", existing
-            return False, "unreadable", None
+            # Corrupt/unreadable: rename to preserve forensic evidence,
+            # then write the new finish so the system converges to a
+            # terminal state instead of being stuck forever.
+            corrupt_name = f"finish.corrupt.{_now_ms()}.json"
+            corrupt_path = artifacts_dir / corrupt_name
+            try:
+                os.replace(finish_path, corrupt_path)
+            except Exception:
+                try:
+                    finish_path.unlink()
+                except Exception:
+                    return False, "unreadable", None
+            _write_json(finish_path, finish_obj)
+            return True, "recovered", None
         _write_json(finish_path, finish_obj)
         return True, "written", None
 
@@ -3192,7 +3218,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     events_path = artifacts_dir / "events.ndjson" if args.save_events else None
     assistant_path = artifacts_dir / "assistant.txt" if args.save_text else None
     stderr_path = artifacts_dir / "stderr.log"
-    wrapper_log_path = artifacts_dir / "wrapper.log" if args.wrapper_log else None
+    # wrapper.log is only meaningful in start (background) mode;
+    # in foreground run mode there is no wrapper process.
+    wrapper_log_path = None
 
     # Job init
     job_obj = {
@@ -4063,6 +4091,8 @@ def _maybe_finalize_stale_running_job(
 ) -> dict[str, Any] | None:
     if finish_path.exists():
         return None
+    # Defensive: canonicalize run_id from job in case callers forgot.
+    run_id = _canonical_run_id(run_id, job)
     state = str(job.get("state") or "").strip().lower()
     if state and state not in ("running", "queued", "canceled", "cancelled", "failed"):
         return None
@@ -4137,6 +4167,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
     prompt_path = artifacts_dir / "prompt.txt"
+
+    # Canonicalize run_id: prefer the real runId recorded in job.json
+    # over the potentially freshly-generated one from _resolve_artifacts_dir.
+    _pre_job = _load_json(job_path)
+    run_id = _canonical_run_id(run_id, _pre_job)
 
     if finish_path.exists():
         fin = _load_json(finish_path)
@@ -4261,6 +4296,10 @@ def cmd_wait(args: argparse.Namespace) -> int:
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
 
+    # Canonicalize run_id from job.json (see _canonical_run_id).
+    _pre_job = _load_json(job_path)
+    run_id = _canonical_run_id(run_id, _pre_job)
+
     if not job_path.exists() and not finish_path.exists():
         out = _status_obj(
             run_id=run_id,
@@ -4368,6 +4407,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     finish_path = artifacts_dir / "finish.json"
 
     job = _load_json(job_path) or {}
+    run_id = _canonical_run_id(run_id, job)
     pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
     server_url = (
         str(job.get("serverUrl"))
@@ -4392,9 +4432,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
     stop_attempted = False
     stop_ok: bool | None = None
-    job_run_id = (
-        str(job.get("runId") or run_id) if isinstance(job, dict) else str(run_id)
-    )
+    # run_id is already canonical (set via _canonical_run_id above).
+    job_run_id = run_id
 
     kill_attempted = False
     kill_signal_delivered = False
@@ -4594,7 +4633,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             include_debug=False,
             debug=None,
         )
-        _write_finish_once(
+        cancel_fin_written, cancel_fin_reason, _ = _write_finish_once(
             artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
         )
 

@@ -435,19 +435,19 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 
 **Note:** `resultDigest` is a raw SHA-256 hex string (no `sha256:` prefix).
 
-## Artifacts (always on disk)
+## Artifacts (on disk)
 
-| File | Description |
-|------|-------------|
-| `prompt.txt` | Effective prompt (with contract appended) |
-| `events.ndjson` | Full event stream (CLI NDJSON or HTTP SSE→NDJSON) |
-| `assistant.txt` | Full assistant transcript |
-| `stderr.log` | CLI stderr or HTTP errors |
-| `result.json` | Adapter-extracted structured result |
-| `changes.patch` | git diff for tracked changes |
-| `job.json` | Job state for status/wait/cancel |
-| `finish.json` | Final stable result (same as stdout) |
-| `wrapper.log` | Background worker output (start mode) |
+| File | Condition | Description |
+|------|-----------|-------------|
+| `prompt.txt` | always | Effective prompt (with contract appended) |
+| `job.json` | always | Job state for status/wait/cancel |
+| `finish.json` | always | Final stable result (same as stdout) |
+| `stderr.log` | always | CLI stderr or HTTP errors |
+| `result.json` | always | Adapter-extracted structured result |
+| `events.ndjson` | `--save-events` (profile-dependent) | Full event stream (CLI NDJSON or HTTP SSE→NDJSON) |
+| `assistant.txt` | `--save-text` (profile-dependent) | Full assistant transcript |
+| `changes.patch` | when git tracked changes exist | git diff for tracked changes |
+| `wrapper.log` | `start` mode only | Background worker output |
 
 ## Permission Modes
 
