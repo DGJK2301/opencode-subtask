@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from pathlib import Path
@@ -587,20 +588,26 @@ class TestCancelTerminalFinish(unittest.TestCase):
         """When status is invoked with only --artifacts-dir (no --run-id),
         and finish.json does NOT exist, the output runId must match
         job.json's recorded runId, not a freshly generated one.
-        This tests the _canonical_run_id path that actually uses run_id."""
+        This tests the _canonical_run_id path that actually uses run_id.
+
+        NOTE: state="finished" prevents _maybe_finalize_stale_running_job
+        from triggering (it only acts on running/queued), ensuring we test
+        the primary cmd_status canonicalization, not the defensive one
+        inside the stale finalizer."""
         repo_root = Path(__file__).resolve().parents[1]
         script = repo_root / "scripts" / "opencode_subtask.py"
 
         with tempfile.TemporaryDirectory(prefix="ocsubtask_test_canonical_rid_") as td:
             artifacts_dir = Path(td)
             real_run_id = "run_canonical_test_12345"
+            now_ms = int(time.time() * 1000)
             job = {
                 "runId": real_run_id,
                 "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": 2147483647,
+                "state": "finished",
+                "createdAt": now_ms,
+                "updatedAt": now_ms,
+                "pid": 0,
             }
             (artifacts_dir / "job.json").write_text(
                 json.dumps(job, indent=2), encoding="utf-8"
@@ -623,6 +630,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 text=True,
                 timeout=20,
             )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
             out = json.loads(proc.stdout)
             # The runId in stdout must be the canonical one from job.json,
             # not a freshly generated run_XXXX_YYYY.
