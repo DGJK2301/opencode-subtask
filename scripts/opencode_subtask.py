@@ -4083,9 +4083,13 @@ def _maybe_finalize_stale_running_job(
 
     pid_alive = bool(pid and _pid_running(pid))
     if pid_alive and pid is not None:
+        # Use the run_id recorded in job.json (the real worker's id), not
+        # the caller-supplied run_id which may be a freshly generated one
+        # when status/wait was invoked with only --artifacts-dir.
+        job_run_id = job.get("runId") if isinstance(job, dict) else None
         ownership = _pid_subtask_worker_ownership_status(
             pid,
-            run_id,
+            job_run_id or run_id,
             require_run_id=False,
         )
         if ownership == "mismatch":
