@@ -1,6 +1,6 @@
 ---
 name: opencode-subtask
-description: Run an OpenCode subtask as an isolated sub-agent executor (run/start/status/wait/cancel). Prints exactly one JSON line to stdout and writes full artifacts to disk; prefers HTTP server API with CLI fallback. Use when delegating a single well-scoped coding task to OpenCode. Not for task decomposition or orchestration (use subtask-orchestrator). 用 OpenCode 跑一个子任务并返回稳定 JSON。
+description: Run an OpenCode subtask as an isolated sub-agent executor (run/start/status/wait/cancel). Prints exactly one JSON line to stdout and writes full artifacts to disk; prefers HTTP server API with CLI fallback for non-timeout failures. Use when delegating a single well-scoped coding task to OpenCode. Not for task decomposition or orchestration (use subtask-orchestrator). 用 OpenCode 跑一个子任务并返回稳定 JSON。
 ---
 
 # OpenCode Subtask Adapter
@@ -28,10 +28,10 @@ This skill turns OpenCode into a reliable "subagent primitive" for upstream agen
    - `ensure-server` → `opencode-subtask-server`
    - `stop-server` → `opencode-subtask-stop-server`
    - CLI argument errors → `opencode-subtask-error` (with `ok: false`)
-   - `cancel` includes cleanup telemetry fields: `stopServerAttempted`, `stopServerOk`
+  - `cancel` includes cleanup telemetry fields: `stopServerAttempted`, `stopServerOk`, `workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`
 2. **Artifacts-first**: Large outputs (NDJSON, transcript, stderr) written to disk
 3. **Protocol shielding**: Callers depend only on this adapter's schema, not OpenCode internals
-4. **Engine abstraction**: HTTP server API preferred, CLI fallback on failure
+4. **Engine abstraction**: HTTP server API preferred, CLI fallback on non-timeout failures
 
 ## Prerequisites
 
@@ -105,6 +105,11 @@ python scripts/opencode_subtask.py status --run-id <runId>
 python scripts/opencode_subtask.py wait --run-id <runId>
 ```
 
+Behavior note:
+- `run` is foreground and returns automatically when the subtask completes (one final JSON line).
+- `start` only returns a launch record; completion is observed via `wait`/`status` reading `finish.json`.
+- There is no push callback mode in this adapter today.
+
 ### Foreground (debug/quick tasks)
 
 ```bash
@@ -126,7 +131,20 @@ python scripts/opencode_subtask.py run --workdir . --engine auto --execution-pro
 | `--hybrid-short-prompt-chars` | (unset) | `hybrid` short-task prompt-length threshold override (chars). Precedence: flag > env > default `1600`. |
 | `--orphan-reaper` | `true` | On run start, reap orphan per-project servers left by crashed/hard-killed workers. Use `--no-orphan-reaper` to disable. |
 | `--orphan-reaper-idle-s` | `1800` | Fallback idle timeout for reaping healthy but unreferenced per-project servers. Set `0` to disable idle-timeout reaping. |
-| `--timeout` | (varies) | Increase for long-running reasoning models. |
+| `--timeout` | (varies) | Legacy timeout input. Used when `--run-timeout` / `--wait-timeout` is not set. |
+| `--run-timeout` | (unset) | Runtime timeout for `run` / `start` worker execution; overrides `--timeout` when set. |
+| `--wait-timeout` | (unset) | Wait window for `wait`; overrides `--timeout` when set. |
+| `--retry-empty-output` | `true` | Retry once when model returns an empty successful response and no tracked file changes are detected. |
+| `--empty-output-retries` | `1` | Max retries for empty-output recovery. |
+
+## Timeout semantics (important)
+
+- `run --run-timeout` / `start --run-timeout`: hard cap for worker runtime.
+- `wait --wait-timeout`: wait-window for the caller, independent from worker runtime timeout.
+- Backward compatibility: if `--run-timeout` / `--wait-timeout` is not provided, adapter falls back to `--timeout`.
+- The adapter does not currently auto-extend runtime timeout based on heartbeat (`events.ndjson` / `assistant.txt` growth).
+- Empty-success guard: if a model returns success with empty assistant output, adapter marks `EmptyModelOutput` and (by default) retries once only when no tracked changes were produced.
+- For heavy reasoning models (especially `opus-4.6-thinking`), prefer larger runtime timeout windows (commonly 1200-1800s for complex reviews).
 
 ## Persona-first prompts (default behavior)
 
@@ -284,6 +302,8 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 | `--max-text-chars <n>` | Bound the `summary` size in the finish JSON. |
 | `--max-artifact-bytes <n>` | Hard cap per artifact file (0 disables). |
 | `--include-debug` | Include extra debug fields in the finish JSON. |
+| `--retry-empty-output` | Enable/disable empty-output auto-retry safety net. |
+| `--empty-output-retries <n>` | Configure empty-output retry count (default 1). |
 
 ## Prompt / input control
 
@@ -302,6 +322,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 | `--agent <name>` | OpenCode agent name to use. |
 | `--env KEY=VALUE` | Set environment variable for the OpenCode process. |
 | `--env-file KEY=PATH` | Set environment variable from file contents. |
+| `OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL` | `1/true/yes/on` enables kill on unknown worker ownership (default is safe-off, i.e. unknown ownership is not killed). |
 
 ## Server attachment
 
@@ -314,11 +335,19 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 | `--orphan-reaper-idle-s <seconds>` | Idle fallback threshold used by the startup reaper. |
 
 Shutdown note:
-- In `--engine auto`, if HTTP is attempted first and then falls back to CLI, shutdown policy is still evaluated for that attempted HTTP path.
+- In `--engine auto`, if HTTP is attempted first and then falls back to CLI (non-timeout failures), shutdown policy is still evaluated for that attempted HTTP path.
 - `if-started` only stops when this invocation created the per-project server; `always` stops regardless of who started it.
 - Safety gate: `always` / `if-started` only stop the currently tracked **local** per-project server URL (prevents stopping unrelated or remote `--attach` targets).
 - `cancel` applies the same policy from persisted job state (`httpAttempted`, `serverStartedNew`, `stopServerAfterRunMode`) to reduce orphaned per-project servers.
-- `cancel` persists `job.json.state=canceled` (plus `canceledAt`) so startup orphan scans do not misclassify canceled jobs as crashes.
+- `cancel` success (`ok=true`) is recognized when any of the following holds:
+  - local worker termination is confirmed,
+  - remote `abort` succeeds, or
+  - kill signal is delivered and liveness probe is inconclusive.
+- When `ok=true` comes from inconclusive liveness probing, finish error message explicitly marks cancellation as unverified.
+- `cancel` persists `job.json.state=canceled` (plus `canceledAt`) when `ok=true`, so startup orphan scans do not misclassify canceled jobs as crashes.
+- Default safety posture: unknown worker ownership does not trigger kill. Override only when needed via `OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL`.
+- Startup/attach server lock timeout is aligned with `--server-wait` (instead of fixed 20s) to reduce false concurrent-start failures.
+- In early `OpencodeNotFound` paths, if `finish.json` already exists, adapter reuses existing finish for stdout/exit consistency.
 - Startup reaper uses recent `job.json` evidence and server health: it reaps dead/unhealthy servers immediately, reaps strong crashed-owner orphans, and optionally reaps idle healthy servers after `--orphan-reaper-idle-s`.
 - Startup reaper treats failed health probes (including auth mismatch) as unknown evidence and does not kill solely on probe failure.
 
@@ -337,20 +366,20 @@ Policy guidance:
 - For long chains, default to `checkpoint`.
 - For quick probes and low-latency asks, use `latency`.
 - Keep `hybrid` as project default when task mix is unknown.
-- If caller input was `--engine auto`, profile-based HTTP preference still preserves HTTP-failure fallback to CLI.
+- If caller input was `--engine auto`, profile-based HTTP preference preserves HTTP-failure fallback to CLI except HTTP timeout (timeout returns directly, no CLI retry).
 
 Hybrid threshold configuration:
 - Flags: `--hybrid-short-timeout-s`, `--hybrid-short-prompt-chars`
 - Env: `OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S`, `OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS`
 - Precedence: CLI flag > env var > built-in default
-- Example (flags): `python scripts/opencode_subtask.py run --execution-profile hybrid --hybrid-short-timeout-s 120 --hybrid-short-prompt-chars 1200 --timeout 90 --prompt "..."`
+- Example (flags): `python scripts/opencode_subtask.py run --execution-profile hybrid --hybrid-short-timeout-s 120 --hybrid-short-prompt-chars 1200 --run-timeout 90 --prompt "..."`
 - Example (env): set `OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S=120` and `OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS=1200`, then run with `--execution-profile hybrid`
 
 ## Engine Selection (`--engine`)
 
 | Mode | Behavior |
 |------|----------|
-| `auto` (default) | **With `--attach-server` (default true):** tries to attach to an existing per-project server first. If a server URL is available (via `--attach` or attached server), uses HTTP; otherwise falls back to CLI. If HTTP fails, falls back to CLI. |
+| `auto` (default) | **With `--attach-server` (default true):** tries to attach to an existing per-project server first. If a server URL is available (via `--attach` or attached server), uses HTTP; otherwise falls back to CLI. If HTTP fails without timeout, falls back to CLI. |
 | `http` | HTTP only (requires server via `--attach` or `ensure-server`) |
 | `cli` | CLI only (`opencode run --format json`) |
 
@@ -464,7 +493,7 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 - **Result extraction**: Prefers sentinel-wrapped JSON (`BEGIN_OC_SUBTASK_JSON`/`END_OC_SUBTASK_JSON`)
 - **Windows**: Default executable is `opencode` (the wrapper prefers `opencode.exe` if available and falls back to `opencode.cmd`); uses `taskkill /T /F` for process cleanup
 - **Fallback logging**: When HTTP→CLI fallback occurs, `engine.fallbackFrom` is set in finish JSON
-- **Orphan reaper telemetry**: run debug/job state may include `orphanReaper` details; cancel output includes `stopServerAttempted` / `stopServerOk`
+- **Orphan reaper telemetry**: run debug/job state may include `orphanReaper` details; cancel output includes `stopServerAttempted` / `stopServerOk` and ownership/probe fields (`workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`)
 
 ## Troubleshooting
 
@@ -479,6 +508,8 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 | `ok=false`, `error.name=WorkerNotRunning` | Background worker process not running and `finish.json` missing. The job may have crashed. Check `wrapper.log` and `stderr.log`. |
 | A `opencode serve` / Node console window pops up | You are starting/ensuring a server (`ensure-server` or `--engine http`). Use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`) to avoid starting a server. |
 | `ok=false`, `error.name=SseUnavailable` | SSE endpoint blocked; try `--engine cli` |
-| `ok=false`, `error.name=Timeout` or `WaitTimeout` | Increase `--timeout`; check model complexity |
+| `ok=false`, `error.name=Timeout` or `WaitTimeout` | Increase `--run-timeout` / `--wait-timeout` (or legacy `--timeout`); check model complexity |
+| `opus-4.6` reviews often timeout before completion | This adapter uses hard runtime timeout; increase `run/start --run-timeout` (commonly 1200-1800s). `wait --wait-timeout` does not extend worker runtime. |
+| `ok=false`, `error.name=EmptyModelOutput` | Model returned an empty successful response. Retry manually, or tune `--retry-empty-output` / `--empty-output-retries`. |
 | `ok=false`, `error.name=OutputTooLarge` | Reduce output or increase `--max-artifact-bytes` |
 | `progress.idleForSeconds` keeps growing | Model stuck; check `stderr.log` for retry loops |

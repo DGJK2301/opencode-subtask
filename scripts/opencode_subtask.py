@@ -188,7 +188,7 @@ def _apply_persona_policy(prompt: str, persona_mode: str, persona_line: str) -> 
     if mode == "prepend":
         sys.stderr.write(
             "[opencode-subtask] NOTE: injected missing persona line. "
-            "Prefer starting prompts with: \"Act as a [profession]...\".\n"
+            'Prefer starting prompts with: "Act as a [profession]...".\n'
         )
         return persona + "\n" + (prompt or "")
 
@@ -446,7 +446,9 @@ def _apply_execution_profile(
     # Explicit modes.
     if profile == "latency":
         if getattr(args, "engine", "auto") == "auto":
-            if getattr(args, "attach", None) or bool(getattr(args, "attach_server", True)):
+            if getattr(args, "attach", None) or bool(
+                getattr(args, "attach_server", True)
+            ):
                 args.engine = "http"
             else:
                 args.engine = "cli"
@@ -486,7 +488,9 @@ def _apply_execution_profile(
     # hybrid
     if short_task:
         if getattr(args, "engine", "auto") == "auto":
-            if getattr(args, "attach", None) or bool(getattr(args, "attach_server", True)):
+            if getattr(args, "attach", None) or bool(
+                getattr(args, "attach_server", True)
+            ):
                 args.engine = "http"
             else:
                 args.engine = "cli"
@@ -812,8 +816,8 @@ def _proc_cmdline(pid: int) -> str:
     try:
         ps_cmd = (
             f'$p=Get-CimInstance Win32_Process -Filter "ProcessId={pid}" '
-            '| Select-Object -First 1 -ExpandProperty CommandLine; '
-            'if ($p) { [Console]::Out.Write($p) }'
+            "| Select-Object -First 1 -ExpandProperty CommandLine; "
+            "if ($p) { [Console]::Out.Write($p) }"
         )
         out = subprocess.check_output(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
@@ -1029,9 +1033,7 @@ def _pid_matches_subtask_worker(
     pid: int, run_id: str | None = None, *, require_run_id: bool = False
 ) -> bool:
     return (
-        _pid_subtask_worker_ownership_status(
-            pid, run_id, require_run_id=require_run_id
-        )
+        _pid_subtask_worker_ownership_status(pid, run_id, require_run_id=require_run_id)
         == "verified"
     )
 
@@ -1237,7 +1239,7 @@ class OpencodeHttpClient:
         except RuntimeError as e:
             # Back-compat: newer servers validate `model` as an object, older servers accept a string.
             # Retry only when the server clearly rejects the string type for `model`.
-            if model and "\"path\":[\"model\"]" in str(e) and "expected object" in str(e):
+            if model and '"path":["model"]' in str(e) and "expected object" in str(e):
                 body2 = dict(body)
                 provider_id, sep, model_id = model.partition("/")
                 if sep:
@@ -1259,7 +1261,9 @@ class OpencodeHttpClient:
     def abort_checked(self, session_id: str, *, timeout_s: float = 5.0) -> None:
         # Same endpoint as abort(), but lets exceptions propagate for callers
         # that need a reliable success/failure signal.
-        self._request_json("POST", f"/session/{session_id}/abort", {}, timeout_s=timeout_s)
+        self._request_json(
+            "POST", f"/session/{session_id}/abort", {}, timeout_s=timeout_s
+        )
 
     def reply_permission(
         self,
@@ -1929,7 +1933,9 @@ def stop_server(workdir: Path) -> dict[str, Any]:
     with _FileLock(lock_path):
         st = _load_json(st_path) or {}
         url = str(st.get("url") or "") if isinstance(st, dict) else ""
-        expected_exec_token = _expected_server_exec_token(st if isinstance(st, dict) else None)
+        expected_exec_token = _expected_server_exec_token(
+            st if isinstance(st, dict) else None
+        )
         pid = int(st.get("pid") or 0) if isinstance(st, dict) else 0
         ok = False
         kept_state = False
@@ -2038,6 +2044,55 @@ class RunOutcome:
 # ============================
 # Structured result extraction
 # ============================
+
+
+def _metric_output_tokens(metrics: dict[str, Any] | None) -> int | None:
+    if not isinstance(metrics, dict):
+        return None
+    tokens = metrics.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    v = tokens.get("output")
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _is_empty_model_output(
+    outcome: RunOutcome, result_obj: dict[str, Any] | None, summary_source: str
+) -> bool:
+    """
+    Detect model-completed-but-empty responses so callers don't treat them as success.
+    Conservative gating: only triggers on successful, non-timeout outcomes with no
+    assistant text / structured payload / summary signal.
+    """
+    if (not outcome.ok) or outcome.timed_out or (outcome.error is not None):
+        return False
+    if (outcome.full_text or "").strip():
+        return False
+    if (summary_source or "").strip():
+        return False
+
+    out_tokens = _metric_output_tokens(outcome.metrics)
+    if out_tokens is not None and out_tokens > 0:
+        return False
+
+    if isinstance(result_obj, dict):
+        for k, v in result_obj.items():
+            if k in ("changed_files", "untracked_files"):
+                continue
+            if isinstance(v, str) and v.strip():
+                return False
+            if isinstance(v, (list, dict)) and len(v) > 0:
+                return False
+            if isinstance(v, (int, float)) and v != 0:
+                return False
+            if isinstance(v, bool) and v:
+                return False
+            if v is None:
+                continue
+    return True
 
 
 def _extract_structured_json(
@@ -2575,7 +2630,11 @@ def _run_cli(
                 killed_for_size = True
                 killed_file = which_file
                 try:
-                    proc.kill()
+                    sent = _kill_tree(
+                        proc.pid, sig=(signal.SIGKILL if os.name != "nt" else None)
+                    )
+                    if (not sent) and proc.poll() is None:
+                        proc.kill()
                 except Exception:
                     pass
                 break
@@ -2588,13 +2647,28 @@ def _run_cli(
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
-            proc.kill()
+            term_sent = _kill_tree(
+                proc.pid, sig=(signal.SIGTERM if os.name != "nt" else None)
+            )
+            if (not term_sent) and proc.poll() is None:
+                proc.kill()
         except Exception:
             pass
         try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                kill_sent = _kill_tree(
+                    proc.pid, sig=(signal.SIGKILL if os.name != "nt" else None)
+                )
+                if (not kill_sent) and proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
 
     th.join(timeout=5)
 
@@ -3085,6 +3159,11 @@ def _run_http(
 
 def cmd_run(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
+    run_timeout_s = (
+        float(args.run_timeout)
+        if getattr(args, "run_timeout", None) is not None
+        else float(args.timeout)
+    )
 
     run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -3094,6 +3173,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Merge env early so profile thresholds can honor --env / --env-file overrides.
     env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+    # Keep profile short-task classification aligned with effective runtime timeout.
+    args.timeout = run_timeout_s
     requested_engine = str(getattr(args, "engine", "auto"))
     profile_info = _apply_execution_profile(args, prompt, env)
 
@@ -3122,7 +3203,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         "updatedAt": _now_ms(),
         "pid": os.getpid(),
         "engine": args.engine,
-        "stopServerAfterRunMode": str(getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)),
+        "stopServerAfterRunMode": str(
+            getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
+        ),
         "serverStartedNew": False,
         "httpAttempted": False,
         "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
@@ -3176,9 +3259,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     attach_url = args.attach
     server_error: dict[str, Any] | None = None
     server_started_new = False
-    stop_server_mode = str(
-        getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
-    ).strip().lower()
+    stop_server_mode = (
+        str(getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN))
+        .strip()
+        .lower()
+    )
 
     # Need opencode binary if we might call CLI engine OR we need to start a server.
     opencode_bin: str | None = None
@@ -3263,7 +3348,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                         env=env,
                         auth=auth,
                     )
-                    server_started_new = bool(server_state.get("startedNew")) if isinstance(server_state, dict) else False
+                    server_started_new = (
+                        bool(server_state.get("startedNew"))
+                        if isinstance(server_state, dict)
+                        else False
+                    )
                     attach_url = str(server_state.get("url"))
             except Exception as e:
                 server_error = {"name": type(e).__name__, "message": str(e)}
@@ -3290,6 +3379,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     chosen = args.engine
     fallback_from: str | None = None
     outcome: RunOutcome | None = None
+    retry_empty_output = bool(getattr(args, "retry_empty_output", True))
+    try:
+        max_empty_output_retries = max(0, int(getattr(args, "empty_output_retries", 1)))
+    except Exception:
+        max_empty_output_retries = 1
+    empty_output_detected = False
+    empty_output_retried = False
+    empty_output_recovered = False
+    empty_output_attempts = 0
 
     # CLI workaround: in some OpenCode versions, "opencode run --attach ... --agent <name>" can fail.
     # If attach was auto-created (not user-provided) and agent is set, prefer standalone CLI (no attach).
@@ -3342,7 +3440,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             model=args.model,
             variant=getattr(args, "variant", None),
             files=list(args.file),
-            timeout_s=float(args.timeout),
+            timeout_s=run_timeout_s,
             quiet=args.quiet,
             save_events=args.save_events,
             save_text=args.save_text,
@@ -3377,7 +3475,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             agent=args.agent,
             model=args.model,
             variant=getattr(args, "variant", None),
-            timeout_s=float(args.timeout),
+            timeout_s=run_timeout_s,
             save_events=args.save_events,
             save_text=args.save_text,
             max_artifact_bytes=int(args.max_artifact_bytes),
@@ -3389,51 +3487,91 @@ def cmd_run(args: argparse.Namespace) -> int:
             on_session_id=lambda sid: _update_job({"sessionId": sid}),
         )
 
-    http_was_attempted = False
-    if chosen == "cli":
-        outcome = run_cli()
-    elif chosen == "http":
-        http_was_attempted = True
-        _update_job({"httpAttempted": True})
-        o1 = run_http()
-        if o1.ok:
-            outcome = o1
-        elif requested_engine == "auto":
-            fallback_from = "http"
+    changed_files: list[str] = []
+    untracked_files: list[str] = []
+    patch_name: str | None = None
+    result_obj: dict[str, Any] | None = None
+    summary_source = ""
+    summary = ""
+    truncated = False
+    baseline_untracked = set(_git_status(workdir)[1])
+    while True:
+        http_was_attempted = False
+        fallback_from = None
+        http_fallback_error: dict[str, Any] | None = None
+        if chosen == "cli":
             outcome = run_cli()
-            outcome.fallback_from = "http"  # type: ignore[attr-defined]
-        else:
-            outcome = o1
-    else:
-        # auto: prefer http if we have a server URL; otherwise cli.
-        if attach_url:
+        elif chosen == "http":
             http_was_attempted = True
             _update_job({"httpAttempted": True})
             o1 = run_http()
             if o1.ok:
                 outcome = o1
-            else:
+            elif requested_engine == "auto" and (not o1.timed_out):
                 fallback_from = "http"
+                http_fallback_error = o1.error if hasattr(o1, "error") else None
                 outcome = run_cli()
                 outcome.fallback_from = "http"  # type: ignore[attr-defined]
+            else:
+                outcome = o1
         else:
-            outcome = run_cli()
+            # auto: prefer http if we have a server URL; otherwise cli.
+            if attach_url:
+                http_was_attempted = True
+                _update_job({"httpAttempted": True})
+                o1 = run_http()
+                if o1.ok:
+                    outcome = o1
+                elif o1.timed_out:
+                    outcome = o1
+                else:
+                    fallback_from = "http"
+                    http_fallback_error = o1.error if hasattr(o1, "error") else None
+                    outcome = run_cli()
+                    outcome.fallback_from = "http"  # type: ignore[attr-defined]
+            else:
+                outcome = run_cli()
 
-    assert outcome is not None
+        assert outcome is not None
 
-    # Post-process: structured result, summary, git status/patch
-    result_obj = _extract_structured_json(outcome.full_text)
-    # Choose summary
-    summary_source = ""
-    if isinstance(result_obj, dict) and isinstance(result_obj.get("summary"), str):
-        summary_source = str(result_obj.get("summary"))
-    else:
-        summary_source = outcome.full_text
+        result_obj = _extract_structured_json(outcome.full_text)
+        if isinstance(result_obj, dict) and isinstance(result_obj.get("summary"), str):
+            summary_source = str(result_obj.get("summary"))
+        else:
+            summary_source = outcome.full_text
+        summary, truncated = _truncate(summary_source.strip(), int(args.max_text_chars))
+        changed_files, untracked_files = _git_status(workdir)
+        patch_name = _git_patch(workdir, artifacts_dir)
 
-    summary, truncated = _truncate(summary_source.strip(), int(args.max_text_chars))
-
-    changed_files, untracked_files = _git_status(workdir)
-    patch_name = _git_patch(workdir, artifacts_dir)
+        empty_now = _is_empty_model_output(outcome, result_obj, summary_source)
+        if empty_now:
+            empty_output_detected = True
+        new_untracked = set(untracked_files) - baseline_untracked
+        can_retry_empty = bool(
+            retry_empty_output
+            and empty_now
+            and (empty_output_attempts < max_empty_output_retries)
+            and (len(changed_files) == 0)
+            and (len(new_untracked) == 0)
+            and (patch_name is None)
+        )
+        if can_retry_empty:
+            empty_output_retried = True
+            empty_output_attempts += 1
+            retries_left = max(0, max_empty_output_retries - empty_output_attempts)
+            sys.stderr.write(
+                f"[opencode-subtask] WARN: empty model output detected; retrying ({empty_output_attempts}/{max_empty_output_retries}, left={retries_left}).\n"
+            )
+            continue
+        if empty_output_retried and (not empty_now):
+            empty_output_recovered = True
+        if empty_now:
+            msg = f"model completed with empty output after {empty_output_attempts + 1} attempt(s)"
+            outcome.error = {"name": "EmptyModelOutput", "message": msg}
+            if outcome.exit_code == 0:
+                outcome.exit_code = 1
+            outcome.ok = False
+        break
 
     # Persist structured result to result.json (always adapter-written)
     result_path = artifacts_dir / "result.json"
@@ -3468,12 +3606,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         debug = {
             "engineSelected": outcome.engine,
             "fallbackFrom": fallback_from,
+            "httpFallbackError": http_fallback_error,
             "serverError": server_error,
             "serverUrl": attach_url,
             "serverStartedNew": server_started_new,
             "stopServerAfterRunMode": stop_server_mode,
             "executionProfile": profile_info,
             "orphanReaper": reaper_info,
+            "emptyOutputDetected": empty_output_detected,
+            "emptyOutputRetried": empty_output_retried,
+            "emptyOutputRecovered": empty_output_recovered,
+            "emptyOutputRetryAttempts": empty_output_attempts,
+            "emptyOutputRetryMax": max_empty_output_retries,
             "serverHealth": (
                 OpencodeHttpClient(
                     attach_url, auth=_get_http_auth_from_env(env)
@@ -3530,6 +3674,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             "serverStartedNew": server_started_new,
             "httpAttempted": http_was_attempted,
             "stopServerAfterRunMode": stop_server_mode,
+            "emptyOutputDetected": empty_output_detected,
+            "emptyOutputRetried": empty_output_retried,
+            "emptyOutputRecovered": empty_output_recovered,
         }
         if outcome.session_id:
             fields["sessionId"] = outcome.session_id
@@ -3562,10 +3709,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             should_stop_server = is_local_selected_server
         elif stop_server_mode == "if-started":
             # Safety gate: only stop the exact local server this invocation started.
-            should_stop_server = bool(
-                server_started_new
-                and is_local_selected_server
-            )
+            should_stop_server = bool(server_started_new and is_local_selected_server)
         elif stop_server_mode == "never":
             should_stop_server = False
         else:
@@ -3630,6 +3774,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     opencode_arg = _resolve_executable_for_workdir(str(args.opencode), workdir) or str(
         args.opencode
     )
+    run_timeout_s = (
+        float(args.run_timeout)
+        if getattr(args, "run_timeout", None) is not None
+        else float(args.timeout)
+    )
 
     # Build worker command (explicitly pass run_id/artifacts_dir/opencode path and flags).
     py = sys.executable
@@ -3648,7 +3797,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--engine",
         args.engine,
         "--timeout",
-        str(args.timeout),
+        str(run_timeout_s),
         "--max-text-chars",
         str(args.max_text_chars),
         "--max-artifact-bytes",
@@ -3679,13 +3828,26 @@ def cmd_start(args: argparse.Namespace) -> int:
         worker_cmd.append("--no-contract")
 
     # prompt persona policy (keep worker behavior consistent with start/run)
-    worker_cmd.extend(["--persona-mode", str(args.persona_mode), "--persona-line", str(args.persona_line)])
+    worker_cmd.extend(
+        [
+            "--persona-mode",
+            str(args.persona_mode),
+            "--persona-line",
+            str(args.persona_line),
+        ]
+    )
     if args.wrapper_log:
         worker_cmd.append("--wrapper-log")
     if args.workaround_agent_attach:
         worker_cmd.append("--workaround-agent-attach")
     else:
         worker_cmd.append("--no-workaround-agent-attach")
+    worker_cmd.append(
+        "--retry-empty-output" if args.retry_empty_output else "--no-retry-empty-output"
+    )
+    worker_cmd.extend(["--empty-output-retries", str(args.empty_output_retries)])
+    if getattr(args, "run_timeout", None) is not None:
+        worker_cmd.extend(["--run-timeout", str(args.run_timeout)])
 
     # attach settings
     if args.attach:
@@ -3920,6 +4082,14 @@ def _maybe_finalize_stale_running_job(
     )
 
     pid_alive = bool(pid and _pid_running(pid))
+    if pid_alive and pid is not None:
+        ownership = _pid_subtask_worker_ownership_status(
+            pid,
+            run_id,
+            require_run_id=False,
+        )
+        if ownership == "mismatch":
+            pid_alive = False
     if not pid_alive:
         if age_since_touch_s < dead_worker_grace_s:
             return None
@@ -4107,7 +4277,12 @@ def cmd_wait(args: argparse.Namespace) -> int:
         sys.stdout.write(_json_line(out) + "\n")
         return 1
 
-    deadline = time.monotonic() + float(args.timeout)
+    wait_timeout_s = (
+        float(args.wait_timeout)
+        if getattr(args, "wait_timeout", None) is not None
+        else float(args.timeout)
+    )
+    deadline = time.monotonic() + wait_timeout_s
     while True:
         if finish_path.exists():
             fin = _load_json(finish_path)
@@ -4171,7 +4346,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 progress=progress,
                 error={
                     "name": "WaitTimeout",
-                    "message": f"timeout waiting for finish.json (timeout={args.timeout}s)",
+                    "message": f"timeout waiting for finish.json (timeout={wait_timeout_s}s)",
                 },
             )
             sys.stdout.write(_json_line(out) + "\n")
@@ -4200,18 +4375,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         if isinstance(job, dict) and job.get("sessionId")
         else None
     )
-    http_attempted = (
-        bool(job.get("httpAttempted"))
+    http_attempted = bool(job.get("httpAttempted")) if isinstance(job, dict) else False
+    stop_server_mode = (
+        str(job.get("stopServerAfterRunMode", DEFAULT_STOP_SERVER_AFTER_RUN))
+        .strip()
+        .lower()
         if isinstance(job, dict)
-        else False
+        else DEFAULT_STOP_SERVER_AFTER_RUN
     )
-    stop_server_mode = str(
-        job.get("stopServerAfterRunMode", DEFAULT_STOP_SERVER_AFTER_RUN)
-    ).strip().lower() if isinstance(job, dict) else DEFAULT_STOP_SERVER_AFTER_RUN
     server_started_new = (
-        bool(job.get("serverStartedNew"))
-        if isinstance(job, dict)
-        else False
+        bool(job.get("serverStartedNew")) if isinstance(job, dict) else False
     )
     stop_attempted = False
     stop_ok: bool | None = None
@@ -4225,12 +4398,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     termination_confirmed = False
     termination_evidence = "unknown"
     worker_ownership = "not_checked"
-    allow_unknown_kill = (
-        str(os.environ.get("OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL", ""))
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
-    )
+    allow_unknown_kill = str(
+        os.environ.get("OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL", "")
+    ).strip().lower() in ("1", "true", "yes", "on")
     if not allow_unknown_kill:
         allow_unknown_kill = DEFAULT_CANCEL_ALLOW_UNKNOWN_KILL
     cancel_phase = "none"
@@ -4265,7 +4435,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                         pid, sig=(signal.SIGKILL if os.name != "nt" else None)
                     )
                     kill_signal_delivered = kill_signal_delivered or kill_sent
-                    if kill_sent and _wait_for_pid_dead(pid, DEFAULT_CANCEL_KILL_GRACE_S):
+                    if kill_sent and _wait_for_pid_dead(
+                        pid, DEFAULT_CANCEL_KILL_GRACE_S
+                    ):
                         termination_confirmed = True
                         termination_evidence = "pid_dead"
                 if kill_attempted and (not termination_confirmed):
@@ -4314,6 +4486,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         )
     else:
         ok = bool(abort_ok)
+    cancel_unverified = bool(
+        ok
+        and (not termination_confirmed)
+        and (not abort_ok)
+        and kill_attempted
+        and kill_signal_delivered
+        and probe_inconclusive_after_kill
+    )
 
     # If worker was canceled before normal completion, best-effort apply
     # stop-server-after-run policy to avoid orphaning a freshly-started server.
@@ -4362,7 +4542,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     no_signal_path = bool((pid <= 0) or termination_confirmed)
     if ok or no_signal_path:
         if ok:
-            cancel_error = {"name": "Canceled", "message": "job canceled by adapter"}
+            if cancel_unverified:
+                cancel_error = {
+                    "name": "Canceled",
+                    "message": "cancel signal delivered; termination not confirmed (liveness probe inconclusive)",
+                }
+            else:
+                cancel_error = {
+                    "name": "Canceled",
+                    "message": "job canceled by adapter",
+                }
         elif abort_error:
             cancel_error = {
                 "name": "CancelAbortFailed",
@@ -4420,6 +4609,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             "cancelPhase": cancel_phase,
             "killSignalDelivered": kill_signal_delivered,
             "probeInconclusiveAfterKill": probe_inconclusive_after_kill,
+            "cancelUnverified": cancel_unverified,
         }
         if ok:
             fields["state"] = "canceled"
@@ -4444,6 +4634,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "cancelPhase": cancel_phase,
         "killSignalDelivered": kill_signal_delivered,
         "probeInconclusiveAfterKill": probe_inconclusive_after_kill,
+        "cancelUnverified": cancel_unverified,
         "stopServerAttempted": stop_attempted,
         "stopServerOk": stop_ok,
     }
@@ -4562,7 +4753,7 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         "--engine",
         choices=["auto", "http", "cli"],
         default="auto",
-        help="Execution engine. auto prefers HTTP then falls back to CLI.",
+        help="Execution engine. auto prefers HTTP then falls back to CLI on non-timeout failures.",
     )
     p.add_argument(
         "--attach",
@@ -4669,7 +4860,26 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_S,
-        help="Overall timeout seconds for the subtask.",
+        help="Legacy timeout seconds (used when --run-timeout / --wait-timeout is not set).",
+    )
+    p.add_argument(
+        "--run-timeout",
+        type=float,
+        default=None,
+        help="Runtime timeout seconds for run/start worker execution (overrides --timeout when set).",
+    )
+    p.add_argument(
+        "--retry-empty-output",
+        dest="retry_empty_output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retry when model returns an empty success with no tracked/untracked changes (count controlled by --empty-output-retries).",
+    )
+    p.add_argument(
+        "--empty-output-retries",
+        type=int,
+        default=1,
+        help="Max retries for empty model output (only when retry-empty-output is enabled).",
     )
     p.add_argument(
         "--poll-interval",
@@ -4724,7 +4934,7 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         help=(
-            "hybrid profile threshold: classify as short only if --timeout <= this value. "
+            "hybrid profile threshold: classify as short only if effective runtime timeout <= this value. "
             "Precedence: flag > env(OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S) > default."
         ),
     )
@@ -4836,6 +5046,12 @@ def main(argv: list[str] | None = None) -> int:
         p_wait.add_argument("--run-id", required=False, default=None)
         p_wait.add_argument("--artifacts-dir", required=False, default=None)
         p_wait.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+        p_wait.add_argument(
+            "--wait-timeout",
+            type=float,
+            default=None,
+            help="Wait window seconds for wait command (overrides --timeout when set).",
+        )
         p_wait.add_argument("--poll-interval", type=float, default=0.5)
         p_wait.set_defaults(func=cmd_wait)
 
@@ -4845,7 +5061,8 @@ def main(argv: list[str] | None = None) -> int:
         p_status.set_defaults(func=cmd_status)
 
         p_cancel = sub.add_parser(
-            "cancel", help="Cancel a job by killing worker and aborting session if known."
+            "cancel",
+            help="Cancel a job by killing worker and aborting session if known.",
         )
         p_cancel.add_argument("--run-id", required=False, default=None)
         p_cancel.add_argument("--artifacts-dir", required=False, default=None)
@@ -4875,7 +5092,9 @@ def main(argv: list[str] | None = None) -> int:
         p_es.add_argument("--env-file", action="append", default=[])
         p_es.set_defaults(func=cmd_ensure_server)
 
-        p_ss = sub.add_parser("stop-server", help="Stop the per-project opencode server.")
+        p_ss = sub.add_parser(
+            "stop-server", help="Stop the per-project opencode server."
+        )
         p_ss.add_argument("--workdir", default=".")
         p_ss.set_defaults(func=cmd_stop_server)
 
