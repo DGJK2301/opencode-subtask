@@ -1,5 +1,7 @@
 import argparse
+import contextlib
 import http.server
+import io
 import importlib.util
 import json
 import os
@@ -26,6 +28,32 @@ class TestCancelTerminalFinish(unittest.TestCase):
             sys.modules.pop(module_name, None)
             raise
         return mod
+
+    @staticmethod
+    def _build_run_args(mod, repo_root: Path, artifacts_dir: Path, run_id: str):
+        p = argparse.ArgumentParser(prog="run-test")
+        mod._add_common_run_flags(p)
+        p.add_argument("prompt", nargs=argparse.REMAINDER)
+        return p.parse_args(
+            [
+                "--workdir",
+                str(repo_root),
+                "--engine",
+                "cli",
+                "--run-id",
+                run_id,
+                "--artifacts-dir",
+                str(artifacts_dir),
+                "--opencode",
+                "__dummy_opencode__",
+                "--prompt",
+                "Act as a senior software engineer.",
+                "--include-debug",
+                "--retry-empty-output",
+                "--empty-output-retries",
+                "1",
+            ]
+        )
 
     def test_cancel_writes_finish_when_worker_dead_and_abort_fails(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -140,6 +168,45 @@ class TestCancelTerminalFinish(unittest.TestCase):
             out = json.loads(proc.stdout)
             self.assertEqual(out.get("type"), "opencode-subtask-status")
             self.assertEqual((out.get("error") or {}).get("name"), "FinishUnreadable")
+
+    def test_wait_timeout_override_takes_precedence(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_wait_timeout_override_") as td:
+            artifacts_dir = Path(td)
+            job = {
+                "runId": "test-run-wait-timeout",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": 1,
+                "updatedAt": 1,
+            }
+            (artifacts_dir / "job.json").write_text(
+                json.dumps(job, indent=2), encoding="utf-8"
+            )
+
+            orig_finalize = mod._maybe_finalize_stale_running_job
+            buf = io.StringIO()
+            try:
+                mod._maybe_finalize_stale_running_job = lambda **kwargs: None
+                with contextlib.redirect_stdout(buf):
+                    rc = mod.cmd_wait(
+                        argparse.Namespace(
+                            run_id=None,
+                            artifacts_dir=str(artifacts_dir),
+                            timeout=60.0,
+                            wait_timeout=0.05,
+                            poll_interval=0.01,
+                        )
+                    )
+            finally:
+                mod._maybe_finalize_stale_running_job = orig_finalize
+
+            self.assertNotEqual(rc, 0)
+            out = json.loads(buf.getvalue().strip())
+            self.assertEqual((out.get("error") or {}).get("name"), "WaitTimeout")
+            self.assertIn("timeout=0.05s", (out.get("error") or {}).get("message", ""))
 
     def test_cancel_succeeds_when_abort_succeeds_with_stale_pid(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -367,13 +434,131 @@ class TestCancelTerminalFinish(unittest.TestCase):
                     )
                 )
                 self.assertEqual(rc, 0)
+                out = json.loads((artifacts_dir / "job.json").read_text(encoding="utf-8"))
+                self.assertTrue(bool(out.get("cancelUnverified")))
                 fin = json.loads((artifacts_dir / "finish.json").read_text(encoding="utf-8"))
                 self.assertEqual((fin.get("error") or {}).get("name"), "Canceled")
+                self.assertIn(
+                    "termination not confirmed",
+                    (fin.get("error") or {}).get("message", ""),
+                )
             finally:
                 mod._pid_running_state = orig_pid_running_state
                 mod._pid_subtask_worker_ownership_status = orig_pid_owner
                 mod._kill_tree = orig_kill_tree
                 mod._wait_for_pid_dead = orig_wait_dead
+
+    def test_empty_output_retry_once_then_fail(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_empty_output_fail_") as td:
+            artifacts_dir = Path(td)
+            args = self._build_run_args(mod, repo_root, artifacts_dir, "empty-fail")
+            calls = {"n": 0}
+
+            def fake_run_cli(**kwargs):
+                calls["n"] += 1
+                return mod.RunOutcome(
+                    ok=True,
+                    exit_code=0,
+                    timed_out=False,
+                    engine="cli",
+                    fallback_from=None,
+                    session_id="ses_test",
+                    full_text="",
+                    metrics={"tokens": {"output": 0}},
+                    error=None,
+                )
+
+            orig_resolve = mod._resolve_executable_for_workdir
+            orig_run_cli = mod._run_cli
+            orig_git_status = mod._git_status
+            orig_git_patch = mod._git_patch
+            try:
+                mod._resolve_executable_for_workdir = lambda cmd, wd: "__dummy_opencode__"
+                mod._run_cli = fake_run_cli
+                mod._git_status = lambda wd: ([], [])
+                mod._git_patch = lambda wd, ad: None
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = mod.cmd_run(args)
+                self.assertEqual(calls["n"], 2)
+                self.assertNotEqual(rc, 0)
+                fin = json.loads(buf.getvalue().strip())
+                self.assertEqual((fin.get("error") or {}).get("name"), "EmptyModelOutput")
+                dbg = fin.get("debug") or {}
+                self.assertTrue(bool(dbg.get("emptyOutputDetected")))
+                self.assertTrue(bool(dbg.get("emptyOutputRetried")))
+                self.assertFalse(bool(dbg.get("emptyOutputRecovered")))
+            finally:
+                mod._resolve_executable_for_workdir = orig_resolve
+                mod._run_cli = orig_run_cli
+                mod._git_status = orig_git_status
+                mod._git_patch = orig_git_patch
+
+    def test_empty_output_retry_recovers(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_empty_output_recover_") as td:
+            artifacts_dir = Path(td)
+            args = self._build_run_args(mod, repo_root, artifacts_dir, "empty-recover")
+            calls = {"n": 0}
+
+            def fake_run_cli(**kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return mod.RunOutcome(
+                        ok=True,
+                        exit_code=0,
+                        timed_out=False,
+                        engine="cli",
+                        fallback_from=None,
+                        session_id="ses_test",
+                        full_text="",
+                        metrics={"tokens": {"output": 0}},
+                        error=None,
+                    )
+                return mod.RunOutcome(
+                    ok=True,
+                    exit_code=0,
+                    timed_out=False,
+                    engine="cli",
+                    fallback_from=None,
+                    session_id="ses_test",
+                    full_text="No major issues found.",
+                    metrics={"tokens": {"output": 12}},
+                    error=None,
+                )
+
+            orig_resolve = mod._resolve_executable_for_workdir
+            orig_run_cli = mod._run_cli
+            orig_git_status = mod._git_status
+            orig_git_patch = mod._git_patch
+            try:
+                mod._resolve_executable_for_workdir = lambda cmd, wd: "__dummy_opencode__"
+                mod._run_cli = fake_run_cli
+                mod._git_status = lambda wd: ([], [])
+                mod._git_patch = lambda wd, ad: None
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = mod.cmd_run(args)
+                self.assertEqual(calls["n"], 2)
+                self.assertEqual(rc, 0)
+                fin = json.loads(buf.getvalue().strip())
+                self.assertTrue(bool(fin.get("ok")))
+                dbg = fin.get("debug") or {}
+                self.assertTrue(bool(dbg.get("emptyOutputDetected")))
+                self.assertTrue(bool(dbg.get("emptyOutputRetried")))
+                self.assertTrue(bool(dbg.get("emptyOutputRecovered")))
+            finally:
+                mod._resolve_executable_for_workdir = orig_resolve
+                mod._run_cli = orig_run_cli
+                mod._git_status = orig_git_status
+                mod._git_patch = orig_git_patch
 
 
 if __name__ == "__main__":
