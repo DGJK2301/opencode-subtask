@@ -517,6 +517,6 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 | `ok=false`, `error.name=EmptyModelOutput` | Model returned an empty successful response. Retry manually, or tune `--retry-empty-output` / `--empty-output-retries`. |
 | `ok=false`, `error.name=OutputTooLarge` | Reduce output or increase `--max-artifact-bytes` |
 | `ok=false`, `error.name=FinishWriteFailed` | `finish.json` could not be written to disk (permissions, disk full, etc.). The stdout JSON is degraded to `ok=false`. Check disk space and directory permissions for the artifacts dir. |
-| `ok=false`, `error.name=CancelFinishWriteFailed` | `cancel` killed the process but could not persist `finish.json`. Subsequent `wait`/`status` may not see a terminal state. Check disk space and artifacts dir permissions. |
+| `ok=false`, `error.name=CancelFinishWriteFailed` | `cancel` attempted to terminate the subtask but could not persist `finish.json` to disk (the process may or may not have been killed — e.g. `pid<=0` takes a no-signal path). Subsequent `wait`/`status` may not see a terminal state. Check disk space and artifacts dir permissions. |
 | `cancel` returns `alreadyFinished=true` | The job already has a valid `finish.json`. Cancel is a no-op — no PID kill, no state overwrite. This is normal for finally-cleanup patterns. |
 | `progress.idleForSeconds` keeps growing | Model stuck; check `stderr.log` for retry loops |
