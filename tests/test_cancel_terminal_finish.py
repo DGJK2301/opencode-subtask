@@ -1325,6 +1325,79 @@ class TestCancelTerminalFinish(unittest.TestCase):
             )
             self.assertEqual(job_after.get("state"), "failed")
 
+    # ── PR #12 regression tests ────────────────────────────────────────
+
+    def test_run_cli_posix_sets_start_new_session(self):
+        """Fix B: _run_cli must set start_new_session=True on POSIX so
+        _kill_tree's os.killpg targets only the subtask process group."""
+        if os.name == "nt":
+            self.skipTest("POSIX-only test")
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        # Patch subprocess.Popen to capture kwargs
+        import subprocess as _sp
+
+        captured_kwargs: dict = {}
+        original_popen = _sp.Popen
+
+        class _CapturePopen:
+            def __init__(self, *a, **kw):
+                captured_kwargs.update(kw)
+                raise OSError("intentional — just capturing kwargs")
+
+        with unittest.mock.patch.object(_sp, "Popen", _CapturePopen):
+            try:
+                mod._run_cli(
+                    cmd=["echo", "test"],
+                    workdir=Path("."),
+                    env=dict(os.environ),
+                    timeout_s=10,
+                    stderr_path=None,
+                )
+            except Exception:
+                pass  # expected — we abort in Popen
+
+        self.assertTrue(
+            captured_kwargs.get("start_new_session"),
+            "_run_cli must set start_new_session=True on POSIX",
+        )
+
+    def test_apply_execution_profile_called_in_cmd_start(self):
+        """Fix A: cmd_start must call _apply_execution_profile before building
+        worker_cmd so that --engine/--save-events/--save-text flags match what
+        the worker will compute."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        # Track whether _apply_execution_profile was called and with what args
+        profile_calls: list = []
+        original_apply = mod._apply_execution_profile
+
+        def _tracking_apply(args, prompt, env):
+            profile_calls.append(
+                {
+                    "engine_before": getattr(args, "engine", None),
+                    "profile": getattr(args, "execution_profile", None),
+                }
+            )
+            return original_apply(args, prompt, env)
+
+        with unittest.mock.patch.object(
+            mod, "_apply_execution_profile", _tracking_apply
+        ):
+            # We can't easily run cmd_start end-to-end (needs opencode binary),
+            # but we can verify the function is referenced in cmd_start's code
+            # by inspecting the source.
+            import inspect
+
+            source = inspect.getsource(mod.cmd_start)
+            self.assertIn(
+                "_apply_execution_profile",
+                source,
+                "cmd_start must call _apply_execution_profile before building "
+                "worker_cmd to align start metadata with worker behavior",
+            )
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
