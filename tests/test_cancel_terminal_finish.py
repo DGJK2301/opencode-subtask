@@ -782,6 +782,60 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 mod._git_status = orig_git_status
                 mod._git_patch = orig_git_patch
 
+    def test_run_wrapper_log_referenced_when_present(self) -> None:
+        """Fix D: when wrapper.log exists on disk (start-mode worker reusing
+        cmd_run code path), finish JSON should reference it via wrapperLogPath."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_wrapper_ref_") as td:
+            artifacts_dir = Path(td)
+            # Pre-create wrapper.log to simulate start-mode scenario
+            (artifacts_dir / "wrapper.log").write_text(
+                "wrapper boot log line\n", encoding="utf-8"
+            )
+            args = self._build_run_args(mod, repo_root, artifacts_dir, "wrapper-ref")
+
+            def fake_run_cli(**kwargs):
+                return mod.RunOutcome(
+                    ok=True,
+                    exit_code=0,
+                    timed_out=False,
+                    engine="cli",
+                    fallback_from=None,
+                    session_id="ses_wrapper",
+                    full_text="Done.",
+                    metrics={"tokens": {"output": 3}},
+                    error=None,
+                )
+
+            orig_resolve = mod._resolve_executable_for_workdir
+            orig_run_cli = mod._run_cli
+            orig_git_status = mod._git_status
+            orig_git_patch = mod._git_patch
+            try:
+                mod._resolve_executable_for_workdir = lambda cmd, wd: "__dummy__"
+                mod._run_cli = fake_run_cli
+                mod._git_status = lambda wd: ([], [])
+                mod._git_patch = lambda wd, ad: None
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = mod.cmd_run(args)
+                self.assertEqual(rc, 0)
+                fin = json.loads(buf.getvalue().strip())
+                artifacts = fin.get("artifacts") or {}
+                self.assertEqual(
+                    artifacts.get("wrapperLogPath"),
+                    "wrapper.log",
+                    "wrapperLogPath should reference wrapper.log when it exists on disk",
+                )
+            finally:
+                mod._resolve_executable_for_workdir = orig_resolve
+                mod._run_cli = orig_run_cli
+                mod._git_status = orig_git_status
+                mod._git_patch = orig_git_patch
+
     # ------------------------------------------------------------------ #
     # Degradation & edge-case tests (added per expert review feedback)   #
     # ------------------------------------------------------------------ #

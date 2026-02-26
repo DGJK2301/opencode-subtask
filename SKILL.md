@@ -449,7 +449,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 | `job.json` | always | Runtime/diagnostic job state for status/wait/cancel (not authoritative for terminal outcome) |
 | `finish.json` | always | **Authoritative terminal state** — the single source of truth for task outcome (same schema as stdout) |
 | `stderr.log` | always | CLI stderr or HTTP errors |
-| `result.json` | always | Adapter-extracted structured result |
+| `result.json` | best-effort | Adapter-extracted structured result (may be missing if disk write fails) |
 | `events.ndjson` | `--save-events` (profile-dependent) | Full event stream (CLI NDJSON or HTTP SSE→NDJSON) |
 | `assistant.txt` | `--save-text` (profile-dependent) | Full assistant transcript |
 | `changes.patch` | when git tracked changes exist | git diff for tracked changes |
