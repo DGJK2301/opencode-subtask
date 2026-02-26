@@ -2577,6 +2577,11 @@ def _run_cli(
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
             popen_kwargs.update(_win_hide_popen_kwargs(detached=False))
+        else:
+            # Place the child in its own process group so _kill_tree's
+            # os.killpg(pid, sig) targets only the subtask tree, not the
+            # adapter's own process group.
+            popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen(
             cmd,
             cwd=str(workdir),
@@ -3837,6 +3842,17 @@ def cmd_start(args: argparse.Namespace) -> int:
         if getattr(args, "run_timeout", None) is not None
         else float(args.timeout)
     )
+
+    # Apply execution profile so that worker_cmd flags (--engine,
+    # --save-events, --save-text) and the start stdout metadata match what
+    # the worker will actually compute in cmd_run.  The function mutates
+    # args in place and is idempotent, so the worker calling it again is
+    # harmless.
+    # Important: _apply_execution_profile() reads args.timeout, so align it
+    # with the actual worker runtime timeout (run_timeout_s) before applying.
+    args.timeout = float(run_timeout_s)
+    env = _merge_env(dict(os.environ), args.env, args.env_file)
+    _apply_execution_profile(args, prompt, env)
 
     # Build worker command (explicitly pass run_id/artifacts_dir/opencode path and flags).
     py = sys.executable

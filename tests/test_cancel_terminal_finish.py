@@ -1325,6 +1325,207 @@ class TestCancelTerminalFinish(unittest.TestCase):
             )
             self.assertEqual(job_after.get("state"), "failed")
 
+    # ── PR #12 regression tests ────────────────────────────────────────
+
+    def test_run_cli_posix_sets_start_new_session(self):
+        """Fix B: _run_cli must set start_new_session=True on POSIX so
+        _kill_tree's os.killpg targets only the subtask process group."""
+        if os.name == "nt":
+            self.skipTest("POSIX-only test")
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        captured_kwargs: dict = {}
+
+        def _capture_popen(*a, **kw):
+            captured_kwargs.update(kw)
+            raise OSError("intentional — just capturing kwargs")
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_run_cli_posix_") as td:
+            td_path = Path(td)
+            workdir = td_path
+            prompt_path = td_path / "prompt.txt"
+            prompt_path.write_text(
+                "Act as a senior software engineer.\n", encoding="utf-8"
+            )
+            stderr_path = td_path / "stderr.log"
+
+            with unittest.mock.patch.object(mod.subprocess, "Popen", _capture_popen):
+                try:
+                    mod._run_cli(
+                        opencode_bin="__dummy_opencode__",
+                        workdir=workdir,
+                        env=dict(os.environ),
+                        attach_url=None,
+                        prompt_path=prompt_path,
+                        continue_last=False,
+                        session_id=None,
+                        title=None,
+                        agent=None,
+                        model=None,
+                        variant=None,
+                        files=[],
+                        timeout_s=1.0,
+                        quiet=True,
+                        save_events=False,
+                        save_text=False,
+                        max_artifact_bytes=0,
+                        events_path=None,
+                        stderr_path=stderr_path,
+                        assistant_path=None,
+                        on_session_id=None,
+                    )
+                except Exception:
+                    pass  # expected
+
+        self.assertTrue(
+            captured_kwargs.get("start_new_session"),
+            "_run_cli must set start_new_session=True on POSIX",
+        )
+
+    def test_cmd_start_execution_profile_uses_run_timeout_for_short_class(self):
+        """Fix A: cmd_start should apply execution profile using the effective
+        worker runtime timeout (run_timeout_s), not the legacy args.timeout."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        p = argparse.ArgumentParser(prog="start-test")
+        mod._add_common_run_flags(p)
+        p.add_argument("prompt", nargs=argparse.REMAINDER)
+
+        captured_cmd: list[str] | None = None
+
+        def _fake_popen(cmd, *a, **kw):
+            nonlocal captured_cmd
+            captured_cmd = list(cmd)
+            # Close wrapper log so TemporaryDirectory cleanup works on Windows.
+            out = kw.get("stdout")
+            err = kw.get("stderr")
+            try:
+                if out is not None and hasattr(out, "close"):
+                    out.close()
+            except Exception:
+                pass
+            try:
+                if err is not None and err is not out and hasattr(err, "close"):
+                    err.close()
+            except Exception:
+                pass
+
+            class _Proc:
+                pid = 12345
+
+            return _Proc()
+
+        with tempfile.TemporaryDirectory(
+            prefix="ocsubtask_test_cmd_start_profile_"
+        ) as td:
+            artifacts_dir = Path(td) / "artifacts"
+            args = p.parse_args(
+                [
+                    "--workdir",
+                    str(repo_root),
+                    "--engine",
+                    "auto",
+                    "--execution-profile",
+                    "hybrid",
+                    "--run-id",
+                    "profile-short-test",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                    "--opencode",
+                    "__dummy_opencode__",
+                    "--prompt",
+                    "Act as a senior software engineer.",
+                    "--run-timeout",
+                    "30",
+                    # If cmd_start incorrectly uses legacy args.timeout(600),
+                    # this threshold would classify the job as long.
+                    "--hybrid-short-timeout-s",
+                    "100",
+                ]
+            )
+
+            with unittest.mock.patch.object(mod.subprocess, "Popen", _fake_popen):
+                rc = mod.cmd_start(args)
+
+        self.assertEqual(rc, 0)
+        self.assertIsNotNone(captured_cmd)
+        assert captured_cmd is not None
+        engine = captured_cmd[captured_cmd.index("--engine") + 1]
+        self.assertEqual(engine, "http")
+        self.assertIn("--no-save-events", captured_cmd)
+        self.assertIn("--no-save-text", captured_cmd)
+
+    def test_cmd_start_execution_profile_merges_env_thresholds(self):
+        """Fix A: cmd_start should merge --env/--env-file into the env passed to
+        _apply_execution_profile so hybrid thresholds are honored."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        p = argparse.ArgumentParser(prog="start-test-env")
+        mod._add_common_run_flags(p)
+        p.add_argument("prompt", nargs=argparse.REMAINDER)
+
+        captured_cmd: list[str] | None = None
+
+        def _fake_popen(cmd, *a, **kw):
+            nonlocal captured_cmd
+            captured_cmd = list(cmd)
+            out = kw.get("stdout")
+            err = kw.get("stderr")
+            try:
+                if out is not None and hasattr(out, "close"):
+                    out.close()
+            except Exception:
+                pass
+            try:
+                if err is not None and err is not out and hasattr(err, "close"):
+                    err.close()
+            except Exception:
+                pass
+
+            class _Proc:
+                pid = 23456
+
+            return _Proc()
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_cmd_start_env_") as td:
+            artifacts_dir = Path(td) / "artifacts"
+            args = p.parse_args(
+                [
+                    "--workdir",
+                    str(repo_root),
+                    "--engine",
+                    "auto",
+                    "--execution-profile",
+                    "hybrid",
+                    "--run-id",
+                    "profile-env-test",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                    "--opencode",
+                    "__dummy_opencode__",
+                    "--prompt",
+                    "Act as a senior software engineer.",
+                    "--run-timeout",
+                    "30",
+                    # If --env is merged, threshold=10 => classify as long (CLI + full artifacts)
+                    "--env",
+                    "OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S=10",
+                ]
+            )
+
+            with unittest.mock.patch.object(mod.subprocess, "Popen", _fake_popen):
+                rc = mod.cmd_start(args)
+
+        self.assertEqual(rc, 0)
+        self.assertIsNotNone(captured_cmd)
+        assert captured_cmd is not None
+        engine = captured_cmd[captured_cmd.index("--engine") + 1]
+        self.assertEqual(engine, "cli")
+        self.assertIn("--save-events", captured_cmd)
+        self.assertIn("--save-text", captured_cmd)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
