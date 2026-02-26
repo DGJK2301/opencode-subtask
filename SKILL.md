@@ -377,6 +377,8 @@ Hybrid threshold configuration:
 - Example (flags): `python scripts/opencode_subtask.py run --execution-profile hybrid --hybrid-short-timeout-s 120 --hybrid-short-prompt-chars 1200 --run-timeout 90 --prompt "..."`
 - Example (env): set `OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S=120` and `OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS=1200`, then run with `--execution-profile hybrid`
 
+Start-mode alignment: `start` pre-applies the execution profile before spawning the background worker, so that the start stdout metadata (engine, taskClass, save flags) matches what the worker will actually compute. The timeout used for hybrid short/long classification is `--run-timeout` (not the legacy `--timeout`), and `--env`/`--env-file` values are merged into the environment before threshold resolution.
+
 ## Engine Selection (`--engine`)
 
 | Mode | Behavior |
@@ -444,8 +446,8 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 | File | Condition | Description |
 |------|-----------|-------------|
 | `prompt.txt` | always | Effective prompt (with contract appended) |
-| `job.json` | always | Job state for status/wait/cancel |
-| `finish.json` | always | Final stable result (same as stdout) |
+| `job.json` | always | Runtime/diagnostic job state for status/wait/cancel (not authoritative for terminal outcome) |
+| `finish.json` | always | **Authoritative terminal state** — the single source of truth for task outcome (same schema as stdout) |
 | `stderr.log` | always | CLI stderr or HTTP errors |
 | `result.json` | always | Adapter-extracted structured result |
 | `events.ndjson` | `--save-events` (profile-dependent) | Full event stream (CLI NDJSON or HTTP SSE→NDJSON) |
