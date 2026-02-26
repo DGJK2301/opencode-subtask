@@ -1241,6 +1241,90 @@ class TestCancelTerminalFinish(unittest.TestCase):
             )
             self.assertIn("FinishWriteFailed", str(job_after.get("lastError", {})))
 
+    def test_cancel_idempotency_rejects_empty_finish(self):
+        """Codex P1a: cancel idempotency guard must NOT trigger for an empty
+        finish.json ({}) — only for a structurally complete finish with 'ok'."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            # Write an EMPTY finish.json (structurally incomplete)
+            (artifacts_dir / "finish.json").write_text(json.dumps({}), encoding="utf-8")
+            # Write a job.json with pid=0
+            job = {
+                "runId": "empty-finish-test",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": int(time.time() * 1000),
+                "updatedAt": int(time.time() * 1000),
+                "pid": 0,
+            }
+            (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            out = json.loads(result.stdout.strip())
+            # Should NOT have alreadyFinished — the empty finish is not valid
+            self.assertFalse(
+                out.get("alreadyFinished", False),
+                "cancel must not treat an empty {} finish.json as a valid "
+                "terminal state",
+            )
+
+    def test_cancel_idempotency_accepts_complete_finish(self):
+        """Codex P1a: cancel idempotency guard triggers for finish.json
+        that contains the 'ok' key (structurally complete)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            # Write a COMPLETE finish.json
+            finish = {"ok": False, "exitCode": 1, "runId": "complete-test"}
+            (artifacts_dir / "finish.json").write_text(
+                json.dumps(finish), encoding="utf-8"
+            )
+            job = {
+                "runId": "complete-test",
+                "workdir": str(repo_root),
+                "state": "failed",
+                "createdAt": int(time.time() * 1000),
+                "updatedAt": int(time.time() * 1000),
+                "pid": 0,
+            }
+            (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0)
+            out = json.loads(result.stdout.strip())
+            self.assertTrue(out.get("alreadyFinished"))
+            self.assertTrue(out.get("ok"))
+            # Job state must remain unchanged
+            job_after = json.loads(
+                (artifacts_dir / "job.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(job_after.get("state"), "failed")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

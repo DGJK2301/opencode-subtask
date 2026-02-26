@@ -4462,8 +4462,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     # reached a terminal state.  Killing the (possibly recycled) PID or
     # overwriting job.state would be harmful.  Return early with
     # ``alreadyFinished=true`` so the caller knows cancel was a no-op.
+    #
+    # We require the finish to contain at least an ``ok`` key — an empty
+    # or structurally incomplete dict (e.g. ``{}``) is treated as corrupt
+    # and the cancel proceeds normally so the process is still cleaned up.
     existing_finish = _load_json(finish_path)
-    if isinstance(existing_finish, dict):
+    if isinstance(existing_finish, dict) and "ok" in existing_finish:
         out_idem = {
             "type": "opencode-subtask-cancel",
             "schemaVersion": ADAPTER_SCHEMA_VERSION,
@@ -4652,6 +4656,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     # worker signal path left.
     cancel_fin_written = False
     cancel_fin_reason = "skipped"
+    cancel_error: dict | None = None
     no_signal_path = bool((pid <= 0) or termination_confirmed)
     if ok or no_signal_path:
         if ok:
@@ -4706,6 +4711,23 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         cancel_fin_written, cancel_fin_reason, _ = _write_finish_once(
             artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
         )
+        # If finish.json could not be persisted AND no prior finish exists,
+        # downstream wait/status will never see a terminal state.  Degrade
+        # the cancel result so the caller knows the kill may have worked but
+        # the on-disk record is missing.
+        if (not cancel_fin_written) and cancel_fin_reason in (
+            "write_failed",
+            "unreadable",
+        ):
+            ok = False
+            cancel_error = {
+                "name": "CancelFinishWriteFailed",
+                "message": (
+                    f"cancel finish.json could not be persisted "
+                    f"(reason={cancel_fin_reason}); "
+                    f"wait/status may not see a terminal state"
+                ),
+            }
 
     # Persist cancel telemetry.
     if isinstance(job, dict):
@@ -4758,6 +4780,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "stopServerAttempted": stop_attempted,
         "stopServerOk": stop_ok,
     }
+    if cancel_error:
+        out2["error"] = cancel_error
     sys.stdout.write(_json_line(out2) + "\n")
     return 0 if ok else 1
 
