@@ -11,6 +11,7 @@ import tempfile
 import time
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -949,6 +950,296 @@ class TestCancelTerminalFinish(unittest.TestCase):
             self.assertEqual(reason2, "exists")
             self.assertIsInstance(existing2, dict)
             self.assertEqual(existing2["runId"], "first-recovery")
+
+    # ── PR #10 regression tests ────────────────────────────────────────
+
+    def test_write_finish_once_not_exists_write_failure(self):
+        """P0: _write_finish_once must catch _write_json failure on the
+        'not exists' path and return (False, 'write_failed', None)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            finish_path = artifacts_dir / "finish.json"
+            finish_obj = {"ok": True, "runId": "wf-test"}
+            # Make artifacts_dir read-only so _write_json fails
+            # (on Windows, patch _write_json directly instead)
+            original_write_json = mod._write_json
+            call_count = 0
+
+            def _failing_write_json(path, obj):
+                nonlocal call_count
+                call_count += 1
+                raise OSError("disk full")
+
+            with unittest.mock.patch.object(mod, "_write_json", _failing_write_json):
+                written, reason, existing = mod._write_finish_once(
+                    artifacts_dir=artifacts_dir,
+                    finish_path=finish_path,
+                    finish_obj=finish_obj,
+                )
+            self.assertFalse(written)
+            self.assertEqual(reason, "write_failed")
+            self.assertIsNone(existing)
+            self.assertEqual(call_count, 1)
+            self.assertFalse(finish_path.exists())
+
+    def test_canonical_run_id_strip_and_control_char_rejection(self):
+        """P3: _canonical_run_id strips whitespace and rejects control chars."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        fallback = "safe-uuid-1234"
+
+        # Strip whitespace from job runId
+        result = mod._canonical_run_id(fallback, {"runId": "  abc-123  "})
+        self.assertEqual(result, "abc-123")
+
+        # Strip whitespace from fallback when job has no runId
+        result = mod._canonical_run_id("  fallback-id  ", {})
+        self.assertEqual(result, "fallback-id")
+
+        # Reject newline in job runId → fall back to stripped run_id
+        result = mod._canonical_run_id(fallback, {"runId": "bad\nid"})
+        self.assertEqual(result, fallback)
+
+        # Reject tab in job runId
+        result = mod._canonical_run_id(fallback, {"runId": "bad\tid"})
+        self.assertEqual(result, fallback)
+
+        # Reject NUL in job runId
+        result = mod._canonical_run_id(fallback, {"runId": "bad\x00id"})
+        self.assertEqual(result, fallback)
+
+        # Reject DEL (0x7f) in job runId
+        result = mod._canonical_run_id(fallback, {"runId": "bad\x7fid"})
+        self.assertEqual(result, fallback)
+
+        # Clean job runId passes through
+        result = mod._canonical_run_id(fallback, {"runId": "clean-id-99"})
+        self.assertEqual(result, "clean-id-99")
+
+    def test_artifacts_obj_nonexistent_files_are_null(self):
+        """P2: _artifacts_obj returns null for optional paths that don't exist."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            job_path = d / "job.json"
+            finish_path = d / "finish.json"
+            prompt_path = d / "prompt.md"
+            # Create only mandatory files
+            for p in (job_path, finish_path, prompt_path):
+                p.write_text("{}")
+            # Optional paths that do NOT exist on disk
+            events_path = d / "events.ndjson"
+            stderr_path = d / "stderr.log"
+            assistant_path = d / "assistant.txt"
+            wrapper_log_path = d / "wrapper.log"
+            result_path = d / "result.json"
+
+            arts = mod._artifacts_obj(
+                dir_path=d,
+                job_path=job_path,
+                finish_path=finish_path,
+                prompt_path=prompt_path,
+                events_path=events_path,
+                stderr_path=stderr_path,
+                assistant_path=assistant_path,
+                wrapper_log_path=wrapper_log_path,
+                result_path=result_path,
+                patch_path=None,
+            )
+            # Non-existent optional files should be null
+            self.assertIsNone(arts["eventsPath"])
+            self.assertIsNone(arts["stderrPath"])
+            self.assertIsNone(arts["assistantPath"])
+            self.assertIsNone(arts["wrapperLogPath"])
+            self.assertIsNone(arts["resultPath"])
+            # Mandatory files should still have names
+            self.assertEqual(arts["jobPath"], "job.json")
+            self.assertEqual(arts["finishPath"], "finish.json")
+
+    def test_artifacts_obj_existing_files_have_names(self):
+        """P2: _artifacts_obj returns file names for paths that DO exist."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            job_path = d / "job.json"
+            finish_path = d / "finish.json"
+            prompt_path = d / "prompt.md"
+            events_path = d / "events.ndjson"
+            stderr_path = d / "stderr.log"
+            # Create all files
+            for p in (job_path, finish_path, prompt_path, events_path, stderr_path):
+                p.write_text("{}")
+
+            arts = mod._artifacts_obj(
+                dir_path=d,
+                job_path=job_path,
+                finish_path=finish_path,
+                prompt_path=prompt_path,
+                events_path=events_path,
+                stderr_path=stderr_path,
+                assistant_path=None,
+                wrapper_log_path=None,
+                result_path=None,
+                patch_path=None,
+            )
+            self.assertEqual(arts["eventsPath"], "events.ndjson")
+            self.assertEqual(arts["stderrPath"], "stderr.log")
+            # None paths stay None
+            self.assertIsNone(arts["assistantPath"])
+            self.assertIsNone(arts["wrapperLogPath"])
+            self.assertIsNone(arts["resultPath"])
+
+    def test_cancel_idempotent_when_finish_exists(self):
+        """P1: cmd_cancel returns early with alreadyFinished=true when
+        finish.json already contains a valid terminal state."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            # Write a valid finish.json (successful completion)
+            finish = {
+                "ok": True,
+                "exitCode": 0,
+                "runId": "already-done",
+                "summary": "completed successfully",
+            }
+            (artifacts_dir / "finish.json").write_text(
+                json.dumps(finish), encoding="utf-8"
+            )
+            # Write a job.json with a PID that doesn't exist
+            job = {
+                "runId": "already-done",
+                "workdir": str(repo_root),
+                "state": "finished",
+                "createdAt": int(time.time() * 1000),
+                "updatedAt": int(time.time() * 1000),
+                "pid": 0,
+            }
+            (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
+            out = json.loads(result.stdout.strip())
+            self.assertTrue(out.get("ok"))
+            self.assertTrue(out.get("alreadyFinished"))
+            self.assertEqual(out["existingFinish"]["runId"], "already-done")
+            # job.json state should NOT have been changed to 'canceled'
+            job_after = json.loads(
+                (artifacts_dir / "job.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(job_after.get("state"), "finished")
+
+    def test_cancel_telemetry_no_state_overwrite_when_finish_exists(self):
+        """P1b: When _write_finish_once returns 'exists' during cancel,
+        telemetry must NOT overwrite job.state to 'canceled'."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            finish_path = artifacts_dir / "finish.json"
+            job_path = artifacts_dir / "job.json"
+
+            # Pre-existing successful finish
+            finish = {"ok": True, "exitCode": 0, "runId": "success-run"}
+            finish_path.write_text(json.dumps(finish), encoding="utf-8")
+
+            # Job in 'finished' state
+            job = {
+                "runId": "success-run",
+                "workdir": str(repo_root),
+                "state": "finished",
+                "createdAt": int(time.time() * 1000),
+                "updatedAt": int(time.time() * 1000),
+                "pid": 0,
+            }
+            job_path.write_text(json.dumps(job), encoding="utf-8")
+
+            # Try to write a cancel finish — should return 'exists'
+            cancel_finish = {
+                "ok": False,
+                "exitCode": 130,
+                "runId": "success-run",
+                "engine": "cancel",
+            }
+            written, reason, existing = mod._write_finish_once(
+                artifacts_dir=artifacts_dir,
+                finish_path=finish_path,
+                finish_obj=cancel_finish,
+            )
+            self.assertFalse(written)
+            self.assertEqual(reason, "exists")
+            self.assertIsInstance(existing, dict)
+            self.assertTrue(existing["ok"])  # original success preserved
+
+    def test_emit_synthesized_finish_guards_job_state_on_write_failure(self):
+        """P0: _emit_synthesized_missing_finish must NOT set job state='failed'
+        when _write_finish_once itself fails (write_failed reason)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            job_path = artifacts_dir / "job.json"
+            finish_path = artifacts_dir / "finish.json"
+
+            # Job in 'running' state
+            job = {
+                "runId": "synth-test",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": int(time.time() * 1000),
+                "updatedAt": int(time.time() * 1000),
+                "pid": 0,
+            }
+            job_path.write_text(json.dumps(job), encoding="utf-8")
+
+            # Patch _write_json to fail ONLY for finish.json
+            original_write_json = mod._write_json
+
+            def _selective_failing_write_json(path, obj):
+                if Path(path).name == "finish.json":
+                    raise OSError("disk full")
+                return original_write_json(path, obj)
+
+            with unittest.mock.patch.object(
+                mod, "_write_json", _selective_failing_write_json
+            ):
+                out = mod._emit_synthesized_missing_finish(
+                    artifacts_dir=artifacts_dir,
+                    job_path=job_path,
+                    finish_path=finish_path,
+                    job=job,
+                    run_id="synth-test",
+                    error_name="ProcessVanished",
+                    error_message="test vanish",
+                )
+
+            # Output should still be the synthesized failure
+            self.assertFalse(out.get("ok"))
+            # Job state should NOT have been set to 'failed' —
+            # instead lastError should record the write failure
+            job_after = json.loads(job_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(
+                job_after.get("state"),
+                "failed",
+                "job.state must not transition to 'failed' when finish.json "
+                "write itself failed",
+            )
+            self.assertIn("FinishWriteFailed", str(job_after.get("lastError", {})))
 
 
 if __name__ == "__main__":

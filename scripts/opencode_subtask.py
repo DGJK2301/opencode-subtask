@@ -701,10 +701,21 @@ def _canonical_run_id(run_id: str, job: Any) -> str:
     ``--run-id``), :func:`_resolve_artifacts_dir` generates a fresh run_id
     that won't match the real worker's ID stored in job.json.  This helper
     resolves the discrepancy by preferring the job-recorded value.
+
+    The result is stripped of surrounding whitespace and rejected if it
+    contains control characters (newlines, tabs, NUL, etc.) to prevent
+    identity-field injection via a crafted job.json.
     """
+    candidate = run_id
     if isinstance(job, dict) and job.get("runId"):
-        return str(job["runId"])
-    return run_id
+        candidate = str(job["runId"])
+    candidate = candidate.strip()
+    # Reject control characters (< 0x20 except nothing, plus DEL 0x7f).
+    if any(c < " " or c == "\x7f" for c in candidate):
+        # Fall back to the original (already generated) run_id stripped,
+        # which is a safe UUID produced by _resolve_artifacts_dir.
+        return run_id.strip()
+    return candidate
 
 
 # ============================
@@ -1789,7 +1800,10 @@ def _write_finish_once(
             except Exception:
                 return False, "write_failed", None
             return True, "recovered", None
-        _write_json(finish_path, finish_obj)
+        try:
+            _write_json(finish_path, finish_obj)
+        except Exception:
+            return False, "write_failed", None
         return True, "written", None
 
 
@@ -2315,16 +2329,19 @@ def _artifacts_obj(
     result_path: Path | None,
     patch_path: str | None,
 ) -> dict[str, Any]:
+    def _name_if_exists(p: Path | None) -> str | None:
+        return p.name if p and p.exists() else None
+
     return {
         "dir": str(dir_path),
         "jobPath": job_path.name,
         "finishPath": finish_path.name,
         "promptPath": prompt_path.name,
-        "eventsPath": events_path.name if events_path else None,
-        "stderrPath": stderr_path.name if stderr_path else None,
-        "assistantPath": assistant_path.name if assistant_path else None,
-        "wrapperLogPath": wrapper_log_path.name if wrapper_log_path else None,
-        "resultPath": result_path.name if result_path else None,
+        "eventsPath": _name_if_exists(events_path),
+        "stderrPath": _name_if_exists(stderr_path),
+        "assistantPath": _name_if_exists(assistant_path),
+        "wrapperLogPath": _name_if_exists(wrapper_log_path),
+        "resultPath": _name_if_exists(result_path),
         "patchPath": patch_path,
     }
 
@@ -3692,11 +3709,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         debug=debug,
     )
 
-    finish_written, _, existing_finish = _write_finish_once(
+    finish_written, finish_reason, existing_finish = _write_finish_once(
         artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
     )
     if (not finish_written) and isinstance(existing_finish, dict):
         out = existing_finish
+    elif (not finish_written) and existing_finish is None:
+        # write_failed / unreadable — disk has no finish.json; degrade stdout
+        out["ok"] = False
+        if not out.get("error"):
+            out["error"] = {
+                "name": "FinishWriteFailed",
+                "message": (
+                    f"finish.json could not be persisted (reason={finish_reason})"
+                ),
+            }
     # Update job state only if this worker won the terminal finish write.
     if finish_written:
         fields: dict[str, Any] = {
@@ -4062,20 +4089,38 @@ def _emit_synthesized_missing_finish(
         include_debug=False,
         debug=None,
     )
-    finish_written, _, existing_finish = _write_finish_once(
+    finish_written, finish_reason, existing_finish = _write_finish_once(
         artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
     )
     if (not finish_written) and isinstance(existing_finish, dict):
         out = existing_finish
-    _update_job_fields_locked(
-        job_path,
-        artifacts_dir,
-        {
-            "state": "failed",
-            "failedAt": _now_ms(),
-            "lastError": {"name": error_name, "message": error_message},
-        },
-    )
+    # Only update job state when we successfully persisted a terminal finish
+    # (or an existing finish already covers it).
+    if finish_written or isinstance(existing_finish, dict):
+        _update_job_fields_locked(
+            job_path,
+            artifacts_dir,
+            {
+                "state": "failed",
+                "failedAt": _now_ms(),
+                "lastError": {"name": error_name, "message": error_message},
+            },
+        )
+    else:
+        # write_failed / unreadable — persist only the error, not the state
+        # transition, to avoid a state=failed with no finish.json on disk.
+        _update_job_fields_locked(
+            job_path,
+            artifacts_dir,
+            {
+                "lastError": {
+                    "name": "FinishWriteFailed",
+                    "message": (
+                        f"watchdog finish.json write failed (reason={finish_reason})"
+                    ),
+                },
+            },
+        )
     return out
 
 
@@ -4411,6 +4456,26 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     job = _load_json(job_path) or {}
     run_id = _canonical_run_id(run_id, job)
+
+    # ── Idempotency guard ─────────────────────────────────────────────
+    # If a valid finish.json already exists the subtask has already
+    # reached a terminal state.  Killing the (possibly recycled) PID or
+    # overwriting job.state would be harmful.  Return early with
+    # ``alreadyFinished=true`` so the caller knows cancel was a no-op.
+    existing_finish = _load_json(finish_path)
+    if isinstance(existing_finish, dict):
+        out_idem = {
+            "type": "opencode-subtask-cancel",
+            "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "timestamp": _now_ms(),
+            "runId": run_id,
+            "ok": True,
+            "alreadyFinished": True,
+            "existingFinish": existing_finish,
+        }
+        sys.stdout.write(_json_line(out_idem) + "\n")
+        return 0
+
     pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
     server_url = (
         str(job.get("serverUrl"))
@@ -4661,12 +4726,17 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             "cancelFinWritten": cancel_fin_written,
             "cancelFinReason": cancel_fin_reason,
         }
-        if ok:
-            fields["state"] = "canceled"
-            fields["canceledAt"] = now_ms
-        elif no_signal_path:
-            fields["state"] = "failed"
-            fields["failedAt"] = now_ms
+        # Only transition job state when *this* cancel actually won the
+        # terminal finish write.  If _write_finish_once returned 'exists',
+        # an earlier run/watchdog already finalised the job — overwriting
+        # state would corrupt the record (e.g. success → canceled).
+        if cancel_fin_written:
+            if ok:
+                fields["state"] = "canceled"
+                fields["canceledAt"] = now_ms
+            elif no_signal_path:
+                fields["state"] = "failed"
+                fields["failedAt"] = now_ms
         _update_job_fields_locked(job_path, artifacts_dir, fields)
 
     out2 = {
