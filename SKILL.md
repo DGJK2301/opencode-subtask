@@ -32,6 +32,7 @@ This skill turns OpenCode into a reliable "subagent primitive" for upstream agen
 2. **Artifacts-first**: Large outputs (NDJSON, transcript, stderr) written to disk
 3. **Protocol shielding**: Callers depend only on this adapter's schema, not OpenCode internals
 4. **Engine abstraction**: HTTP server API preferred, CLI fallback on non-timeout failures
+5. **Exit codes are informational**: `status`, `wait`, and `cancel` return exit code 0 when they successfully observe the task state — even if the task itself failed (`ok=false`). Always parse the stdout JSON (`ok`, `error`) to determine task outcome; do not rely on the process exit code.
 
 ## Prerequisites
 
@@ -304,6 +305,7 @@ python scripts\opencode_subtask.py run --workdir . --engine cli ^
 | `--include-debug` | Include extra debug fields in the finish JSON. |
 | `--retry-empty-output` | Enable/disable empty-output auto-retry safety net. |
 | `--empty-output-retries <n>` | Configure empty-output retry count (default 1). |
+| `--wrapper-log` / `--no-wrapper-log` | Retained for compatibility. In `start` mode, `wrapper.log` is the background worker stdout/stderr sink and is always created regardless of this flag. The flag may gain meaning in future versions but currently has no effect. |
 
 ## Prompt / input control
 
@@ -441,7 +443,11 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 
 **Note:** Optional artifact paths (`eventsPath`, `stderrPath`, `assistantPath`, `wrapperLogPath`, `resultPath`) are `null` in JSON when the corresponding file does not exist on disk. Only paths whose files have actually been created are populated with file names. `patchPath` follows its own logic (non-null only when git tracked changes exist).
 
+**Schema evolution:** `schemaVersion=1` is the current stable schema. Within v1, new fields may be added (additive-only) but existing field names, types, and semantics will not change. A breaking change (field removal, type change, or semantic redefinition) requires bumping `schemaVersion` to 2+. Callers should ignore unknown fields and must not depend on field ordering.
+
 ## Artifacts (on disk)
+
+**Note:** "always" below means the file is created once `artifacts_dir` has been initialized. Early-fatal exits (e.g. `BadArgs`, `PersonaMissing`) may terminate before directory creation, in which case no artifacts exist on disk — the error is reported solely via stdout JSON.
 
 | File | Condition | Description |
 |------|-----------|-------------|
