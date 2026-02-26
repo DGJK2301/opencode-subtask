@@ -339,12 +339,14 @@ Shutdown note:
 - `if-started` only stops when this invocation created the per-project server; `always` stops regardless of who started it.
 - Safety gate: `always` / `if-started` only stop the currently tracked **local** per-project server URL (prevents stopping unrelated or remote `--attach` targets).
 - `cancel` applies the same policy from persisted job state (`httpAttempted`, `serverStartedNew`, `stopServerAfterRunMode`) to reduce orphaned per-project servers.
+- `cancel` is **idempotent**: if `finish.json` already contains a valid terminal state (has an `ok` key), cancel returns immediately with `alreadyFinished=true` and `ok=true` — no PID kill, no job.state overwrite. An empty or structurally incomplete `finish.json` (e.g. `{}`) is NOT treated as a valid terminal state and cancel proceeds normally.
 - `cancel` success (`ok=true`) is recognized when any of the following holds:
   - local worker termination is confirmed,
   - remote `abort` succeeds, or
   - kill signal is delivered and liveness probe is inconclusive.
 - When `ok=true` comes from inconclusive liveness probing, finish error message explicitly marks cancellation as unverified.
-- `cancel` persists `job.json.state=canceled` (plus `canceledAt`) when `ok=true`, so startup orphan scans do not misclassify canceled jobs as crashes.
+- `cancel` persists `job.json.state=canceled` (plus `canceledAt`) only when the cancel finish write actually wins (i.e. no prior `finish.json` existed). If `finish.json` was already written by the worker or watchdog, job.state is not overwritten.
+- If `cancel` cannot persist `finish.json` to disk (`write_failed` / `unreadable`), it degrades `ok` to `false` and attaches a `CancelFinishWriteFailed` error so the caller knows wait/status may not see a terminal state.
 - Default safety posture: unknown worker ownership does not trigger kill. Override only when needed via `OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL`.
 - Startup/attach server lock timeout is aligned with `--server-wait` (instead of fixed 20s) to reduce false concurrent-start failures.
 - In early `OpencodeNotFound` paths, if `finish.json` already exists, adapter reuses existing finish for stdout/exit consistency.
@@ -423,9 +425,9 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
     "finishPath": "finish.json",
     "promptPath": "prompt.txt",
     "eventsPath": "events.ndjson",
-    "stderrPath": "stderr.log",
-    "assistantPath": "assistant.txt",
-    "wrapperLogPath": "wrapper.log",
+    "stderrPath": null,
+    "assistantPath": null,
+    "wrapperLogPath": null,
     "resultPath": "result.json",
     "patchPath": "changes.patch"
   },
@@ -434,6 +436,8 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 ```
 
 **Note:** `resultDigest` is a raw SHA-256 hex string (no `sha256:` prefix).
+
+**Note:** Optional artifact paths (`eventsPath`, `stderrPath`, `assistantPath`, `wrapperLogPath`, `resultPath`) are `null` in JSON when the corresponding file does not exist on disk. Only paths whose files have actually been created are populated with file names. `patchPath` follows its own logic (non-null only when git tracked changes exist).
 
 ## Artifacts (on disk)
 
@@ -512,4 +516,7 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 | `opus-4.6` reviews often timeout before completion | This adapter uses hard runtime timeout; increase `run/start --run-timeout` (commonly 1200-1800s). `wait --wait-timeout` does not extend worker runtime. |
 | `ok=false`, `error.name=EmptyModelOutput` | Model returned an empty successful response. Retry manually, or tune `--retry-empty-output` / `--empty-output-retries`. |
 | `ok=false`, `error.name=OutputTooLarge` | Reduce output or increase `--max-artifact-bytes` |
+| `ok=false`, `error.name=FinishWriteFailed` | `finish.json` could not be written to disk (permissions, disk full, etc.). The stdout JSON is degraded to `ok=false`. Check disk space and directory permissions for the artifacts dir. |
+| `ok=false`, `error.name=CancelFinishWriteFailed` | `cancel` killed the process but could not persist `finish.json`. Subsequent `wait`/`status` may not see a terminal state. Check disk space and artifacts dir permissions. |
+| `cancel` returns `alreadyFinished=true` | The job already has a valid `finish.json`. Cancel is a no-op — no PID kill, no state overwrite. This is normal for finally-cleanup patterns. |
 | `progress.idleForSeconds` keeps growing | Model stuck; check `stderr.log` for retry loops |
