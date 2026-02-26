@@ -3244,8 +3244,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     assistant_path = artifacts_dir / "assistant.txt" if args.save_text else None
     stderr_path = artifacts_dir / "stderr.log"
     # wrapper.log is only meaningful in start (background) mode;
-    # in foreground run mode there is no wrapper process.
-    wrapper_log_path = None
+    # in foreground run mode the file won't exist, so _artifacts_obj
+    # will return null for wrapperLogPath.  But we point to the
+    # canonical path so that if a start-mode worker reuses this code
+    # path the artifact is correctly referenced when present.
+    wrapper_log_path = artifacts_dir / "wrapper.log"
 
     # Job init
     job_obj = {
