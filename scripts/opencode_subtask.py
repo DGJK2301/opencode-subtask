@@ -3848,7 +3848,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     # the worker will actually compute in cmd_run.  The function mutates
     # args in place and is idempotent, so the worker calling it again is
     # harmless.
-    _apply_execution_profile(args, prompt, dict(os.environ))
+    # Important: _apply_execution_profile() reads args.timeout, so align it
+    # with the actual worker runtime timeout (run_timeout_s) before applying.
+    args.timeout = float(run_timeout_s)
+    env = _merge_env(dict(os.environ), args.env, args.env_file)
+    _apply_execution_profile(args, prompt, env)
 
     # Build worker command (explicitly pass run_id/artifacts_dir/opencode path and flags).
     py = sys.executable
