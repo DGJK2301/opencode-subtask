@@ -429,7 +429,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
     "finishPath": "finish.json",
     "promptPath": "prompt.txt",
     "eventsPath": "events.ndjson",
-    "stderrPath": null,
+    "stderrPath": "stderr.log",
     "assistantPath": null,
     "wrapperLogPath": null,
     "resultPath": "result.json",
@@ -441,7 +441,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 
 **Note:** `resultDigest` is a raw SHA-256 hex string (no `sha256:` prefix).
 
-**Note:** Optional artifact paths (`eventsPath`, `stderrPath`, `assistantPath`, `wrapperLogPath`, `resultPath`) are `null` in JSON when the corresponding file does not exist on disk. Only paths whose files have actually been created are populated with file names. `patchPath` follows its own logic (non-null only when git tracked changes exist).
+**Note:** Optional artifact paths (`eventsPath`, `assistantPath`, `wrapperLogPath`, `resultPath`) are `null` in JSON when the corresponding file does not exist on disk. Only paths whose files have actually been created are populated with file names. `stderrPath` is effectively always present once execution begins (the file is opened in append mode), but may be absent in early preflight failures before `artifacts_dir` is initialized. `patchPath` follows its own logic (non-null only when git tracked changes exist).
 
 **Schema evolution:** `schemaVersion=1` is the current stable schema. Within v1, new fields may be added (additive-only) but existing field names, types, and semantics will not change. A breaking change (field removal, type change, or semantic redefinition) requires bumping `schemaVersion` to 2+. Callers should ignore unknown fields and must not depend on field ordering.
 
