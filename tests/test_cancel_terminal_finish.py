@@ -1580,6 +1580,112 @@ class TestCancelTerminalFinish(unittest.TestCase):
         self.assertIn("--save-events", captured_cmd)
         self.assertIn("--save-text", captured_cmd)
 
+    # ── PR #17 regression tests (review10) ─────────────────────────────
+
+    def test_status_returns_0_for_failed_task(self) -> None:
+        """Exit code semantics: status observing a failed task should return 0
+        (observation succeeded), not 1.  Task outcome lives in stdout JSON."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_exitcode_") as td:
+            artifacts_dir = Path(td)
+            finish = {
+                "type": "opencode-subtask-finish",
+                "ok": False,
+                "exitCode": 1,
+                "runId": "exitcode-test",
+                "error": {"name": "Timeout", "message": "timed out"},
+            }
+            (artifacts_dir / "finish.json").write_text(
+                json.dumps(finish), encoding="utf-8"
+            )
+
+            p = argparse.ArgumentParser()
+            p.add_argument("--run-id", default="exitcode-test")
+            p.add_argument("--artifacts-dir", default=str(artifacts_dir))
+            p.add_argument("--timeout", default="600")
+            args = p.parse_args([])
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.cmd_status(args)
+
+            self.assertEqual(rc, 0, "status should return 0 when observation succeeds")
+            out = json.loads(buf.getvalue().strip())
+            self.assertFalse(out["ok"], "stdout JSON should still report ok=false")
+
+    def test_wait_returns_0_for_failed_task(self) -> None:
+        """Exit code semantics: wait observing a failed task should return 0."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_wait_exitcode_") as td:
+            artifacts_dir = Path(td)
+            finish = {
+                "type": "opencode-subtask-finish",
+                "ok": False,
+                "exitCode": 1,
+                "runId": "wait-exitcode-test",
+                "error": {"name": "EmptyModelOutput", "message": "empty"},
+            }
+            (artifacts_dir / "finish.json").write_text(
+                json.dumps(finish), encoding="utf-8"
+            )
+            (artifacts_dir / "job.json").write_text(
+                json.dumps({"runId": "wait-exitcode-test", "pid": 99999}),
+                encoding="utf-8",
+            )
+
+            p = argparse.ArgumentParser()
+            p.add_argument("--run-id", default="wait-exitcode-test")
+            p.add_argument("--artifacts-dir", default=str(artifacts_dir))
+            p.add_argument("--timeout", default="600")
+            p.add_argument("--wait-timeout", default="5")
+            p.add_argument("--poll-interval", default="0.1")
+            args = p.parse_args([])
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.cmd_wait(args)
+
+            self.assertEqual(rc, 0, "wait should return 0 when observation succeeds")
+            out = json.loads(buf.getvalue().strip())
+            self.assertFalse(out["ok"])
+
+    def test_run_id_path_traversal_rejected(self) -> None:
+        """run_id with path traversal components must be rejected."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        bad_ids = [
+            "../escape",
+            "..\\escape",
+            "foo/../bar",
+            "foo/bar",
+            "foo\\bar",
+            "hello world",  # space
+            "run_123;rm -rf /",  # semicolon
+        ]
+        for bad_id in bad_ids:
+            with self.assertRaises(ValueError, msg=f"should reject run_id={bad_id!r}"):
+                mod._validate_run_id_for_path(bad_id)
+
+    def test_run_id_valid_patterns_accepted(self) -> None:
+        """Normal run_id patterns must be accepted."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        good_ids = [
+            "run_1234567890_12345",
+            "my-custom-run.v2",
+            "test_run_001",
+            "a",
+        ]
+        for good_id in good_ids:
+            # Should not raise
+            mod._validate_run_id_for_path(good_id)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
