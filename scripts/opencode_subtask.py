@@ -683,6 +683,23 @@ def _make_run_id() -> str:
     return f"run_{_now_ms()}_{os.getpid()}"
 
 
+_RUN_ID_RE = re.compile(r"^[\w.\-]+$")  # alphanumeric, underscore, dot, hyphen
+
+
+def _validate_run_id_for_path(rid: str) -> None:
+    """Reject run_id values that could escape _runs_dir() via path traversal.
+
+    Raises ValueError if the run_id contains path separators, ``..``
+    components, or characters outside the safe whitelist.
+    """
+    if ".." in rid.split("/") or ".." in rid.split("\\"):
+        raise ValueError(f"run_id contains path traversal component: {rid!r}")
+    if "/" in rid or "\\" in rid:
+        raise ValueError(f"run_id contains path separator: {rid!r}")
+    if not _RUN_ID_RE.match(rid):
+        raise ValueError(f"run_id contains disallowed characters: {rid!r}")
+
+
 def _resolve_artifacts_dir(
     run_id: str | None, artifacts_dir: str | None
 ) -> tuple[str, Path]:
@@ -690,6 +707,7 @@ def _resolve_artifacts_dir(
     if artifacts_dir:
         ad = Path(artifacts_dir).expanduser().resolve()
     else:
+        _validate_run_id_for_path(rid)
         ad = (_runs_dir() / rid).resolve()
     return rid, ad
 
@@ -4244,7 +4262,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         fin = _load_json(finish_path)
         if isinstance(fin, dict):
             sys.stdout.write(_json_line(fin) + "\n")
-            return 0 if fin.get("ok") is True else 1
+            # Exit 0: status successfully observed terminal state.
+            # Task success/failure is in the JSON (ok/error), not the exit code.
+            return 0
         out = _status_obj(
             run_id=run_id,
             status="failed",
@@ -4398,7 +4418,9 @@ def cmd_wait(args: argparse.Namespace) -> int:
             fin = _load_json(finish_path)
             if isinstance(fin, dict):
                 sys.stdout.write(_json_line(fin) + "\n")
-                return 0 if fin.get("ok") is True else 1
+                # Exit 0: wait successfully observed terminal state.
+                # Task success/failure is in the JSON (ok/error), not the exit code.
+                return 0
             out = _status_obj(
                 run_id=run_id,
                 status="failed",

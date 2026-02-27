@@ -385,7 +385,7 @@ Start-mode alignment: `start` pre-applies the execution profile before spawning 
 
 | Mode | Behavior |
 |------|----------|
-| `auto` (default) | **With `--attach-server` (default true):** tries to attach to an existing per-project server first. If a server URL is available (via `--attach` or attached server), uses HTTP; otherwise falls back to CLI. If HTTP fails without timeout, falls back to CLI. |
+| `auto` (default) | **With `--attach-server` (default true):** tries to attach to an existing per-project server first. If a server URL is available (via `--attach` or attached server), uses HTTP; otherwise falls back to CLI. If HTTP fails without timeout, falls back to CLI. When combined with `--execution-profile`, the profile may override `auto` to a specific engine (e.g. hybrid long tasks force `cli`). |
 | `http` | HTTP only (requires server via `--attach` or `ensure-server`) |
 | `cli` | CLI only (`opencode run --format json`) |
 
