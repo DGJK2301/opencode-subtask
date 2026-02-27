@@ -348,6 +348,7 @@ Shutdown note:
   - kill signal is delivered and liveness probe is inconclusive.
 - When `ok=true` comes from inconclusive liveness probing, finish error message explicitly marks cancellation as unverified.
 - `cancel` persists `job.json.state=canceled` (plus `canceledAt`) only when the cancel finish write actually wins (i.e. no prior `finish.json` existed). If `finish.json` was already written by the worker or watchdog, job.state is not overwritten.
+- **CLI engine cancel scope**: cancel terminates the worker process group and writes a terminal `finish.json`. The opencode CLI subprocess (which runs in its own session group via `start_new_session=True`) usually exits due to pipe break, but this is not a protocol guarantee. HTTP engine cancel additionally attempts `abort` on the session. Callers should not assume cancel will deterministically stop all downstream computation — only that a terminal state will be recorded.
 - If `cancel` cannot persist `finish.json` to disk (`write_failed` / `unreadable`), it degrades `ok` to `false` and attaches a `CancelFinishWriteFailed` error so the caller knows wait/status may not see a terminal state.
 - Default safety posture: unknown worker ownership does not trigger kill. Override only when needed via `OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL`.
 - Startup/attach server lock timeout is aligned with `--server-wait` (instead of fixed 20s) to reduce false concurrent-start failures.
@@ -506,6 +507,7 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 - **Windows**: Default executable is `opencode` (the wrapper prefers `opencode.exe` if available and falls back to `opencode.cmd`); uses `taskkill /T /F` for process cleanup
 - **Fallback logging**: When HTTP→CLI fallback occurs, `engine.fallbackFrom` is set in finish JSON
 - **Orphan reaper telemetry**: run debug/job state may include `orphanReaper` details; cancel output includes `stopServerAttempted` / `stopServerOk` and ownership/probe fields (`workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`)
+- **Cache pruning**: `prune-cache` subcommand deletes old run artifact directories. Safe-by-default (dry-run); pass `--apply` to delete. `--keep-last N` (default 200) retains the N most-recent directories by mtime. Output: `type=opencode-subtask-prune-cache` JSON with `applied`, `report`, and `ok` fields.
 
 ## Troubleshooting
 
