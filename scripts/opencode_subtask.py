@@ -535,6 +535,16 @@ def _merge_env(
     return env
 
 
+def _safe_merge_env(
+    base: dict[str, str], set_vars: list[str], set_from_files: list[str]
+) -> dict[str, str]:
+    """Command-entry wrapper: converts ValueError → BadArgs (exit 2)."""
+    try:
+        return _merge_env(base, set_vars, set_from_files)
+    except ValueError as exc:
+        _exit_with_error("BadArgs", str(exc), exit_code=2)
+
+
 # ============================
 # Paths
 # ============================
@@ -717,6 +727,16 @@ def _resolve_artifacts_dir(
         except ValueError:
             raise ValueError(f"run_id resolves outside runs directory: {rid!r} -> {ad}")
     return rid, ad
+
+
+def _safe_resolve_artifacts_dir(
+    run_id: str | None, artifacts_dir: str | None
+) -> tuple[str, Path]:
+    """Command-entry wrapper: converts ValueError → BadRunId (exit 2)."""
+    try:
+        return _resolve_artifacts_dir(run_id, artifacts_dir)
+    except ValueError as exc:
+        _exit_with_error("BadRunId", str(exc), exit_code=2)
 
 
 def _canonical_run_id(run_id: str, job: Any) -> str:
@@ -3240,14 +3260,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         else float(args.timeout)
     )
 
-    run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     # Prompt
     prompt = _resolve_prompt_input(args)
 
     # Merge env early so profile thresholds can honor --env / --env-file overrides.
-    env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+    env = _safe_merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
     # Keep profile short-task classification aligned with effective runtime timeout.
     args.timeout = run_timeout_s
     requested_engine = str(getattr(args, "engine", "auto"))
@@ -3827,7 +3847,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_start(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
 
-    run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     # Prompt
@@ -3878,7 +3898,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     # Important: _apply_execution_profile() reads args.timeout, so align it
     # with the actual worker runtime timeout (run_timeout_s) before applying.
     args.timeout = float(run_timeout_s)
-    env = _merge_env(dict(os.environ), args.env, args.env_file)
+    env = _safe_merge_env(dict(os.environ), args.env, args.env_file)
     _apply_execution_profile(args, prompt, env)
 
     # Build worker command (explicitly pass run_id/artifacts_dir/opencode path and flags).
@@ -4254,7 +4274,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
         _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
 
-    run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
     prompt_path = artifacts_dir / "prompt.txt"
@@ -4385,7 +4405,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
     if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
         _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
 
-    run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
 
@@ -4497,7 +4517,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
         _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
 
-    run_id, artifacts_dir = _resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
 
@@ -4622,7 +4642,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     abort_ok = False
     abort_error: str | None = None
     if server_url and session_id:
-        env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+        env = _safe_merge_env(
+            os.environ, set_vars=args.env, set_from_files=args.env_file
+        )
         auth = _get_http_auth_from_env(env)
         try:
             OpencodeHttpClient(server_url, auth=auth, timeout_s=5.0).abort_checked(
@@ -4835,7 +4857,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 def cmd_ensure_server(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
-    env = _merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+    env = _safe_merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
     auth = _get_http_auth_from_env(env)
     opencode_bin = _resolve_executable_for_workdir(args.opencode, workdir)
     if not opencode_bin:
