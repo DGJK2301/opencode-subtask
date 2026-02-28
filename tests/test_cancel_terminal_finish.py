@@ -1699,6 +1699,20 @@ class TestCancelTerminalFinish(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"]["name"], "BadArgs")
 
+    def test_safe_merge_env_oserror_emits_bad_args(self) -> None:
+        """_safe_merge_env must exit with BadArgs (exit 2) for missing env-file."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                mod._safe_merge_env({}, [], ["MY_VAR=/nonexistent/path/to/file.txt"])
+        self.assertEqual(cm.exception.code, 2)
+        out = json.loads(buf.getvalue())
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["name"], "BadArgs")
+
     def test_run_id_valid_patterns_accepted(self) -> None:
         """Normal run_id patterns must be accepted."""
         repo_root = Path(__file__).resolve().parents[1]
