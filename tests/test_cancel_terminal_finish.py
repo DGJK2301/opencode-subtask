@@ -289,7 +289,201 @@ class TestCancelTerminalFinish(unittest.TestCase):
             th.join(timeout=5)
             srv.server_close()
 
+    def test_cancel_writes_finish_when_live_pid_and_abort_unreachable(self) -> None:
+        """Live PID (not the worker) + unreachable server → cancel detects
+        ownership mismatch, refuses to kill (safety), returns ok=false,
+        and does NOT write finish.json (cannot confirm worker is dead)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_live_unreach_") as td:
+            artifacts_dir = Path(td)
+            job_path = artifacts_dir / "job.json"
+            finish_path = artifacts_dir / "finish.json"
+
+            job = {
+                "runId": "test-live-pid-unreach",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "pid": os.getpid(),  # live but not the worker
+                "serverUrl": "http://127.0.0.1:1",  # unreachable
+                "sessionId": "ses_test",
+                "httpAttempted": True,
+                "serverStartedNew": False,
+                "stopServerAfterRunMode": "never",
+            }
+            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            # Cancel returns ok=false (ownership mismatch → refuses to kill)
+            stdout_obj = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertFalse(stdout_obj["ok"])
+            self.assertEqual(
+                stdout_obj.get("workerOwnership"),
+                "mismatch",
+                "cancel should detect PID ownership mismatch",
+            )
+            self.assertFalse(stdout_obj.get("killSignalDelivered", True))
+            # finish.json must NOT be written — can't mark a job terminal
+            # when the worker couldn't be confirmed dead
+            self.assertFalse(
+                finish_path.exists(),
+                "finish.json should NOT be written on ownership mismatch",
+            )
+
+    def test_cancel_writes_finish_when_live_pid_and_no_server(self) -> None:
+        """Live PID (not the worker) + no serverUrl/sessionId → cancel detects
+        ownership mismatch, refuses to kill, returns ok=false,
+        and does NOT write finish.json (kill-only path, safety)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_live_nosrv_") as td:
+            artifacts_dir = Path(td)
+            job_path = artifacts_dir / "job.json"
+            finish_path = artifacts_dir / "finish.json"
+
+            job = {
+                "runId": "test-live-pid-nosrv",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "pid": os.getpid(),  # live but not the worker
+                "httpAttempted": False,
+                "serverStartedNew": False,
+                "stopServerAfterRunMode": "never",
+            }
+            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            # Cancel returns ok=false (ownership mismatch → refuses to kill)
+            stdout_obj = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertFalse(stdout_obj["ok"])
+            self.assertEqual(
+                stdout_obj.get("workerOwnership"),
+                "mismatch",
+                "cancel should detect PID ownership mismatch",
+            )
+            self.assertFalse(stdout_obj.get("killSignalDelivered", True))
+            # finish.json must NOT be written
+            self.assertFalse(
+                finish_path.exists(),
+                "finish.json should NOT be written on ownership mismatch",
+            )
+            # Cancel returns ok=false (ownership mismatch → refuses to kill)
+            stdout_obj = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertFalse(stdout_obj["ok"])
+            self.assertEqual(
+                stdout_obj.get("workerOwnership"),
+                "mismatch",
+                "cancel should detect PID ownership mismatch",
+            )
+            # finish.json must still be written to mark job terminal
+            self.assertTrue(
+                finish_path.exists(),
+                f"finish.json was not written; stdout={proc.stdout!r}",
+            )
+
+    def test_cancel_writes_finish_when_live_pid_and_no_server(self) -> None:
+        """Live PID (not the worker) + no serverUrl/sessionId → cancel detects
+        ownership mismatch, refuses to kill, returns ok=false,
+        but must still write finish.json (kill-only path)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_live_nosrv_") as td:
+            artifacts_dir = Path(td)
+            job_path = artifacts_dir / "job.json"
+            finish_path = artifacts_dir / "finish.json"
+
+            job = {
+                "runId": "test-live-pid-nosrv",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "pid": os.getpid(),  # live but not the worker
+                "httpAttempted": False,
+                "serverStartedNew": False,
+                "stopServerAfterRunMode": "never",
+            }
+            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            # Cancel returns ok=false (ownership mismatch → refuses to kill)
+            stdout_obj = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertFalse(stdout_obj["ok"])
+            self.assertEqual(
+                stdout_obj.get("workerOwnership"),
+                "mismatch",
+                "cancel should detect PID ownership mismatch",
+            )
+            self.assertFalse(stdout_obj.get("killSignalDelivered", True))
+            # finish.json must NOT be written on ownership mismatch
+            self.assertFalse(
+                finish_path.exists(),
+                "finish.json should NOT be written on ownership mismatch",
+            )
+
+    def test_abort_client_handles_connection_refused(self) -> None:
+        """OpencodeHttpClient.abort to unreachable server must not crash.
+        Connection refused is caught internally and handled gracefully."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        client = mod.OpencodeHttpClient("http://127.0.0.1:1")
+        # abort() catches connection errors internally; must not raise
+        try:
+            client.abort("ses_nonexistent")
+        except Exception as exc:
+            self.fail(
+                f"abort() should handle connection refused gracefully, but raised: {exc}"
+            )
+
     def test_cancel_does_not_overwrite_existing_finish(self) -> None:
+        """Cancel must not overwrite an already-written finish.json."""
         repo_root = Path(__file__).resolve().parents[1]
         script = repo_root / "scripts" / "opencode_subtask.py"
 
