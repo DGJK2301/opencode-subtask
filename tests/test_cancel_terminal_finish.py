@@ -1671,6 +1671,34 @@ class TestCancelTerminalFinish(unittest.TestCase):
             with self.assertRaises(ValueError, msg=f"should reject run_id={bad_id!r}"):
                 mod._validate_run_id_for_path(bad_id)
 
+    def test_safe_resolve_artifacts_dir_emits_bad_run_id(self) -> None:
+        """_safe_resolve_artifacts_dir must exit with BadRunId (exit 2)."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                mod._safe_resolve_artifacts_dir("../escape", None)
+        self.assertEqual(cm.exception.code, 2)
+        out = json.loads(buf.getvalue())
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["name"], "BadRunId")
+
+    def test_safe_merge_env_emits_bad_args(self) -> None:
+        """_safe_merge_env must exit with BadArgs (exit 2) for malformed env."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                mod._safe_merge_env({}, ["NO_EQUALS_SIGN"], [])
+        self.assertEqual(cm.exception.code, 2)
+        out = json.loads(buf.getvalue())
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["name"], "BadArgs")
+
     def test_run_id_valid_patterns_accepted(self) -> None:
         """Normal run_id patterns must be accepted."""
         repo_root = Path(__file__).resolve().parents[1]
