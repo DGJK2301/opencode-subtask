@@ -538,10 +538,14 @@ def _merge_env(
 def _safe_merge_env(
     base: dict[str, str], set_vars: list[str], set_from_files: list[str]
 ) -> dict[str, str]:
-    """Command-entry wrapper: converts ValueError → BadArgs (exit 2)."""
+    """Command-entry wrapper: converts ValueError/OSError → BadArgs (exit 2).
+
+    OSError covers env-file not found / permission denied.
+    UnicodeDecodeError is a ValueError subclass, already caught.
+    """
     try:
         return _merge_env(base, set_vars, set_from_files)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         _exit_with_error("BadArgs", str(exc), exit_code=2)
 
 
