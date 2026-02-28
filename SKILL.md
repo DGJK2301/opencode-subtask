@@ -475,7 +475,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 | Use Case | Recommended Model |
 |----------|-------------------|
 | Quick probes, connectivity checks | `google/antigravity-gemini-3-flash` (variants: `minimal`, `low`, `medium`, `high`) |
-| Routine analysis, code review | `google/antigravity-claude-sonnet-4-6-thinking` (variants: `low`, `max`) |
+| Routine analysis, code review | `google/antigravity-claude-opus-4-6-thinking` (variants: `low`, `max`)  |
 | Complex analysis, multi-step refactors | `google/antigravity-claude-opus-4-6-thinking` (variants: `low`, `max`) |
 | Pure formatting, minimal reasoning | `google/antigravity-claude-sonnet-4-6` (no thinking) |
 | Simple isolated tasks | `google/antigravity-gemini-3.1-pro` (variants: `low`, `high`) |
@@ -517,6 +517,8 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 | `ok=false`, `error.name=OpencodeNotFound` | OpenCode not installed or not in PATH. Install OpenCode or use `--opencode <path>` to specify the executable path. |
 | `ok=false`, `error.name=MissingPrompt` | No prompt provided. Pass prompt after `--` or use `--prompt` / `--prompt-file`. |
 | `ok=false`, `error.name=PromptConflict` | Multiple prompt sources were provided. Use exactly one of: positional args after `--`, `--prompt`, or `--prompt-file`. |
+| `ok=false`, `error.name=BadRunId` | The `--run-id` value contains invalid characters (path separators, `..`, spaces, semicolons, etc.) or resolves outside the runs directory. Fix the run-id string. Exit code 2. |
+| `ok=false`, `error.name=BadArgs` | A CLI argument is malformed (e.g. `--env` value missing `=` separator). Fix the argument syntax. Exit code 2. |
 | `ok=false`, `error.name=MissingRunId` | `status`/`wait`/`cancel` requires `--run-id` or `--artifacts-dir`. |
 | `ok=false`, `error.name=JobNotFound` | The specified run-id/artifacts-dir doesn't have a `job.json`. The job may not have started. |
 | `ok=false`, `error.name=WorkerNotRunning` | Background worker process not running and `finish.json` missing. The job may have crashed. Check `wrapper.log` and `stderr.log`. |
