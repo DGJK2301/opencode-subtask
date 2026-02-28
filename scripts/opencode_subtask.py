@@ -708,7 +708,14 @@ def _resolve_artifacts_dir(
         ad = Path(artifacts_dir).expanduser().resolve()
     else:
         _validate_run_id_for_path(rid)
-        ad = (_runs_dir() / rid).resolve()
+        runs = _runs_dir().resolve()
+        ad = (runs / rid).resolve()
+        # Belt-and-suspenders: ensure resolved path stays under runs_dir
+        # even if symlinks or OS-level tricks bypass the regex whitelist.
+        try:
+            ad.relative_to(runs)
+        except ValueError:
+            raise ValueError(f"run_id resolves outside runs directory: {rid!r} -> {ad}")
     return rid, ad
 
 
@@ -1425,12 +1432,11 @@ def _scan_running_job_server_urls(
             continue
         finish = _load_json(run_dir / "finish.json")
         if isinstance(finish, dict):
-            err = finish.get("error")
-            if isinstance(err, dict):
-                err_name = str(err.get("name") or "").strip().lower()
-                if err_name == "canceled":
-                    # Do not treat canceled runs as crashed-owner evidence.
-                    continue
+            # Any readable finish.json means the job has reached a terminal
+            # state — it should not contribute crashed-owner evidence.
+            # Previously only canceled finishes were skipped; a successful or
+            # failed finish is equally terminal.
+            continue
         state = str(job.get("state") or "").strip().lower()
         if state != "running":
             continue

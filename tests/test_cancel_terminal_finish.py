@@ -1686,6 +1686,133 @@ class TestCancelTerminalFinish(unittest.TestCase):
             # Should not raise
             mod._validate_run_id_for_path(good_id)
 
+    # ── PR #19 regression tests (review12) ─────────────────────────────
+
+    def test_resolve_artifacts_dir_containment(self) -> None:
+        """_resolve_artifacts_dir must reject run_id that resolves outside
+        _runs_dir even if the regex whitelist somehow passes."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        # Normal valid run_id should work fine
+        rid, ad = mod._resolve_artifacts_dir("test_run_001", None)
+        self.assertEqual(rid, "test_run_001")
+        self.assertTrue(str(ad).endswith("test_run_001"))
+
+        # Explicit --artifacts-dir bypasses containment (by design)
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_ad_") as td:
+            rid2, ad2 = mod._resolve_artifacts_dir("anything", td)
+            self.assertEqual(str(ad2), str(Path(td).resolve()))
+
+    def test_scan_running_job_skips_finished_jobs(self) -> None:
+        """_scan_running_job_server_urls must skip jobs with ANY readable
+        finish.json, not just canceled ones.  A finished (ok=true or ok=false)
+        job should never contribute crashed-owner evidence."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_reaper_") as td:
+            runs_dir = Path(td)
+
+            # Job 1: running, no finish → should contribute active/crashed
+            run1 = runs_dir / "run_active"
+            run1.mkdir()
+            (run1 / "job.json").write_text(
+                json.dumps(
+                    {
+                        "runId": "run_active",
+                        "state": "running",
+                        "pid": 99999999,  # non-existent PID
+                        "serverUrl": "http://localhost:11111",
+                        "serverStartedNew": True,
+                        "workdir": str(repo_root),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Job 2: running state in job.json BUT has finish.json (ok=true)
+            run2 = runs_dir / "run_finished_ok"
+            run2.mkdir()
+            (run2 / "job.json").write_text(
+                json.dumps(
+                    {
+                        "runId": "run_finished_ok",
+                        "state": "running",
+                        "pid": 99999998,
+                        "serverUrl": "http://localhost:22222",
+                        "serverStartedNew": True,
+                        "workdir": str(repo_root),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run2 / "finish.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "type": "opencode-subtask-finish",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Job 3: running state BUT has finish.json (ok=false, non-cancel)
+            run3 = runs_dir / "run_finished_fail"
+            run3.mkdir()
+            (run3 / "job.json").write_text(
+                json.dumps(
+                    {
+                        "runId": "run_finished_fail",
+                        "state": "running",
+                        "pid": 99999997,
+                        "serverUrl": "http://localhost:33333",
+                        "serverStartedNew": True,
+                        "workdir": str(repo_root),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run3 / "finish.json").write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "type": "opencode-subtask-finish",
+                        "error": {"name": "Timeout", "message": "timed out"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Patch _runs_dir to use our temp directory
+            original_runs_dir = mod._runs_dir
+            mod._runs_dir = lambda: runs_dir
+            try:
+                _active, crashed = mod._scan_running_job_server_urls(
+                    current_project_key=mod._project_key(repo_root),
+                )
+            finally:
+                mod._runs_dir = original_runs_dir
+
+            # Job 1 (no finish) → crashed-owner (PID doesn't exist)
+            self.assertIn(
+                "http://localhost:11111",
+                crashed,
+                "job without finish.json should be in crashed_owner_urls",
+            )
+            # Job 2 (finish ok=true) → skipped entirely
+            self.assertNotIn(
+                "http://localhost:22222",
+                crashed,
+                "finished ok=true job should NOT be in crashed_owner_urls",
+            )
+            # Job 3 (finish ok=false) → skipped entirely
+            self.assertNotIn(
+                "http://localhost:33333",
+                crashed,
+                "finished ok=false job should NOT be in crashed_owner_urls",
+            )
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
