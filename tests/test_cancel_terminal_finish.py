@@ -1860,6 +1860,8 @@ class TestCancelTerminalFinish(unittest.TestCase):
             "foo\\bar",
             "hello world",  # space
             "run_123;rm -rf /",  # semicolon
+            ".",  # resolves to runs root – review17 finding A
+            "..",  # parent traversal alias
         ]
         for bad_id in bad_ids:
             with self.assertRaises(ValueError, msg=f"should reject run_id={bad_id!r}"):

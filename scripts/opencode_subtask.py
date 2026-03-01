@@ -706,6 +706,8 @@ def _validate_run_id_for_path(rid: str) -> None:
     Raises ValueError if the run_id contains path separators, ``..``
     components, or characters outside the safe whitelist.
     """
+    if rid in (".", ".."):
+        raise ValueError(f"run_id must not be a relative directory alias: {rid!r}")
     if ".." in rid.split("/") or ".." in rid.split("\\"):
         raise ValueError(f"run_id contains path traversal component: {rid!r}")
     if "/" in rid or "\\" in rid:
