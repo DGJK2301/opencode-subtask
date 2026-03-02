@@ -521,7 +521,7 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 | `ok=false`, `error.name=BadArgs` | A CLI argument is malformed (e.g. `--env` value missing `=` separator). Fix the argument syntax. Exit code 2. |
 | `ok=false`, `error.name=PromptFileReadError` | The file specified by `--prompt-file` could not be read (missing, permission denied, etc.). Check the path and permissions. Exit code 2. |
 | `ok=false`, `error.name=PersonaMissing` | `--persona-mode require` is active but the prompt does not start with a persona line (`Act as a ...`). Add a persona line as the first line, or use `--persona-mode prepend` / `off`. Exit code 2. |
-| `ok=false`, `error.name=BadPersonaMode` | An unrecognized `--persona-mode` value was provided. Valid values: `off`, `require`, `prepend`. Exit code 2. |
+| `ok=false`, `error.name=BadPersonaMode` | An unrecognized `--persona-mode` value was provided. Valid values: `off`, `require`, `prepend`, `warn`. Exit code 2. |
 | `ok=false`, `error.name=BadConfig` | An environment-variable configuration value has an invalid format (e.g. a non-numeric string where a float/int is expected). Fix the env var value. Exit code 2. |
 | `ok=false`, `error.name=MissingRunId` | `status`/`wait`/`cancel` requires `--run-id` or `--artifacts-dir`. |
 | `ok=false`, `error.name=JobNotFound` | The specified run-id/artifacts-dir doesn't have a `job.json`. The job may not have started. |
