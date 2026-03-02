@@ -392,6 +392,8 @@ Start-mode alignment: `start` pre-applies the execution profile before spawning 
 
 **Note:** `--attach-server` defaults to `true`, meaning `auto` mode will attempt to reuse an existing server if one is running for the project. Use `--no-attach-server` to force CLI mode without checking for servers.
 
+**Note (profile overrides engine):** When `--execution-profile` is set alongside `--engine auto`, the profile's engine preference takes precedence. For example, `hybrid` classifies the task as short or long — short tasks use HTTP, long tasks force CLI. The `auto` fallback logic (HTTP failure → CLI retry) still applies within the profile's chosen engine, except for HTTP timeouts which return directly without CLI retry.
+
 **Note (memory):** HTTP engine sessions live inside the per-project `opencode serve` process and are not automatically deleted. If you run many subtasks against a long-lived server, memory can grow over time. Options: run with `--stop-server-after-run if-started` (or `always`), periodically run `stop-server`, or use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`).
 
 **HTTP path** (preferred):
@@ -506,24 +508,34 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 - **Result extraction**: Prefers sentinel-wrapped JSON (`BEGIN_OC_SUBTASK_JSON`/`END_OC_SUBTASK_JSON`)
 - **Windows**: Default executable is `opencode` (the wrapper prefers `opencode.exe` if available and falls back to `opencode.cmd`); uses `taskkill /T /F` for process cleanup
 - **Fallback logging**: When HTTP→CLI fallback occurs, `engine.fallbackFrom` is set in finish JSON
+- **`--env` security**: Values passed via `--env KEY=VALUE` are visible in the process argument list. For secrets, prefer `--env-file` pointing to a file with restricted permissions.
+- **Summary length**: The contract prompt requests summaries `<=800 chars`. The `--max-text-chars` default (1000) provides headroom so the adapter does not truncate borderline-compliant model output.
 - **Orphan reaper telemetry**: run debug/job state may include `orphanReaper` details; cancel output includes `stopServerAttempted` / `stopServerOk` and ownership/probe fields (`workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`)
 - **Cache pruning**: `prune-cache` subcommand deletes old run artifact directories. Safe-by-default (dry-run); pass `--apply` to delete. `--keep-last N` (default 200) retains the N most-recent directories by mtime. Output: `type=opencode-subtask-prune-cache` JSON with `applied`, `report`, and `ok` fields.
 
 ## Troubleshooting
 
+### Exit Code Reference
+
+| Exit Code | Meaning | `ok` field | Error type |
+|-----------|---------|------------|------------|
+| 0 | Success (including successful observation of a failed task) | `true` | — |
+| 1 | Internal/runtime error (adapter bug, OpenCode crash, disk I/O failure, etc.) | `false` | `UnhandledException`, `ServerUnhealthy`, `OpencodeNotFound`, `Timeout`, `EmptyModelOutput`, `OutputTooLarge`, `FinishWriteFailed`, etc. |
+| 2 | Caller-input error (bad CLI args, invalid config, missing required input) | `false` | `BadRunId`, `BadArgs`, `BadConfig`, `MissingPrompt`, `PromptConflict`, `MissingRunId`, `PromptFileReadError`, `PersonaMissing`, `BadPersonaMode` |
+
 | Symptom | Check |
 |---------|-------|
 | `ok=false`, `error.name=ServerUnhealthy` | Server not running/healthy. If you want HTTP, run `ensure-server` (or pass `--attach`). Otherwise use CLI (`--engine cli`). |
 | `ok=false`, `error.name=OpencodeNotFound` | OpenCode not installed or not in PATH. Install OpenCode or use `--opencode <path>` to specify the executable path. |
-| `ok=false`, `error.name=MissingPrompt` | No prompt provided. Pass prompt after `--` or use `--prompt` / `--prompt-file`. |
-| `ok=false`, `error.name=PromptConflict` | Multiple prompt sources were provided. Use exactly one of: positional args after `--`, `--prompt`, or `--prompt-file`. |
+| `ok=false`, `error.name=MissingPrompt` | No prompt provided. Pass prompt after `--` or use `--prompt` / `--prompt-file`. Exit code 2. |
+| `ok=false`, `error.name=PromptConflict` | Multiple prompt sources were provided. Use exactly one of: positional args after `--`, `--prompt`, or `--prompt-file`. Exit code 2. |
 | `ok=false`, `error.name=BadRunId` | The `--run-id` value contains invalid characters (path separators, `..`, spaces, semicolons, etc.) or resolves outside the runs directory. Fix the run-id string. Exit code 2. |
 | `ok=false`, `error.name=BadArgs` | A CLI argument is malformed (e.g. `--env` value missing `=` separator). Fix the argument syntax. Exit code 2. |
 | `ok=false`, `error.name=PromptFileReadError` | The file specified by `--prompt-file` could not be read (missing, permission denied, etc.). Check the path and permissions. Exit code 2. |
 | `ok=false`, `error.name=PersonaMissing` | `--persona-mode require` is active but the prompt does not start with a persona line (`Act as a ...`). Add a persona line as the first line, or use `--persona-mode prepend` / `off`. Exit code 2. |
 | `ok=false`, `error.name=BadPersonaMode` | An unrecognized `--persona-mode` value was provided. Valid values: `off`, `require`, `prepend`, `warn`. Exit code 2. |
 | `ok=false`, `error.name=BadConfig` | An environment-variable configuration value has an invalid format (e.g. a non-numeric string where a float/int is expected). Fix the env var value. Exit code 2. |
-| `ok=false`, `error.name=MissingRunId` | `status`/`wait`/`cancel` requires `--run-id` or `--artifacts-dir`. |
+| `ok=false`, `error.name=MissingRunId` | `status`/`wait`/`cancel` requires `--run-id` or `--artifacts-dir`. Exit code 2. |
 | `ok=false`, `error.name=JobNotFound` | The specified run-id/artifacts-dir doesn't have a `job.json`. The job may not have started. |
 | `ok=false`, `error.name=WorkerNotRunning` | Background worker process not running and `finish.json` missing. The job may have crashed. Check `wrapper.log` and `stderr.log`. |
 | A `opencode serve` / Node console window pops up | You are starting/ensuring a server (`ensure-server` or `--engine http`). Use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`) to avoid starting a server. |

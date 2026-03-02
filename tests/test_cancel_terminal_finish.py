@@ -1985,5 +1985,63 @@ class TestCancelTerminalFinish(unittest.TestCase):
             )
 
 
+class TestExtractStructuredJson(unittest.TestCase):
+    """Unit tests for _extract_structured_json — the 3-strategy extraction pipeline."""
+
+    @classmethod
+    def setUpClass(cls):
+        repo = Path(__file__).resolve().parent.parent
+        module_name = "opencode_subtask_extract_test"
+        if module_name in sys.modules:
+            cls._mod = sys.modules[module_name]
+            return
+        script = repo / "scripts" / "opencode_subtask.py"
+        spec = importlib.util.spec_from_file_location(module_name, script)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+        cls._mod = mod
+
+    def test_sentinel_extraction(self):
+        """Strategy 1: sentinel-wrapped JSON is extracted."""
+        func = self._mod._extract_structured_json
+        BEGIN = self._mod.SENTINEL_BEGIN
+        END = self._mod.SENTINEL_END
+        payload = '{"summary": "done", "evidence": []}'
+        text = f"Some preamble\n{BEGIN}\n{payload}\n{END}\ntrailing"
+        result = func(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["summary"], "done")
+
+    def test_fenced_json_extraction(self):
+        """Strategy 2: fenced ```json block is extracted."""
+        func = self._mod._extract_structured_json
+        text = (
+            'Here is output:\n```json\n{"summary": "fenced", "changes": []}\n```\nDone.'
+        )
+        result = func(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["summary"], "fenced")
+
+    def test_backward_scan_extraction(self):
+        """Strategy 3: bare JSON object at end of text is found by backward scan."""
+        func = self._mod._extract_structured_json
+        text = 'Some text output\n{"summary": "scanned"}'
+        result = func(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["summary"], "scanned")
+
+    def test_empty_and_no_json_returns_none(self):
+        """No JSON anywhere → None; empty string → None."""
+        func = self._mod._extract_structured_json
+        self.assertIsNone(func(""))
+        self.assertIsNone(func("just plain text with no braces"))
+
+
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
