@@ -2380,6 +2380,30 @@ def _git_patch(workdir: Path, artifacts_dir: Path) -> str | None:
 # ============================
 
 
+def _minimal_artifacts(
+    *,
+    dir_path: Path,
+    job_path: Path,
+    finish_path: Path,
+) -> dict[str, Any]:
+    """Artifact dict for edge/error paths where optional file paths are unavailable.
+
+    Returns the same key set as _artifacts_obj so consumers see a stable shape.
+    """
+    return {
+        "dir": str(dir_path),
+        "jobPath": job_path.name,
+        "finishPath": finish_path.name,
+        "promptPath": None,
+        "eventsPath": None,
+        "stderrPath": None,
+        "assistantPath": None,
+        "wrapperLogPath": None,
+        "resultPath": None,
+        "patchPath": None,
+    }
+
+
 def _artifacts_obj(
     *,
     dir_path: Path,
@@ -2487,6 +2511,7 @@ def _start_obj(
 
 def _status_obj(
     *,
+    ok: bool = True,
     run_id: str,
     status: str,
     pid: int | None,
@@ -2497,7 +2522,7 @@ def _status_obj(
     error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
-        "ok": True,
+        "ok": ok,
         "type": "opencode-subtask-status",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "timestamp": _now_ms(),
@@ -4165,11 +4190,11 @@ def _emit_synthesized_missing_finish(
         changed_files=[],
         untracked_files=[],
         artifacts_dir=artifacts_dir,
-        artifacts={
-            "dir": str(artifacts_dir),
-            "jobPath": job_path.name,
-            "finishPath": finish_path.name,
-        },
+        artifacts=_minimal_artifacts(
+            dir_path=artifacts_dir,
+            job_path=job_path,
+            finish_path=finish_path,
+        ),
         metrics=None,
         error={"name": error_name, "message": error_message},
         include_debug=False,
@@ -4433,6 +4458,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
         )
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+
+    poll_interval = float(args.poll_interval)
+    if poll_interval <= 0:
+        _exit_with_error(
+            "BadConfig",
+            f"--poll-interval must be > 0, got: {poll_interval}",
+            exit_code=2,
+        )
+
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
 
@@ -4442,16 +4476,17 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
     if not job_path.exists() and not finish_path.exists():
         out = _status_obj(
+            ok=False,
             run_id=run_id,
             status="missing",
             pid=None,
             workdir=None,
             artifacts_dir=artifacts_dir,
-            artifacts={
-                "dir": str(artifacts_dir),
-                "jobPath": job_path.name,
-                "finishPath": finish_path.name,
-            },
+            artifacts=_minimal_artifacts(
+                dir_path=artifacts_dir,
+                job_path=job_path,
+                finish_path=finish_path,
+            ),
             error={
                 "name": "JobNotFound",
                 "message": "job.json and finish.json not found",
@@ -4475,16 +4510,17 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 # Task success/failure is in the JSON (ok/error), not the exit code.
                 return 0
             out = _status_obj(
+                ok=False,
                 run_id=run_id,
                 status="failed",
                 pid=None,
                 workdir=None,
                 artifacts_dir=artifacts_dir,
-                artifacts={
-                    "dir": str(artifacts_dir),
-                    "jobPath": job_path.name,
-                    "finishPath": finish_path.name,
-                },
+                artifacts=_minimal_artifacts(
+                    dir_path=artifacts_dir,
+                    job_path=job_path,
+                    finish_path=finish_path,
+                ),
                 error=_finish_unreadable_error(),
             )
             sys.stdout.write(_json_line(out) + "\n")
@@ -4518,16 +4554,17 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
         if time.monotonic() >= deadline:
             out = _status_obj(
+                ok=False,
                 run_id=run_id,
                 status="running",
                 pid=pid,
                 workdir=None,
                 artifacts_dir=artifacts_dir,
-                artifacts={
-                    "dir": str(artifacts_dir),
-                    "jobPath": job_path.name,
-                    "finishPath": finish_path.name,
-                },
+                artifacts=_minimal_artifacts(
+                    dir_path=artifacts_dir,
+                    job_path=job_path,
+                    finish_path=finish_path,
+                ),
                 progress=progress,
                 error={
                     "name": "WaitTimeout",
@@ -4537,7 +4574,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
             sys.stdout.write(_json_line(out) + "\n")
             return 1
 
-        time.sleep(float(args.poll_interval))
+        time.sleep(poll_interval)
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
@@ -4796,11 +4833,11 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             changed_files=[],
             untracked_files=[],
             artifacts_dir=artifacts_dir,
-            artifacts={
-                "dir": str(artifacts_dir),
-                "jobPath": job_path.name,
-                "finishPath": finish_path.name,
-            },
+            artifacts=_minimal_artifacts(
+                dir_path=artifacts_dir,
+                job_path=job_path,
+                finish_path=finish_path,
+            ),
             metrics=None,
             error=cancel_error,
             include_debug=False,
@@ -5151,7 +5188,7 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         "--wrapper-log",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Keep wrapper.log (start mode).",
+        help="Retained for compatibility; wrapper.log is always created in start mode.",
     )
 
     p.add_argument(
