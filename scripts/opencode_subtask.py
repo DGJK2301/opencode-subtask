@@ -183,6 +183,7 @@ def _apply_persona_policy(prompt: str, persona_mode: str, persona_line: str) -> 
             "Prompt must start with a persona line on the FIRST line (no leading blank lines): "
             "'Act as a [profession]...'. Either add it as line 1, or set "
             "--persona-mode prepend (auto-inject) / off (disable).",
+            exit_code=2,
         )
         return prompt  # unreachable
     if mode == "prepend":
@@ -192,7 +193,9 @@ def _apply_persona_policy(prompt: str, persona_mode: str, persona_line: str) -> 
         )
         return persona + "\n" + (prompt or "")
 
-    _exit_with_error("BadPersonaMode", f"Unknown --persona-mode: {persona_mode!r}")
+    _exit_with_error(
+        "BadPersonaMode", f"Unknown --persona-mode: {persona_mode!r}", exit_code=2
+    )
     return prompt  # unreachable
 
 
@@ -316,6 +319,7 @@ def _resolve_prompt_input(args: argparse.Namespace) -> str:
             _exit_with_error(
                 "PromptFileReadError",
                 f"Could not read --prompt-file {prompt_file_path}: {type(e).__name__}: {e}",
+                exit_code=2,
             )
     if has_text:
         return str(args.prompt_text)
@@ -332,7 +336,9 @@ def _read_env_float(env: dict[str, str], key: str) -> float | None:
     try:
         return float(txt)
     except Exception:
-        _exit_with_error("BadConfig", f"{key} must be a float, got: {raw!r}")
+        _exit_with_error(
+            "BadConfig", f"{key} must be a float, got: {raw!r}", exit_code=2
+        )
 
 
 def _read_env_int(env: dict[str, str], key: str) -> int | None:
@@ -345,7 +351,9 @@ def _read_env_int(env: dict[str, str], key: str) -> int | None:
     try:
         return int(txt)
     except Exception:
-        _exit_with_error("BadConfig", f"{key} must be an int, got: {raw!r}")
+        _exit_with_error(
+            "BadConfig", f"{key} must be an int, got: {raw!r}", exit_code=2
+        )
 
 
 def _resolve_hybrid_thresholds(
