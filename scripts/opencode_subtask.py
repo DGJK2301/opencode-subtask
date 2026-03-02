@@ -2491,6 +2491,7 @@ def _status_obj(
     error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
+        "ok": True,
         "type": "opencode-subtask-status",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "timestamp": _now_ms(),
