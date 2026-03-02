@@ -3466,7 +3466,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 sys.stdout.write(_json_line(out) + "\n")
                 return 0 if final_ok else 1
             sys.stdout.write(_json_line(out) + "\n")
-            return 127
+            return 1  # OpencodeNotFound is an internal/runtime error
 
     if not attach_url and args.attach_server:
         # Engine policy:
@@ -4342,6 +4342,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             # Task success/failure is in the JSON (ok/error), not the exit code.
             return 0
         out = _status_obj(
+            ok=False,
             run_id=run_id,
             status="failed",
             pid=None,
@@ -4367,6 +4368,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     if not job_path.exists():
         out = _status_obj(
+            ok=False,
             run_id=run_id,
             status="missing",
             pid=None,

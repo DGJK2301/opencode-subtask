@@ -5,6 +5,7 @@ import io
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,9 @@ import threading
 import unittest
 import unittest.mock
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = str(REPO_ROOT / "scripts" / "opencode_subtask.py")
 
 
 class TestCancelTerminalFinish(unittest.TestCase):
@@ -2041,6 +2045,122 @@ class TestExtractStructuredJson(unittest.TestCase):
         func = self._mod._extract_structured_json
         self.assertIsNone(func(""))
         self.assertIsNone(func("just plain text with no braces"))
+
+
+class TestMinimalArtifactsShape(unittest.TestCase):
+    """Verify _minimal_artifacts returns the same key set as _artifacts_obj."""
+
+    @classmethod
+    def setUpClass(cls):
+        repo = Path(__file__).resolve().parent.parent
+        module_name = "opencode_subtask_extract_test"
+        if module_name in sys.modules:
+            cls._mod = sys.modules[module_name]
+            return
+        script = repo / "scripts" / "opencode_subtask.py"
+        spec = importlib.util.spec_from_file_location(module_name, script)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+        cls._mod = mod
+
+    def test_key_sets_match(self):
+        """_minimal_artifacts and _artifacts_obj must produce identical key sets."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            job_path = tmp / "job.json"
+            finish_path = tmp / "finish.json"
+            prompt_path = tmp / "prompt.txt"
+            minimal = self._mod._minimal_artifacts(
+                dir_path=tmp,
+                job_path=job_path,
+                finish_path=finish_path,
+            )
+            full = self._mod._artifacts_obj(
+                dir_path=tmp,
+                job_path=job_path,
+                finish_path=finish_path,
+                prompt_path=prompt_path,
+                events_path=None,
+                stderr_path=None,
+                assistant_path=None,
+                wrapper_log_path=None,
+                result_path=None,
+                patch_path=None,
+            )
+            self.assertEqual(set(minimal.keys()), set(full.keys()))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPollIntervalValidation(unittest.TestCase):
+    """--poll-interval <= 0 must produce BadConfig exit 2."""
+
+    def _run(self, interval_val):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "wait",
+                "--run-id",
+                "test_run",
+                "--poll-interval",
+                str(interval_val),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return proc
+
+    def test_zero_poll_interval_rejected(self):
+        proc = self._run(0)
+        self.assertEqual(proc.returncode, 2)
+        out = json.loads(proc.stdout)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["name"], "BadConfig")
+
+    def test_negative_poll_interval_rejected(self):
+        proc = self._run(-5)
+        self.assertEqual(proc.returncode, 2)
+        out = json.loads(proc.stdout)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["name"], "BadConfig")
+
+
+class TestWaitJobNotFound(unittest.TestCase):
+    """cmd_wait on empty artifacts dir must return ok=false + JobNotFound."""
+
+    def test_wait_empty_dir_returns_job_not_found(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "wait",
+                    "--artifacts-dir",
+                    str(tmp),
+                    "--timeout",
+                    "1",
+                    "--poll-interval",
+                    "0.1",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 1)
+            out = json.loads(proc.stdout)
+            self.assertFalse(out["ok"])
+            self.assertEqual(out["error"]["name"], "JobNotFound")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
