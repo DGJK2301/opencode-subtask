@@ -290,6 +290,7 @@ def _join_prompt(args_prompt: list[str]) -> str:
     _exit_with_error(
         "MissingPrompt",
         "Missing prompt. Pass after `--`, via --prompt/--prompt-file, or via stdin.",
+        exit_code=2,
     )
 
 
@@ -307,6 +308,7 @@ def _resolve_prompt_input(args: argparse.Namespace) -> str:
         _exit_with_error(
             "PromptConflict",
             "Use exactly one prompt source: --prompt-file, --prompt, or positional args after `--`.",
+            exit_code=2,
         )
 
     if has_file:
@@ -370,6 +372,7 @@ def _resolve_hybrid_thresholds(
             _exit_with_error(
                 "BadConfig",
                 f"OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S must be > 0, got: {env_timeout}",
+                exit_code=2,
             )
         timeout_s = float(env_timeout)
         timeout_source = "env"
@@ -380,6 +383,7 @@ def _resolve_hybrid_thresholds(
             _exit_with_error(
                 "BadConfig",
                 f"OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS must be > 0, got: {env_prompt_chars}",
+                exit_code=2,
             )
         prompt_chars = int(env_prompt_chars)
         prompt_source = "env"
@@ -390,6 +394,7 @@ def _resolve_hybrid_thresholds(
             _exit_with_error(
                 "BadConfig",
                 f"--hybrid-short-timeout-s must be > 0, got: {flag_timeout}",
+                exit_code=2,
             )
         timeout_s = float(flag_timeout)
         timeout_source = "flag"
@@ -400,6 +405,7 @@ def _resolve_hybrid_thresholds(
             _exit_with_error(
                 "BadConfig",
                 f"--hybrid-short-prompt-chars must be > 0, got: {flag_prompt_chars}",
+                exit_code=2,
             )
         prompt_chars = int(flag_prompt_chars)
         prompt_source = "flag"
@@ -3347,6 +3353,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         _exit_with_error(
             "BadConfig",
             f"--orphan-reaper-idle-s must be >= 0, got: {reaper_idle_s}",
+            exit_code=2,
         )
     if (
         bool(getattr(args, "orphan_reaper", True))
@@ -3841,6 +3848,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             _exit_with_error(
                 "BadConfig",
                 "Invalid --stop-server-after-run mode. Expected one of: if-started, always, never.",
+                exit_code=2,
             )
 
     if should_stop_server:
@@ -4287,7 +4295,9 @@ def _maybe_finalize_stale_running_job(
 
 def cmd_status(args: argparse.Namespace) -> int:
     if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
-        _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
+        _exit_with_error(
+            "MissingRunId", "Provide --run-id or --artifacts-dir", exit_code=2
+        )
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
@@ -4418,7 +4428,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_wait(args: argparse.Namespace) -> int:
     if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
-        _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
+        _exit_with_error(
+            "MissingRunId", "Provide --run-id or --artifacts-dir", exit_code=2
+        )
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
@@ -4530,7 +4542,9 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
-        _exit_with_error("MissingRunId", "Provide --run-id or --artifacts-dir")
+        _exit_with_error(
+            "MissingRunId", "Provide --run-id or --artifacts-dir", exit_code=2
+        )
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     job_path = artifacts_dir / "job.json"
