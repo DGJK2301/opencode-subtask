@@ -35,6 +35,14 @@ class TestCancelTerminalFinish(unittest.TestCase):
             raise
         return mod
 
+    def _assert_adapter_version(self, obj: dict) -> None:
+        """Assert adapterVersion field is present and is a non-empty string."""
+        self.assertIn("adapterVersion", obj, "adapterVersion missing from output JSON")
+        self.assertIsInstance(obj["adapterVersion"], str)
+        self.assertTrue(
+            len(obj["adapterVersion"]) > 0, "adapterVersion must be non-empty"
+        )
+
     @staticmethod
     def _build_run_args(mod, repo_root: Path, artifacts_dir: Path, run_id: str):
         p = argparse.ArgumentParser(prog="run-test")
@@ -109,6 +117,16 @@ class TestCancelTerminalFinish(unittest.TestCase):
             # Dead worker means "already terminated" for cancel semantics:
             # cancel should return success and still write terminal finish.json.
             self.assertEqual(proc.returncode, 0, proc.stdout)
+            # Stdout invariant: ok=true => error absent, taskError present.
+            stdout_obj = json.loads(proc.stdout)
+            self.assertTrue(stdout_obj["ok"])
+            self.assertNotIn(
+                "error",
+                stdout_obj,
+                "ok=true => error must be absent in cancel stdout",
+            )
+            self.assertIsInstance(stdout_obj.get("taskError"), dict)
+            self.assertEqual(stdout_obj["taskError"]["name"], "Canceled")
             self.assertTrue(
                 finish_path.exists(),
                 f"finish.json was not written; stdout={proc.stdout!r}",
@@ -146,6 +164,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             out = json.loads(proc.stdout)
             self.assertEqual(out.get("type"), "opencode-subtask-status")
+            self._assert_adapter_version(out)
             self.assertEqual((out.get("error") or {}).get("name"), "FinishUnreadable")
 
     def test_wait_fail_fast_when_finish_unreadable(self) -> None:
@@ -178,6 +197,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             out = json.loads(proc.stdout)
             self.assertEqual(out.get("type"), "opencode-subtask-status")
+            self._assert_adapter_version(out)
             self.assertEqual((out.get("error") or {}).get("name"), "FinishUnreadable")
 
     def test_wait_timeout_override_takes_precedence(self) -> None:
@@ -218,6 +238,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
 
             self.assertNotEqual(rc, 0)
             out = json.loads(buf.getvalue().strip())
+            self._assert_adapter_version(out)
             self.assertEqual((out.get("error") or {}).get("name"), "WaitTimeout")
             self.assertIn("timeout=0.05s", (out.get("error") or {}).get("message", ""))
 
@@ -281,6 +302,15 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout)
                 out = json.loads(proc.stdout)
                 self.assertTrue(out.get("ok"))
+                self._assert_adapter_version(out)
+                # Stdout invariant: ok=true => error absent, taskError present.
+                self.assertNotIn(
+                    "error",
+                    out,
+                    "ok=true => error must be absent in cancel stdout",
+                )
+                self.assertIsInstance(out.get("taskError"), dict)
+                self.assertEqual(out["taskError"]["name"], "Canceled")
                 self.assertTrue(
                     finish_path.exists(),
                     f"finish.json was not written; stdout={proc.stdout!r}",
@@ -337,6 +367,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             # Cancel returns ok=false (ownership mismatch → refuses to kill)
             stdout_obj = json.loads(proc.stdout.strip().splitlines()[-1])
             self.assertFalse(stdout_obj["ok"])
+            self._assert_adapter_version(stdout_obj)
             self.assertEqual(
                 stdout_obj.get("workerOwnership"),
                 "mismatch",
@@ -392,6 +423,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             # Cancel returns ok=false (ownership mismatch → refuses to kill)
             stdout_obj = json.loads(proc.stdout.strip().splitlines()[-1])
             self.assertFalse(stdout_obj["ok"])
+            self._assert_adapter_version(stdout_obj)
             self.assertEqual(
                 stdout_obj.get("workerOwnership"),
                 "mismatch",
@@ -513,6 +545,8 @@ class TestCancelTerminalFinish(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout)
             out = json.loads(proc.stdout)
             self.assertEqual(out.get("type"), "opencode-subtask-finish")
+            # NOTE: adapterVersion not asserted here because the adapter
+            # returns the pre-existing finish.json as-is (no rewrite).
             self.assertEqual(out.get("runId"), "reuse-run")
             self.assertTrue(out.get("ok"))
             after = finish_path.read_text(encoding="utf-8")
@@ -567,15 +601,31 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 mod._kill_tree = lambda pid, sig=None: True
                 mod._wait_for_pid_dead = lambda pid, timeout_s, poll_s=0.1: False
 
-                rc = mod.cmd_cancel(
-                    argparse.Namespace(
-                        run_id=None,
-                        artifacts_dir=str(artifacts_dir),
-                        env=[],
-                        env_file=[],
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = mod.cmd_cancel(
+                        argparse.Namespace(
+                            run_id=None,
+                            artifacts_dir=str(artifacts_dir),
+                            env=[],
+                            env_file=[],
+                        )
                     )
-                )
                 self.assertEqual(rc, 0)
+                # Stdout invariant: ok=true => error absent, taskError present.
+                cancel_out = json.loads(buf.getvalue().strip())
+                self.assertTrue(cancel_out["ok"])
+                self.assertNotIn(
+                    "error",
+                    cancel_out,
+                    "ok=true => error must be absent in cancel stdout",
+                )
+                self.assertIsInstance(cancel_out.get("taskError"), dict)
+                self.assertEqual(cancel_out["taskError"]["name"], "Canceled")
+                self.assertIn(
+                    "termination not confirmed",
+                    cancel_out["taskError"]["message"],
+                )
                 out = json.loads(
                     (artifacts_dir / "job.json").read_text(encoding="utf-8")
                 )
@@ -766,6 +816,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             out = json.loads(proc.stdout)
             # The runId in stdout must be the canonical one from job.json,
             # not a freshly generated run_XXXX_YYYY.
+            self._assert_adapter_version(out)
             self.assertEqual(out.get("runId"), real_run_id)
 
     def test_cancel_uses_canonical_run_id_from_job_json(self) -> None:
@@ -809,6 +860,14 @@ class TestCancelTerminalFinish(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout)
             out = json.loads(proc.stdout)
             self.assertEqual(out.get("runId"), real_run_id)
+            # Stdout invariant: ok=true => error absent, taskError present.
+            self.assertTrue(out["ok"])
+            self.assertNotIn(
+                "error",
+                out,
+                "ok=true => error must be absent in cancel stdout",
+            )
+            self.assertIsInstance(out.get("taskError"), dict)
 
             fin = json.loads(
                 (artifacts_dir / "finish.json").read_text(encoding="utf-8")
@@ -1321,6 +1380,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
             out = json.loads(result.stdout.strip())
             self.assertTrue(out.get("ok"))
+            self._assert_adapter_version(out)
             self.assertTrue(out.get("alreadyFinished"))
             self.assertEqual(out["existingFinish"]["runId"], "already-done")
             # job.json state should NOT have been changed to 'canceled'
@@ -1460,6 +1520,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             )
             out = json.loads(result.stdout.strip())
             # Should NOT have alreadyFinished — the empty finish is not valid
+            self._assert_adapter_version(out)
             self.assertFalse(
                 out.get("alreadyFinished", False),
                 "cancel must not treat an empty {} finish.json as a valid "
@@ -1502,6 +1563,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0)
             out = json.loads(result.stdout.strip())
+            self._assert_adapter_version(out)
             self.assertTrue(out.get("alreadyFinished"))
             self.assertTrue(out.get("ok"))
             # Job state must remain unchanged
@@ -1784,6 +1846,142 @@ class TestCancelTerminalFinish(unittest.TestCase):
             out = json.loads(buf.getvalue().strip())
             self.assertFalse(out["ok"])
 
+    def test_status_worker_missing_uses_warnings_not_error(self) -> None:
+        """Contract fix: WorkerMissingPending must appear in 'warnings' (list),
+        NOT in 'error'.  ok=true, error=null, exit code 0."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(
+            prefix="ocsubtask_test_warning_contract_"
+        ) as td:
+            artifacts_dir = Path(td)
+            now_ms = int(time.time() * 1000)
+            job = {
+                "runId": "warning-contract-test",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": now_ms,
+                "updatedAt": now_ms,
+                "pid": 2147483647,  # extremely unlikely to exist
+            }
+            (artifacts_dir / "job.json").write_text(
+                json.dumps(job, indent=2), encoding="utf-8"
+            )
+            # No finish.json — forces the WorkerMissingPending path
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "status",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            # Contract: ok=true, error=null
+            self.assertTrue(out.get("ok"), "ok must be true for non-fatal warning")
+            self.assertIsNone(
+                out.get("error"),
+                "error must be null when ok=true (contract invariant)",
+            )
+            # Warning channel carries the signal
+            warnings = out.get("warnings")
+            self.assertIsInstance(warnings, list, "warnings must be a list")
+            self.assertEqual(len(warnings), 1)
+            self.assertEqual(warnings[0]["name"], "WorkerMissingPending")
+            self.assertIn("stale-window", warnings[0]["message"])
+
+    def test_status_no_warnings_when_worker_alive(self) -> None:
+        """When the worker PID is alive, warnings must be null (not [])."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_no_warning_") as td:
+            artifacts_dir = Path(td)
+            now_ms = int(time.time() * 1000)
+            job = {
+                "runId": "no-warning-test",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": now_ms,
+                "updatedAt": now_ms,
+                "pid": os.getpid(),  # current process — alive
+            }
+            (artifacts_dir / "job.json").write_text(
+                json.dumps(job, indent=2), encoding="utf-8"
+            )
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "status",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertTrue(out.get("ok"))
+            self.assertIsNone(out.get("error"))
+            self.assertEqual(
+                out.get("warnings"),
+                [],
+                "warnings must be [] when no warnings are present",
+            )
+
+    def test_status_obj_signature_includes_warnings(self) -> None:
+        """_status_obj must accept 'warnings' kwarg and include it in output."""
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(
+            prefix="ocsubtask_test_status_obj_warnings_"
+        ) as td:
+            artifacts_dir = Path(td)
+            # With warnings
+            obj = mod._status_obj(
+                ok=True,
+                run_id="sig-test",
+                status="running",
+                pid=None,
+                workdir=None,
+                artifacts_dir=artifacts_dir,
+                artifacts={},
+                warnings=[{"name": "TestWarn", "message": "hello"}],
+            )
+            self.assertIn("warnings", obj)
+            self.assertEqual(len(obj["warnings"]), 1)
+            self.assertEqual(obj["warnings"][0]["name"], "TestWarn")
+            self.assertIsNone(obj.get("error"))
+            self.assertTrue(obj["ok"])
+
+            # Without warnings (default)
+            obj2 = mod._status_obj(
+                ok=True,
+                run_id="sig-test-2",
+                status="running",
+                pid=None,
+                workdir=None,
+                artifacts_dir=artifacts_dir,
+                artifacts={},
+            )
+            self.assertIn("warnings", obj2)
+            self.assertEqual(obj2["warnings"], [])
+
     def test_run_id_path_traversal_rejected(self) -> None:
         """run_id with path traversal components must be rejected."""
         repo_root = Path(__file__).resolve().parents[1]
@@ -1816,6 +2014,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         out = json.loads(buf.getvalue())
         self.assertFalse(out["ok"])
+        self._assert_adapter_version(out)
         self.assertEqual(out["error"]["name"], "BadRunId")
 
     def test_safe_merge_env_emits_bad_args(self) -> None:
@@ -1830,6 +2029,7 @@ class TestCancelTerminalFinish(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         out = json.loads(buf.getvalue())
         self.assertFalse(out["ok"])
+        self._assert_adapter_version(out)
         self.assertEqual(out["error"]["name"], "BadArgs")
 
     def test_safe_merge_env_oserror_emits_bad_args(self) -> None:
@@ -2123,6 +2323,7 @@ class TestPollIntervalValidation(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         out = json.loads(proc.stdout)
         self.assertFalse(out["ok"])
+        self.assertIn("adapterVersion", out)
         self.assertEqual(out["error"]["name"], "BadConfig")
 
     def test_negative_poll_interval_rejected(self):
@@ -2161,6 +2362,170 @@ class TestWaitJobNotFound(unittest.TestCase):
             self.assertEqual(out["error"]["name"], "JobNotFound")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestCancelStdoutInvariant(unittest.TestCase):
+    """Enforce invariant: cancel stdout ok=true => error absent, taskError present.
+
+    Tests all three ok=true cancel paths:
+    1. Dead worker (termination confirmed, no abort needed)
+    2. Dead worker + abort fails (termination confirmed via pid_dead)
+    3. Idempotent cancel (alreadyFinished=true)
+
+    And the ok=false path:
+    4. Ownership mismatch (ok=false => error present, taskError null)
+    """
+
+    def test_ok_true_dead_worker_no_server(self) -> None:
+        """ok=true, dead PID, no server => error absent, taskError={Canceled}."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_inv_dead_") as td:
+            artifacts_dir = Path(td)
+            job = {
+                "runId": "inv-dead-nosrv",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "pid": 2147483647,
+            }
+            (artifacts_dir / "job.json").write_text(
+                json.dumps(job, indent=2), encoding="utf-8"
+            )
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0)
+            out = json.loads(proc.stdout)
+            # Core invariant
+            self.assertTrue(out["ok"])
+            self.assertNotIn(
+                "error",
+                out,
+                "INVARIANT VIOLATION: ok=true but error is present in stdout",
+            )
+            # taskError carries the task termination reason
+            self.assertIsInstance(out.get("taskError"), dict)
+            self.assertEqual(out["taskError"]["name"], "Canceled")
+            # finish.json still has error (task ended)
+            fin = json.loads(
+                (artifacts_dir / "finish.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(fin["error"]["name"], "Canceled")
+
+    def test_ok_true_idempotent_already_finished(self) -> None:
+        """ok=true, alreadyFinished => error absent, taskError null."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_inv_idem_") as td:
+            artifacts_dir = Path(td)
+            existing_finish = {
+                "type": "opencode-subtask-finish",
+                "schemaVersion": 1,
+                "ok": True,
+                "runId": "inv-idem",
+            }
+            (artifacts_dir / "finish.json").write_text(
+                json.dumps(existing_finish, indent=2), encoding="utf-8"
+            )
+            job = {
+                "runId": "inv-idem",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "pid": 2147483647,
+            }
+            (artifacts_dir / "job.json").write_text(
+                json.dumps(job, indent=2), encoding="utf-8"
+            )
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0)
+            out = json.loads(proc.stdout)
+            self.assertTrue(out["ok"])
+            self.assertTrue(out.get("alreadyFinished"))
+            self.assertNotIn(
+                "error",
+                out,
+                "INVARIANT VIOLATION: ok=true but error is present in stdout",
+            )
+            # taskError is null for idempotent cancel (no cancel finish generated)
+            self.assertIsNone(out.get("taskError"))
+
+    def test_ok_false_mismatch_has_error_no_task_error(self) -> None:
+        """ok=false, ownership mismatch => error present (no finish generated),
+        taskError null."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "opencode_subtask.py"
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_inv_mismatch_") as td:
+            artifacts_dir = Path(td)
+            job = {
+                "runId": "inv-mismatch",
+                "workdir": str(repo_root),
+                "state": "running",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "pid": os.getpid(),  # live but not the worker
+                "httpAttempted": False,
+                "serverStartedNew": False,
+                "stopServerAfterRunMode": "never",
+            }
+            (artifacts_dir / "job.json").write_text(
+                json.dumps(job, indent=2), encoding="utf-8"
+            )
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "cancel",
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            out = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertFalse(out["ok"])
+            # taskError is null (no cancel finish was generated)
+            self.assertIsNone(out.get("taskError"))
+            # ok=false invariant: error must be present.
+            self.assertIn("error", out)
+            self.assertEqual(out["error"]["name"], "CancelOwnershipMismatch")
 
 
 if __name__ == "__main__":
