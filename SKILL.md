@@ -418,7 +418,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 {
   "type": "opencode-subtask-finish",
   "schemaVersion": 1,
-  "adapterVersion": "0.5.18",
+  "adapterVersion": "0.5.19",
   "ok": true,
   "exitCode": 0,
   "timedOut": false,
