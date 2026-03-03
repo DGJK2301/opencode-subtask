@@ -39,7 +39,7 @@ from typing import Any, Final, Iterable, Never, NoReturn
 # ============================
 
 ADAPTER_SCHEMA_VERSION: Final[int] = 1
-ADAPTER_VERSION: Final[str] = "0.5.18"
+ADAPTER_VERSION: Final[str] = "0.5.19"
 
 DEFAULT_TIMEOUT_S: Final[float] = 600.0
 DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
