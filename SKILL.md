@@ -36,6 +36,7 @@ This skill turns OpenCode into a reliable "subagent primitive" for upstream agen
 5. **Exit codes are informational**: `status`, `wait`, and `cancel` return exit code 0 when they successfully observe the task state — even if the task itself failed (`ok=false`). Always parse the stdout JSON (`ok`, `error`) to determine task outcome; do not rely on the process exit code.
 6. **`ok`/`error` consistency**: When the output includes an `error` field, the following invariants always hold: `ok=true` ⇒ `error=null`; `ok=false` ⇒ `error!=null`. Callers may rely on this for branching without checking both.
 7. **Warnings are non-fatal**: The output may include a `warnings` array of `{name, message}` objects describing non-fatal anomalies observed during execution. A warning does not affect `ok`. Example: `WorkerMissingPending` — the worker PID was not found but `finish.json` has not yet appeared; the adapter continues to poll rather than failing immediately.
+8. **Stdout JSON envelope**: Every stdout JSON object — regardless of subcommand or success/failure — contains at minimum these fields: `type` (string), `schemaVersion` (int), `adapterVersion` (string), `timestamp` (int, ms since epoch), `ok` (bool), `warnings` (array, possibly empty). The `error` field (`{name, message}`) is present only when `ok=false`. Callers may rely on this uniform shape for a single decoder path.
 
 ## Prerequisites
 
@@ -417,7 +418,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 {
   "type": "opencode-subtask-finish",
   "schemaVersion": 1,
-  "adapterVersion": "0.5.17",
+  "adapterVersion": "0.5.18",
   "ok": true,
   "exitCode": 0,
   "timedOut": false,

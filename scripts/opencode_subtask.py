@@ -39,7 +39,7 @@ from typing import Any, Final, Iterable, Never, NoReturn
 # ============================
 
 ADAPTER_SCHEMA_VERSION: Final[int] = 1
-ADAPTER_VERSION: Final[str] = "0.5.17"
+ADAPTER_VERSION: Final[str] = "0.5.18"
 
 DEFAULT_TIMEOUT_S: Final[float] = 600.0
 DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
@@ -94,7 +94,9 @@ def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> Never
         "type": "opencode-subtask-error",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "adapterVersion": ADAPTER_VERSION,
+        "timestamp": _now_ms(),
         "ok": False,
+        "warnings": [],
         "error": {"name": error_name, "message": message},
     }
     sys.stdout.write(_json_line(obj) + "\n")
@@ -5012,6 +5014,7 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
                     "adapterVersion": ADAPTER_VERSION,
                     "timestamp": _now_ms(),
                     "ok": False,
+                    "warnings": [],
                     "error": {"name": "OpencodeNotFound", "message": args.opencode},
                 }
             )
@@ -5034,6 +5037,7 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
             "adapterVersion": ADAPTER_VERSION,
             "timestamp": _now_ms(),
             "ok": True,
+            "warnings": [],
             "server": st,
         }
         sys.stdout.write(_json_line(out) + "\n")
@@ -5045,6 +5049,7 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
             "adapterVersion": ADAPTER_VERSION,
             "timestamp": _now_ms(),
             "ok": False,
+            "warnings": [],
             "error": {"name": type(e).__name__, "message": str(e)},
         }
         sys.stdout.write(_json_line(out) + "\n")
@@ -5059,6 +5064,7 @@ def cmd_stop_server(args: argparse.Namespace) -> int:
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
+        "warnings": [],
         **out,
     }
     sys.stdout.write(_json_line(out2) + "\n")
@@ -5083,6 +5089,7 @@ def cmd_prune_cache(args: argparse.Namespace) -> int:
                 "adapterVersion": ADAPTER_VERSION,
                 "timestamp": _now_ms(),
                 "ok": ok,
+                "warnings": [],
                 **({"error": err} if err else {}),
                 "applied": bool(args.apply),
                 "report": rep,
@@ -5504,7 +5511,9 @@ def main(argv: list[str] | None = None) -> int:
             "type": "opencode-subtask-error",
             "schemaVersion": ADAPTER_SCHEMA_VERSION,
             "adapterVersion": ADAPTER_VERSION,
+            "timestamp": _now_ms(),
             "ok": False,
+            "warnings": [],
             "error": {"name": "UnhandledException", "message": msg},
         }
         sys.stdout.write(_json_line(obj) + "\n")
