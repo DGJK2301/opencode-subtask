@@ -29,7 +29,7 @@ This skill turns OpenCode into a reliable "subagent primitive" for upstream agen
    - `stop-server` → `opencode-subtask-stop-server`
    - CLI argument errors → `opencode-subtask-error` (with `ok: false`)
   - `cancel` includes cleanup telemetry fields: `stopServerAttempted`, `stopServerOk`, `workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`
-  - `cancel` stdout uses `taskError` (additive field) to describe why the task ended (mirrors `finish.json`'s `error`). The top-level `error` field is reserved for cancel-command failures (`ok=false` only). This enforces the `ok=true => error absent` invariant.
+  - `cancel` stdout uses `taskError` (additive field) to describe why the task ended (mirrors `finish.json`'s `error`) *only when a cancel `finish.json` was successfully persisted*; otherwise `taskError` is null. The top-level `error` field is reserved for cancel-command failures (`ok=false` only). This enforces the `ok=true => error absent` invariant.
 2. **Artifacts-first**: Large outputs (NDJSON, transcript, stderr) written to disk
 3. **Protocol shielding**: Callers depend only on this adapter's schema, not OpenCode internals
 4. **Engine abstraction**: HTTP server API preferred, CLI fallback on non-timeout failures
@@ -417,7 +417,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 {
   "type": "opencode-subtask-finish",
   "schemaVersion": 1,
-  "adapterVersion": "0.5.16",
+  "adapterVersion": "0.5.17",
   "ok": true,
   "exitCode": 0,
   "timedOut": false,
