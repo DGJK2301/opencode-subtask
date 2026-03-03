@@ -29,10 +29,13 @@ This skill turns OpenCode into a reliable "subagent primitive" for upstream agen
    - `stop-server` → `opencode-subtask-stop-server`
    - CLI argument errors → `opencode-subtask-error` (with `ok: false`)
   - `cancel` includes cleanup telemetry fields: `stopServerAttempted`, `stopServerOk`, `workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`
+  - `cancel` stdout uses `taskError` (additive field) to describe why the task ended (mirrors `finish.json`'s `error`). The top-level `error` field is reserved for cancel-command failures (`ok=false` only). This enforces the `ok=true => error absent` invariant.
 2. **Artifacts-first**: Large outputs (NDJSON, transcript, stderr) written to disk
 3. **Protocol shielding**: Callers depend only on this adapter's schema, not OpenCode internals
 4. **Engine abstraction**: HTTP server API preferred, CLI fallback on non-timeout failures
 5. **Exit codes are informational**: `status`, `wait`, and `cancel` return exit code 0 when they successfully observe the task state — even if the task itself failed (`ok=false`). Always parse the stdout JSON (`ok`, `error`) to determine task outcome; do not rely on the process exit code.
+6. **`ok`/`error` consistency**: When the output includes an `error` field, the following invariants always hold: `ok=true` ⇒ `error=null`; `ok=false` ⇒ `error!=null`. Callers may rely on this for branching without checking both.
+7. **Warnings are non-fatal**: The output may include a `warnings` array of `{name, message}` objects describing non-fatal anomalies observed during execution. A warning does not affect `ok`. Example: `WorkerMissingPending` — the worker PID was not found but `finish.json` has not yet appeared; the adapter continues to poll rather than failing immediately.
 
 ## Prerequisites
 
@@ -414,6 +417,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
 {
   "type": "opencode-subtask-finish",
   "schemaVersion": 1,
+  "adapterVersion": "0.5.16",
   "ok": true,
   "exitCode": 0,
   "timedOut": false,
@@ -426,6 +430,7 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
   "resultDigest": "abc123def456...",
   "changedFiles": ["src/login.py"],
   "untrackedFiles": [],
+  "warnings": [],
   "artifacts": {
     "dir": "/path/to/artifacts",
     "jobPath": "job.json",
@@ -441,6 +446,10 @@ All commands return a single JSON object to stdout (note: `type` varies by subco
   "error": null
 }
 ```
+
+**Note:** `adapterVersion` is a semver string identifying the adapter release that produced this output. Callers may use it for diagnostics or compatibility checks but must not gate logic on it.
+
+**Note:** `warnings` is an array (possibly empty) of `{name, message}` objects. Warnings signal non-fatal anomalies (e.g. `WorkerMissingPending` when the worker PID disappears but `finish.json` has not yet been written). Presence of warnings does not affect `ok`.
 
 **Note:** `resultDigest` is a raw SHA-256 hex string (no `sha256:` prefix).
 
@@ -512,6 +521,7 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 - **Summary length**: The contract prompt requests summaries `<=800 chars`. The `--max-text-chars` default (1000) provides headroom so the adapter does not truncate borderline-compliant model output.
 - **Orphan reaper telemetry**: run debug/job state may include `orphanReaper` details; cancel output includes `stopServerAttempted` / `stopServerOk` and ownership/probe fields (`workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`)
 - **Cache pruning**: `prune-cache` subcommand deletes old run artifact directories. Safe-by-default (dry-run); pass `--apply` to delete. `--keep-last N` (default 200) retains the N most-recent directories by mtime. Output: `type=opencode-subtask-prune-cache` JSON with `applied`, `report`, and `ok` fields.
+  - **Note:** On failure (`ok=false`), output includes a top-level `error` object.
 
 ## Troubleshooting
 
@@ -520,7 +530,7 @@ python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-
 | Exit Code | Meaning | `ok` field | Error type |
 |-----------|---------|------------|------------|
 | 0 | Success (including successful observation of a failed task) | `true` | — |
-| 1 | Internal/runtime error (adapter bug, OpenCode crash, disk I/O failure, etc.) | `false` | `UnhandledException`, `ServerUnhealthy`, `OpencodeNotFound`, `Timeout`, `EmptyModelOutput`, `OutputTooLarge`, `FinishWriteFailed`, etc. |
+| 1 | Internal/runtime error (adapter bug, OpenCode crash, disk I/O failure, `prune-cache` failure, etc.) | `false` | `UnhandledException`, `ServerUnhealthy`, `OpencodeNotFound`, `Timeout`, `EmptyModelOutput`, `OutputTooLarge`, `FinishWriteFailed`, etc. |
 | 2 | Caller-input error (bad CLI args, invalid config, missing required input) | `false` | `BadRunId`, `BadArgs`, `BadConfig`, `MissingPrompt`, `PromptConflict`, `MissingRunId`, `PromptFileReadError`, `PersonaMissing`, `BadPersonaMode` |
 
 | Symptom | Check |

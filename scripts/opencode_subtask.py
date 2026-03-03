@@ -39,6 +39,7 @@ from typing import Any, Final, Iterable, Never, NoReturn
 # ============================
 
 ADAPTER_SCHEMA_VERSION: Final[int] = 1
+ADAPTER_VERSION: Final[str] = "0.5.16"
 
 DEFAULT_TIMEOUT_S: Final[float] = 600.0
 DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
@@ -92,6 +93,7 @@ def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> Never
     obj = {
         "type": "opencode-subtask-error",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "adapterVersion": ADAPTER_VERSION,
         "ok": False,
         "error": {"name": error_name, "message": message},
     }
@@ -2067,13 +2069,19 @@ def stop_server(workdir: Path) -> dict[str, Any]:
                 st_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
             except Exception:
                 pass
-        return {
+        out = {
             "ok": ok,
             "pid": pid,
             "statePath": str(st_path),
             "keptState": kept_state,
             "reason": reason,
         }
+        if not ok:
+            out["error"] = {
+                "name": "StopServerFailed",
+                "message": f"stop-server did not terminate server (reason={reason})",
+            }
+        return out
 
 
 # ============================
@@ -2450,6 +2458,7 @@ def _finish_obj(
     result_digest: str | None,
     changed_files: list[str],
     untracked_files: list[str],
+    warnings: list[dict[str, str]] | None = None,
     artifacts_dir: Path,
     artifacts: dict[str, Any],
     metrics: dict[str, Any] | None,
@@ -2457,9 +2466,11 @@ def _finish_obj(
     include_debug: bool,
     debug: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    warnings_out = warnings or []
     obj: dict[str, Any] = {
         "type": "opencode-subtask-finish",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "ok": ok,
         "exitCode": exit_code,
@@ -2473,6 +2484,7 @@ def _finish_obj(
         "resultDigest": result_digest,
         "changedFiles": changed_files,
         "untrackedFiles": untracked_files,
+        "warnings": warnings_out,
         "artifacts": artifacts,
         "server": {
             "url": (server or {}).get("url"),
@@ -2500,6 +2512,7 @@ def _start_obj(
     return {
         "type": "opencode-subtask-start",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "ok": True,
         "runId": run_id,
@@ -2520,11 +2533,14 @@ def _status_obj(
     artifacts: dict[str, Any],
     progress: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
+    warnings: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    warnings_out = warnings or []
     return {
         "ok": ok,
         "type": "opencode-subtask-status",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "runId": run_id,
         "status": status,
@@ -2533,6 +2549,7 @@ def _status_obj(
         "artifacts": artifacts,
         "progress": progress,
         "error": error,
+        "warnings": warnings_out,
     }
 
 
@@ -3343,6 +3360,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Job init
     job_obj = {
         "runId": run_id,
+        "adapterVersion": ADAPTER_VERSION,
         "workdir": str(workdir),
         "state": "running",
         "createdAt": _now_ms(),
@@ -3916,6 +3934,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         artifacts_dir,
         {
             "runId": run_id,
+            "adapterVersion": ADAPTER_VERSION,
             "workdir": str(workdir),
             "state": "queued",
             "stopServerAfterRunMode": str(
@@ -4421,6 +4440,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if status in ("running", "queued"):
             status = "failed"
 
+    _worker_missing = pid and not _pid_running(pid) and not finish_path.exists()
     out = _status_obj(
         run_id=run_id,
         status=status,
@@ -4440,12 +4460,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             patch_path=None,
         ),
         progress=progress,
-        error=(
-            {
-                "name": "WorkerMissingPending",
-                "message": "pid is not running; waiting stale-window before synthesizing finish",
-            }
-            if (pid and not _pid_running(pid) and not finish_path.exists())
+        warnings=(
+            [
+                {
+                    "name": "WorkerMissingPending",
+                    "message": "pid is not running; waiting stale-window before synthesizing finish",
+                }
+            ]
+            if _worker_missing
             else None
         ),
     )
@@ -4606,11 +4628,13 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         out_idem = {
             "type": "opencode-subtask-cancel",
             "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "adapterVersion": ADAPTER_VERSION,
             "timestamp": _now_ms(),
             "runId": run_id,
             "ok": True,
             "alreadyFinished": True,
             "existingFinish": existing_finish,
+            "taskError": None,
         }
         sys.stdout.write(_json_line(out_idem) + "\n")
         return 0
@@ -4793,27 +4817,32 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     # worker signal path left.
     cancel_fin_written = False
     cancel_fin_reason = "skipped"
+    # task_error: describes why the task ended (written to finish.json,
+    # surfaced as additive ``taskError`` in stdout).
+    # cancel_error: describes cancel-command failure (stdout ``error``,
+    # only when ok=false).  Enforces invariant: ok=true => error=null.
+    task_error: dict | None = None
     cancel_error: dict | None = None
     no_signal_path = bool((pid <= 0) or termination_confirmed)
     if ok or no_signal_path:
         if ok:
             if cancel_unverified:
-                cancel_error = {
+                task_error = {
                     "name": "Canceled",
                     "message": "cancel signal delivered; termination not confirmed (liveness probe inconclusive)",
                 }
             else:
-                cancel_error = {
+                task_error = {
                     "name": "Canceled",
                     "message": "job canceled by adapter",
                 }
         elif abort_error:
-            cancel_error = {
+            task_error = {
                 "name": "CancelAbortFailed",
                 "message": f"worker not running; session abort failed: {abort_error}",
             }
         else:
-            cancel_error = {
+            task_error = {
                 "name": "CancelNoActiveWorker",
                 "message": "cancel requested but no active worker process remained",
             }
@@ -4841,7 +4870,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 finish_path=finish_path,
             ),
             metrics=None,
-            error=cancel_error,
+            error=task_error,
             include_debug=False,
             debug=None,
         )
@@ -4865,6 +4894,47 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                     f"wait/status may not see a terminal state"
                 ),
             }
+
+        # For failed cancels where no explicit command-error was set,
+        # promote the task_error to cancel_error so stdout ``error``
+        # stays populated on ok=false (backward-compatible).
+        if not ok and cancel_error is None and task_error is not None:
+            cancel_error = task_error
+
+    # If cancel did not confirm termination and we did not write a terminal
+    # finish.json, ensure stdout still includes a cancel-command error.
+    if not ok and cancel_error is None:
+        if worker_ownership == "mismatch":
+            msg = (
+                "refusing to kill pid due to ownership mismatch "
+                f"(pid={pid}, workerOwnership={worker_ownership})"
+            )
+            if abort_error:
+                msg += f"; abort_error={abort_error}"
+            cancel_error = {"name": "CancelOwnershipMismatch", "message": msg}
+        elif worker_ownership == "unknown" and (not allow_unknown_kill):
+            msg = (
+                "refusing to kill pid due to unknown ownership "
+                f"(pid={pid}, workerOwnership={worker_ownership}, "
+                f"allowUnknownOwnershipKill={allow_unknown_kill})"
+            )
+            if abort_error:
+                msg += f"; abort_error={abort_error}"
+            cancel_error = {"name": "CancelOwnershipUnknown", "message": msg}
+        elif kill_attempted and (not kill_signal_delivered):
+            cancel_error = {
+                "name": "CancelSignalFailed",
+                "message": f"failed to deliver termination signal(s) (pid={pid})",
+            }
+        else:
+            msg = (
+                "cancel did not confirm worker termination and session abort did not succeed "
+                f"(pid={pid}, terminationEvidence={termination_evidence}, "
+                f"workerOwnership={worker_ownership})"
+            )
+            if abort_error:
+                msg += f"; abort_error={abort_error}"
+            cancel_error = {"name": "CancelFailed", "message": msg}
 
     # Persist cancel telemetry.
     if isinstance(job, dict):
@@ -4901,6 +4971,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     out2 = {
         "type": "opencode-subtask-cancel",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "runId": run_id,
         "ok": ok,
@@ -4916,8 +4987,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "cancelUnverified": cancel_unverified,
         "stopServerAttempted": stop_attempted,
         "stopServerOk": stop_ok,
+        # taskError: describes why the task ended (mirrors finish.json error).
+        # Present when a cancel finish was generated, null otherwise.
+        "taskError": task_error,
     }
-    if cancel_error:
+    # error: cancel-command failure.  Invariant: ok=true => error absent.
+    if not ok and cancel_error:
         out2["error"] = cancel_error
     sys.stdout.write(_json_line(out2) + "\n")
     return 0 if ok else 1
@@ -4934,6 +5009,7 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
                 {
                     "type": "opencode-subtask-server",
                     "schemaVersion": ADAPTER_SCHEMA_VERSION,
+                    "adapterVersion": ADAPTER_VERSION,
                     "timestamp": _now_ms(),
                     "ok": False,
                     "error": {"name": "OpencodeNotFound", "message": args.opencode},
@@ -4955,6 +5031,7 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
         out = {
             "type": "opencode-subtask-server",
             "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "adapterVersion": ADAPTER_VERSION,
             "timestamp": _now_ms(),
             "ok": True,
             "server": st,
@@ -4965,6 +5042,7 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
         out = {
             "type": "opencode-subtask-server",
             "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "adapterVersion": ADAPTER_VERSION,
             "timestamp": _now_ms(),
             "ok": False,
             "error": {"name": type(e).__name__, "message": str(e)},
@@ -4979,6 +5057,7 @@ def cmd_stop_server(args: argparse.Namespace) -> int:
     out2 = {
         "type": "opencode-subtask-stop-server",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         **out,
     }
@@ -4989,20 +5068,29 @@ def cmd_stop_server(args: argparse.Namespace) -> int:
 def cmd_prune_cache(args: argparse.Namespace) -> int:
     rep = _prune_run_artifacts(keep_last=int(args.keep_last), dry_run=(not args.apply))
     ok = len(rep.get("errors", [])) == 0
+    err = None
+    if not ok:
+        n = len(rep.get("errors", []) or [])
+        err = {
+            "name": "PruneFailed",
+            "message": f"{n} run artifact dir(s) could not be deleted",
+        }
     sys.stdout.write(
         _json_line(
             {
                 "type": "opencode-subtask-prune-cache",
                 "schemaVersion": ADAPTER_SCHEMA_VERSION,
+                "adapterVersion": ADAPTER_VERSION,
                 "timestamp": _now_ms(),
                 "ok": ok,
+                **({"error": err} if err else {}),
                 "applied": bool(args.apply),
                 "report": rep,
             }
         )
         + "\n"
     )
-    return 0 if ok else 2
+    return 0 if ok else 1
 
 
 # ============================
@@ -5415,6 +5503,7 @@ def main(argv: list[str] | None = None) -> int:
         obj = {
             "type": "opencode-subtask-error",
             "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "adapterVersion": ADAPTER_VERSION,
             "ok": False,
             "error": {"name": "UnhandledException", "message": msg},
         }

@@ -57,6 +57,8 @@ class SmokeTests(unittest.TestCase):
         """Assert top-level error schema fields are present."""
         self.assertIn("type", obj)
         self.assertIn("schemaVersion", obj)
+        self.assertIn("adapterVersion", obj)
+        self.assertIsInstance(obj["adapterVersion"], str)
         self.assertIn("ok", obj)
         self.assertFalse(obj["ok"])
         self.assertIn("error", obj)
