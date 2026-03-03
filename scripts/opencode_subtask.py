@@ -39,7 +39,7 @@ from typing import Any, Final, Iterable, Never, NoReturn
 # ============================
 
 ADAPTER_SCHEMA_VERSION: Final[int] = 1
-ADAPTER_VERSION: Final[str] = "0.5.16"
+ADAPTER_VERSION: Final[str] = "0.5.17"
 
 DEFAULT_TIMEOUT_S: Final[float] = 600.0
 DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
@@ -4988,8 +4988,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "stopServerAttempted": stop_attempted,
         "stopServerOk": stop_ok,
         # taskError: describes why the task ended (mirrors finish.json error).
-        # Present when a cancel finish was generated, null otherwise.
-        "taskError": task_error,
+        # Present only when a cancel finish was successfully persisted.
+        "taskError": task_error if cancel_fin_written else None,
     }
     # error: cancel-command failure.  Invariant: ok=true => error absent.
     if not ok and cancel_error:

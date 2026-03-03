@@ -644,6 +644,78 @@ class TestCancelTerminalFinish(unittest.TestCase):
                 mod._kill_tree = orig_kill_tree
                 mod._wait_for_pid_dead = orig_wait_dead
 
+    def test_cancel_clears_task_error_when_finish_write_failed(self) -> None:
+        """P2: If cancel cannot persist finish.json, stdout taskError must be null.
+
+        The adapter should emit ok=false + error=CancelFinishWriteFailed, and must
+        NOT publish a taskError that implies a persisted terminal finish exists.
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        mod = self._load_adapter_module(repo_root)
+
+        with tempfile.TemporaryDirectory(prefix="ocsubtask_cancel_writefail_") as td:
+            artifacts_dir = Path(td)
+            (artifacts_dir / "job.json").write_text(
+                json.dumps(
+                    {
+                        "runId": "cancel-writefail",
+                        "workdir": str(repo_root),
+                        "state": "running",
+                        "createdAt": 1,
+                        "updatedAt": 1,
+                        "pid": 12345,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            orig_pid_running_state = mod._pid_running_state
+            orig_pid_owner = mod._pid_subtask_worker_ownership_status
+            orig_kill_tree = mod._kill_tree
+            orig_wait_dead = mod._wait_for_pid_dead
+            orig_write_finish_once = mod._write_finish_once
+            try:
+                # Simulate a successful cancel (confirmed termination), but force
+                # finish.json persistence to fail.
+                mod._pid_running_state = lambda pid: (True, True)
+                mod._pid_subtask_worker_ownership_status = (
+                    lambda pid, run_id, require_run_id=False: "verified"
+                )
+                mod._kill_tree = lambda pid, sig=None: True
+                mod._wait_for_pid_dead = lambda pid, timeout_s, poll_s=0.1: True
+
+                def fake_write_finish_once(*, artifacts_dir, finish_path, finish_obj):
+                    return (False, "write_failed", None)
+
+                mod._write_finish_once = fake_write_finish_once
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = mod.cmd_cancel(
+                        argparse.Namespace(
+                            run_id=None,
+                            artifacts_dir=str(artifacts_dir),
+                            env=[],
+                            env_file=[],
+                        )
+                    )
+
+                self.assertEqual(rc, 1)
+                out = json.loads(buf.getvalue().strip())
+                self.assertFalse(out.get("ok"))
+                self._assert_adapter_version(out)
+                self.assertIn("error", out)
+                self.assertEqual(out["error"]["name"], "CancelFinishWriteFailed")
+                self.assertIsNone(out.get("taskError"))
+                self.assertFalse((artifacts_dir / "finish.json").exists())
+            finally:
+                mod._pid_running_state = orig_pid_running_state
+                mod._pid_subtask_worker_ownership_status = orig_pid_owner
+                mod._kill_tree = orig_kill_tree
+                mod._wait_for_pid_dead = orig_wait_dead
+                mod._write_finish_once = orig_write_finish_once
+
     def test_empty_output_retry_once_then_fail(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         mod = self._load_adapter_module(repo_root)
