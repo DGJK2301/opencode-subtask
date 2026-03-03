@@ -108,6 +108,26 @@ class SmokeTests(unittest.TestCase):
         self._assert_error_schema(obj)
         self.assertEqual(obj["error"]["name"], "BadRunId")
 
+    def test_6_prompt_conflict_exit2(self) -> None:
+        """Multiple prompt sources → PromptConflict, exit 2."""
+        proc = _run(
+            "run", "--prompt-file", "nonexistent.txt", "--", "extra", "positional"
+        )
+        self.assertEqual(proc.returncode, 2)
+        obj = self._assert_single_json_line(proc)
+        self._assert_error_schema(obj)
+        self.assertEqual(obj["error"]["name"], "PromptConflict")
+
+    def test_7_persona_missing_exit2(self) -> None:
+        """--persona-mode require without persona line → PersonaMissing, exit 2."""
+        proc = _run(
+            "run", "--persona-mode", "require", "--", "Do something without persona"
+        )
+        self.assertEqual(proc.returncode, 2)
+        obj = self._assert_single_json_line(proc)
+        self._assert_error_schema(obj)
+        self.assertEqual(obj["error"]["name"], "PersonaMissing")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
