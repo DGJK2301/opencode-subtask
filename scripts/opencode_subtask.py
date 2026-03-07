@@ -190,17 +190,30 @@ def _normalize_observed_sentinel_nonce(value: str) -> str:
 
 def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> NoReturn:
     """Print a JSON error to stdout and exit. Maintains stdout contract."""
-    obj = {
+    obj = _error_obj(error_name=error_name, message=message)
+    sys.stdout.write(_json_line(obj) + "\n")
+    sys.exit(exit_code)
+
+
+def _error_obj(
+    *, error_name: str, message: str, warnings: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
+    return {
         "type": "opencode-subtask-error",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "ok": False,
-        "warnings": [],
+        "warnings": warnings or [],
         "error": {"name": error_name, "message": message},
     }
-    sys.stdout.write(_json_line(obj) + "\n")
-    sys.exit(exit_code)
+
+
+def _finish_already_present_message(finish_path: Path) -> str:
+    return (
+        "artifacts dir already contains a terminal finish.json; "
+        f"refusing to reuse prior terminal state at {finish_path}"
+    )
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -1954,21 +1967,15 @@ def _write_finish_once(
 ) -> tuple[bool, str, dict[str, Any] | None]:
     with _FileLock(_finish_lock_path(artifacts_dir)):
         if finish_path.exists():
-            existing = _load_json(finish_path)
-            if isinstance(existing, dict):
+            existing, existing_reason = _read_finish_envelope(finish_path)
+            if existing_reason is None and isinstance(existing, dict):
                 return False, "exists", existing
-            # Corrupt/unreadable: rename to preserve forensic evidence,
-            # then write the new finish so the system converges to a
-            # terminal state instead of being stuck forever.
-            corrupt_name = f"finish.corrupt.{_now_ms()}.json"
-            corrupt_path = artifacts_dir / corrupt_name
-            try:
-                os.replace(finish_path, corrupt_path)
-            except Exception:
+            quarantined_path = _quarantine_invalid_finish(finish_path)
+            if quarantined_path is None:
                 try:
-                    finish_path.unlink()
+                    finish_path.unlink(missing_ok=True)  # type: ignore[call-arg]
                 except Exception:
-                    return False, "unreadable", None
+                    return False, str(existing_reason or "unreadable").lower(), None
             try:
                 _write_json(finish_path, finish_obj)
             except Exception:
@@ -3157,6 +3164,7 @@ def _start_obj(
     artifacts_dir: Path,
     artifacts: dict[str, Any],
     output_mode: str,
+    warnings: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     return {
         "type": "opencode-subtask-start",
@@ -3164,7 +3172,7 @@ def _start_obj(
         "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "ok": True,
-        "warnings": [],
+        "warnings": warnings or [],
         "runId": run_id,
         "pid": pid,
         "workdir": str(workdir),
@@ -4155,6 +4163,20 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    finish_path = artifacts_dir / "finish.json"
+    runtime_preflight_warnings: list[dict[str, str]] = []
+    existing_finish, finish_warnings = _load_runtime_finish_envelope(finish_path)
+    runtime_preflight_warnings = _dedupe_warnings(
+        [*runtime_preflight_warnings, *finish_warnings]
+    )
+    if isinstance(existing_finish, dict):
+        err = _error_obj(
+            error_name="FinishAlreadyPresent",
+            message=_finish_already_present_message(finish_path),
+            warnings=runtime_preflight_warnings,
+        )
+        sys.stdout.write(_json_line(err) + "\n")
+        return 1
 
     # Prompt
     prompt = _resolve_prompt_input(args)
@@ -4175,7 +4197,6 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Artifacts paths
     job_path = artifacts_dir / "job.json"
-    finish_path = artifacts_dir / "finish.json"
     events_path = artifacts_dir / "events.ndjson" if args.save_events else None
     assistant_path = artifacts_dir / "assistant.txt" if args.save_text else None
     stderr_path = artifacts_dir / "stderr.log"
@@ -4655,7 +4676,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     except Exception:
         diagnostics_written_path = None
 
-    execution_warnings: list[dict[str, str]] = []
+    execution_warnings: list[dict[str, str]] = list(runtime_preflight_warnings)
     if auto_http_skip_warning:
         execution_warnings.append(auto_http_skip_warning)
     if fallback_from:
@@ -4722,20 +4743,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if (not finish_written) and isinstance(existing_finish, dict):
         out = existing_finish
     elif (not finish_written) and existing_finish is None:
-        err = {
-            "type": "opencode-subtask-error",
-            "schemaVersion": ADAPTER_SCHEMA_VERSION,
-            "adapterVersion": ADAPTER_VERSION,
-            "timestamp": _now_ms(),
-            "ok": False,
-            "warnings": [],
-            "error": {
-                "name": "FinishWriteFailed",
-                "message": (
-                    f"finish.json could not be persisted (reason={finish_reason})"
-                ),
-            },
-        }
+        err = _error_obj(
+            error_name="FinishWriteFailed",
+            message=f"finish.json could not be persisted (reason={finish_reason})",
+        )
         sys.stdout.write(_json_line(err) + "\n")
         return 1
     # Update job state only if this worker won the terminal finish write.
@@ -4821,6 +4832,20 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    finish_path = artifacts_dir / "finish.json"
+    runtime_preflight_warnings: list[dict[str, str]] = []
+    existing_finish, finish_warnings = _load_runtime_finish_envelope(finish_path)
+    runtime_preflight_warnings = _dedupe_warnings(
+        [*runtime_preflight_warnings, *finish_warnings]
+    )
+    if isinstance(existing_finish, dict):
+        err = _error_obj(
+            error_name="FinishAlreadyPresent",
+            message=_finish_already_present_message(finish_path),
+            warnings=runtime_preflight_warnings,
+        )
+        sys.stdout.write(_json_line(err) + "\n")
+        return 1
 
     # Prompt
     prompt = _resolve_prompt_input(args)
@@ -4832,7 +4857,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     _write_text(prompt_path, prompt)
 
     job_path = artifacts_dir / "job.json"
-    finish_path = artifacts_dir / "finish.json"
     wrapper_log_path = artifacts_dir / "wrapper.log"
 
     _write_job_locked(
@@ -5019,6 +5043,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         workdir=workdir,
         artifacts_dir=artifacts_dir,
         output_mode=output_mode_n,
+        warnings=runtime_preflight_warnings,
         artifacts=_artifacts_obj(
             dir_path=artifacts_dir,
             job_path=job_path,

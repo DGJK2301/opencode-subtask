@@ -1582,6 +1582,221 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         self.assertEqual(out["type"], "opencode-subtask-error")
         self.assertEqual(out["error"]["name"], "FinishWriteFailed")
 
+    def test_run_rejects_preexisting_valid_finish(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_run_existing_finish_")
+        self._write_finish(artifacts_dir, self._make_finish(artifacts_dir=artifacts_dir))
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="run-existing-finish",
+            output_mode="machine",
+            nonce="nonce-existing-finish",
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_run_cli",
+                side_effect=AssertionError("_run_cli should not run when finish already exists"),
+            ),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        self.assertEqual(rc, 1)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["type"], "opencode-subtask-error")
+        self.assertEqual(out["error"]["name"], "FinishAlreadyPresent")
+
+    def test_run_quarantines_invalid_finish_before_execution(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_run_invalid_finish_")
+        (artifacts_dir / "finish.json").write_text("{}", encoding="utf-8")
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="run-invalid-finish",
+            output_mode="machine",
+            nonce="nonce-invalid-finish",
+        )
+        outcome = self._mod.RunOutcome(
+            ok=True,
+            exit_code=0,
+            timed_out=False,
+            engine="cli",
+            fallback_from=None,
+            session_id="ses_invalid_finish",
+            full_text=self._build_payload_text(
+                nonce="nonce-invalid-finish",
+                decision="GO_NO_DELTA",
+            ),
+            metrics=None,
+            error=None,
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_resolve_executable_for_workdir",
+                return_value="__dummy_opencode__",
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_apply_execution_profile",
+                side_effect=lambda args, prompt, env: {"profile": args.execution_profile},
+            ),
+            unittest.mock.patch.object(self._mod, "_run_cli", return_value=outcome),
+            unittest.mock.patch.object(self._mod, "_git_status", return_value=([], [])),
+            unittest.mock.patch.object(self._mod, "_git_patch", return_value=None),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["type"], "opencode-subtask-finish")
+        warning_names = {item["name"] for item in out["execution"]["warnings"]}
+        self.assertIn("FinishInvalidQuarantined", warning_names)
+        finish = json.loads((artifacts_dir / "finish.json").read_text(encoding="utf-8"))
+        self.assertEqual(finish["type"], "opencode-subtask-finish")
+        self.assertTrue(list(artifacts_dir.glob("finish.invalid.*.json")))
+
+    def test_run_returns_persisted_finish_when_finish_write_loses_race(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_run_race_finish_")
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="run-race-finish",
+            output_mode="machine",
+            nonce="nonce-race-finish",
+        )
+        outcome = self._mod.RunOutcome(
+            ok=True,
+            exit_code=0,
+            timed_out=False,
+            engine="cli",
+            fallback_from=None,
+            session_id="ses_race_finish",
+            full_text=self._build_payload_text(
+                nonce="nonce-race-finish",
+                decision="GO_NO_DELTA",
+            ),
+            metrics=None,
+            error=None,
+        )
+        winning_finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            run_id="winning-run",
+            payload_status="validated",
+            payload_schema=self._mod.PAYLOAD_PROTOCOL,
+            payload_artifact_path="payload.json",
+            payload_digest="digest",
+            decision_status="determinate",
+            decision_route="GO_NO_DELTA",
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_resolve_executable_for_workdir",
+                return_value="__dummy_opencode__",
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_apply_execution_profile",
+                side_effect=lambda args, prompt, env: {"profile": args.execution_profile},
+            ),
+            unittest.mock.patch.object(self._mod, "_run_cli", return_value=outcome),
+            unittest.mock.patch.object(self._mod, "_git_status", return_value=([], [])),
+            unittest.mock.patch.object(self._mod, "_git_patch", return_value=None),
+            unittest.mock.patch.object(
+                self._mod,
+                "_write_finish_once",
+                return_value=(False, "exists", winning_finish),
+            ),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["type"], "opencode-subtask-finish")
+        self.assertEqual(out["runId"], "winning-run")
+        self.assertEqual(out["decision"]["route"], "GO_NO_DELTA")
+
+    def test_start_rejects_preexisting_valid_finish(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_start_existing_finish_")
+        self._write_finish(artifacts_dir, self._make_finish(artifacts_dir=artifacts_dir))
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="start-existing-finish",
+            output_mode="machine",
+            nonce="nonce-start-existing",
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self._mod.cmd_start(args)
+        self.assertEqual(rc, 1)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["type"], "opencode-subtask-error")
+        self.assertEqual(out["error"]["name"], "FinishAlreadyPresent")
+
+    def test_worker_run_rejects_finish_created_after_start_preflight(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_start_then_run_existing_finish_")
+        args_start = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="start-then-run-existing-finish",
+            output_mode="machine",
+            nonce="nonce-start-then-run",
+        )
+        start_buf = io.StringIO()
+
+        dummy_proc = unittest.mock.Mock()
+        dummy_proc.pid = 4242
+        dummy_proc.poll.return_value = None
+        dummy_proc.wait.return_value = 0
+
+        with (
+            unittest.mock.patch.object(
+                self._mod.subprocess, "Popen", return_value=dummy_proc
+            ),
+            contextlib.redirect_stdout(start_buf),
+        ):
+            start_rc = self._mod.cmd_start(args_start)
+        self.assertEqual(start_rc, 0)
+        start_out = json.loads(start_buf.getvalue().strip())
+        self.assertEqual(start_out["type"], "opencode-subtask-start")
+
+        self._write_finish(
+            artifacts_dir,
+            self._make_finish(
+                artifacts_dir=artifacts_dir,
+                run_id="competing-run",
+                payload_status="validated",
+                payload_schema=self._mod.PAYLOAD_PROTOCOL,
+                payload_artifact_path="payload.json",
+                payload_digest="digest",
+                decision_status="determinate",
+                decision_route="GO_NO_DELTA",
+            ),
+        )
+
+        args_run = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="start-then-run-existing-finish",
+            output_mode="machine",
+            nonce="nonce-start-then-run",
+        )
+        run_buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_run_cli",
+                side_effect=AssertionError(
+                    "_run_cli should not run when finish appears before worker preflight"
+                ),
+            ),
+            contextlib.redirect_stdout(run_buf),
+        ):
+            run_rc = self._mod.cmd_run(args_run)
+        self.assertEqual(run_rc, 1)
+        run_out = json.loads(run_buf.getvalue().strip())
+        self.assertEqual(run_out["type"], "opencode-subtask-error")
+        self.assertEqual(run_out["error"]["name"], "FinishAlreadyPresent")
+
     def test_judge_execution_only_accepts_completed(self) -> None:
         artifacts_dir = self._mktempdir("ocsubtask_v2_judge_exec_")
         finish = {
