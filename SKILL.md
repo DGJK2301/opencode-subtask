@@ -200,7 +200,7 @@ Payload schema:
 | `NONCE_MISMATCH` | Payload nonce did not match the expected contract nonce. |
 | `PAYLOAD_JSON_INVALID` | Payload body was not valid JSON. |
 | `PAYLOAD_SCHEMA_INVALID` | Payload JSON shape was invalid. |
-| `DECISION_INVALID` | `decision` was missing or outside the allowed enum. |
+| `DECISION_INVALID` | `decision` was a string, but outside the allowed enum. |
 | `PAYLOAD_PERSIST_FAILED` | `payload.json` write failed after validation. |
 
 ### `judge.verdict`

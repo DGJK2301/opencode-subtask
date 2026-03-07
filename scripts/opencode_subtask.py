@@ -3384,13 +3384,22 @@ class ArtifactBudgetSupervisor:
             self._stop_evt.wait(self._poll_interval_s)
 
     def _first_breached_path(self) -> Path | None:
-        for path in self._watched_paths:
-            try:
-                if path.exists() and path.stat().st_size > self._max_bytes:
-                    return path
-            except Exception:
-                continue
+        return _first_breached_artifact_path(self._watched_paths, self._max_bytes)
+
+
+def _first_breached_artifact_path(
+    watched_paths: Iterable[Path], max_bytes: int
+) -> Path | None:
+    max_bytes_n = int(max_bytes)
+    if max_bytes_n <= 0:
         return None
+    for path in watched_paths:
+        try:
+            if isinstance(path, Path) and path.exists() and path.stat().st_size > max_bytes_n:
+                return path
+        except Exception:
+            continue
+    return None
 
 
 def _run_cli(
@@ -3509,8 +3518,9 @@ def _run_cli(
         except Exception:
             pass
 
+    watched_artifact_paths = [p for p in [stderr_path, events_path, assistant_path] if p]
     supervisor = ArtifactBudgetSupervisor(
-        watched_paths=[p for p in [stderr_path, events_path, assistant_path] if p],
+        watched_paths=watched_artifact_paths,
         max_bytes=max_artifact_bytes,
         on_breach=on_artifact_breach,
     )
@@ -3756,8 +3766,9 @@ def _run_http(
             except Exception:
                 pass
 
+    watched_artifact_paths = [p for p in [stderr_path, events_path, assistant_path] if p]
     supervisor = ArtifactBudgetSupervisor(
-        watched_paths=[p for p in [stderr_path, events_path, assistant_path] if p],
+        watched_paths=watched_artifact_paths,
         max_bytes=max_artifact_bytes,
         on_breach=on_artifact_breach,
     )
@@ -4089,7 +4100,14 @@ def _run_http(
                 assistant_fp.write(text.encode("utf-8", errors="replace"))
             except Exception:
                 pass
-        full_text = text
+        breached_after_write = supervisor.breached_path or _first_breached_artifact_path(
+            watched_artifact_paths, max_artifact_bytes
+        )
+        if breached_after_write is not None:
+            err = _output_too_large_error(breached_after_write)
+            full_text = ""
+        else:
+            full_text = text
     else:
         full_text = ""
 
