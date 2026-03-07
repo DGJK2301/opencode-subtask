@@ -3255,8 +3255,14 @@ def _maybe_write_diagnostics(
     extraction: MachinePayloadExtraction,
 ) -> Path | None:
     mode_n = _normalize_diagnostics_mode(mode)
+    output_mode_n = _normalize_output_mode(output_mode)
+    extraction_failed = (
+        extraction.payload_status != "not_requested"
+        if output_mode_n == "text"
+        else extraction.payload_status != "validated"
+    )
     should_write = mode_n == "always" or (
-        mode_n == "on-failure" and extraction.payload_status != "validated"
+        mode_n == "on-failure" and extraction_failed
     )
     if not should_write:
         return None
@@ -3731,6 +3737,15 @@ def _run_http(
     sse_open_error: list[str] = []
     session_box: dict[str, str | None] = {"id": None}
 
+    def _output_too_large_error(path: Path) -> dict[str, str]:
+        return {
+            "name": "OutputTooLarge",
+            "message": (
+                f"artifact {path.name} exceeded "
+                f"max-artifact-bytes={max_artifact_bytes}"
+            ),
+        }
+
     def on_artifact_breach(path: Path) -> None:
         stop_evt.set()
         session_id_local = session_box.get("id")
@@ -3952,6 +3967,29 @@ def _run_http(
                 on_session_id(session_id)
             except Exception:
                 pass
+        breached_path = supervisor.breached_path
+        if stop_evt.is_set() and breached_path is not None:
+            try:
+                client.abort(session_id)
+            except Exception:
+                pass
+            supervisor.stop()
+            if events_fp:
+                events_fp.close()
+            if assistant_fp:
+                assistant_fp.close()
+            stderr_fp.close()
+            return RunOutcome(
+                ok=False,
+                exit_code=1,
+                timed_out=False,
+                engine="http",
+                fallback_from=None,
+                session_id=session_id,
+                full_text="",
+                metrics=None,
+                error=_output_too_large_error(breached_path),
+            )
     except Exception as e:
         supervisor.stop()
         if events_fp:
@@ -4016,13 +4054,7 @@ def _run_http(
 
     try:
         if supervisor.breached_path is not None:
-            err = {
-                "name": "OutputTooLarge",
-                "message": (
-                    f"artifact {supervisor.breached_path.name} exceeded "
-                    f"max-artifact-bytes={max_artifact_bytes}"
-                ),
-            }
+            err = _output_too_large_error(supervisor.breached_path)
         else:
             msg_obj = client.send_message_sync(
                 session_id,
@@ -4062,13 +4094,7 @@ def _run_http(
 
     if supervisor.breached_path is not None:
         timed_out = False
-        err = {
-            "name": "OutputTooLarge",
-            "message": (
-                f"artifact {supervisor.breached_path.name} exceeded "
-                f"max-artifact-bytes={max_artifact_bytes}"
-            ),
-        }
+        err = _output_too_large_error(supervisor.breached_path)
 
     if events_fp:
         events_fp.close()

@@ -13,6 +13,7 @@ import time
 import unittest
 import unittest.mock
 from pathlib import Path
+from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = str(REPO_ROOT / "scripts" / "opencode_subtask.py")
@@ -615,6 +616,7 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         self.assertEqual(out["payload"]["status"], "not_requested")
         self.assertEqual(out["decision"]["status"], "not_requested")
         self.assertFalse((artifacts_dir / "payload.json").exists())
+        self.assertFalse((artifacts_dir / "diagnostics.json").exists())
 
     def test_run_timeout_maps_exit_code_from_execution_outcome(self) -> None:
         timeout_outcome = self._mod.RunOutcome(
@@ -1384,6 +1386,76 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error["name"], "OutputTooLarge")
         self.assertIn("events.ndjson", outcome.error["message"])
+
+    def test_run_http_preexisting_artifact_breach_aborts_created_session(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_http_cap_race_")
+        stderr_path = artifacts_dir / "stderr.log"
+        stderr_path.write_text("x" * 2048, encoding="utf-8")
+        events_path = artifacts_dir / "events.ndjson"
+        assistant_path = artifacts_dir / "assistant.txt"
+        state: dict[str, object] = {
+            "abort_calls": [],
+            "send_called": False,
+            "open_sse_called": False,
+        }
+
+        class _FakeHttpClient:
+            def __init__(self, server_url, auth=None, timeout_s=10.0) -> None:
+                return None
+
+            def health(self) -> dict:
+                return {"healthy": True}
+
+            def create_session(self) -> dict:
+                time.sleep(0.25)
+                return {"id": "ses_race"}
+
+            def open_sse(self, path, timeout_s=2.0):
+                state["open_sse_called"] = True
+                raise AssertionError("open_sse should not run after preexisting breach")
+
+            def abort(self, session_id: str) -> None:
+                cast(list[str], state["abort_calls"]).append(session_id)
+
+            def reply_permission(
+                self, session_id: str, permission_id: str, response: str, remember: bool
+            ) -> None:
+                return None
+
+            def send_message_sync(
+                self, session_id: str, prompt: str, model, variant, agent, timeout_s: float
+            ) -> dict:
+                state["send_called"] = True
+                raise AssertionError(
+                    "send_message_sync should not run after preexisting breach"
+                )
+
+        with unittest.mock.patch.object(self._mod, "OpencodeHttpClient", _FakeHttpClient):
+            outcome = self._mod._run_http(
+                server_url="http://127.0.0.1:8765",
+                workdir=artifacts_dir,
+                env=os.environ.copy(),
+                prompt="Act as a senior software engineer.",
+                agent=None,
+                model=None,
+                variant=None,
+                timeout_s=10.0,
+                save_events=True,
+                save_text=True,
+                max_artifact_bytes=1024,
+                events_path=events_path,
+                stderr_path=stderr_path,
+                assistant_path=assistant_path,
+                permission_mode="inherit",
+                on_session_id=None,
+            )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.session_id, "ses_race")
+        self.assertEqual(outcome.error["name"], "OutputTooLarge")
+        self.assertIn("stderr.log", outcome.error["message"])
+        self.assertEqual(state["abort_calls"], ["ses_race"])
+        self.assertFalse(cast(bool, state["open_sse_called"]))
+        self.assertFalse(cast(bool, state["send_called"]))
 
     def test_run_reports_finish_write_failed_as_json_error(self) -> None:
         artifacts_dir = self._mktempdir("ocsubtask_v2_finish_write_failed_")
