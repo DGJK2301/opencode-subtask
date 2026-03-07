@@ -20,8 +20,8 @@ Exactly one JSON line is printed to stdout.
 
 | Command | Stdout `type` |
 |---|---|
-| `run` | `opencode-subtask-finish` |
-| `start` | `opencode-subtask-start` |
+| `run` | `opencode-subtask-finish` on normal terminal completion; `opencode-subtask-error` on preflight or finish-persistence failure |
+| `start` | `opencode-subtask-start` on successful launch; `opencode-subtask-error` on preflight or launch failure |
 | `status` | `opencode-subtask-status` or `opencode-subtask-finish` |
 | `wait` | `opencode-subtask-status` or `opencode-subtask-finish` |
 | `cancel` | `opencode-subtask-cancel` |
