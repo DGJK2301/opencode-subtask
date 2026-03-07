@@ -4,7 +4,7 @@ opencode_subtask.py
 
 A Codex-friendly adapter around OpenCode that provides:
 - Stable one-line JSON output (ASCII-only) with schemaVersion.
-- Artifacts-first logging (events/stderr/assistant/result/patch) to avoid caller context bloat.
+- Artifacts-first logging (events/stderr/assistant/payload/patch) to avoid caller context bloat.
 - Job semantics: start -> wait (background) and run (foreground).
 - Engine abstraction: HTTP server API preferred; CLI fallback.
 
@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import socket
@@ -32,17 +33,16 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import rmtree, which
-from typing import Any, Final, Iterable, Never, NoReturn
+from typing import Any, Final, Iterable, NoReturn
 
 # ============================
 # Constants / schema
 # ============================
 
-ADAPTER_SCHEMA_VERSION: Final[int] = 1
-ADAPTER_VERSION: Final[str] = "0.5.19"
+ADAPTER_SCHEMA_VERSION: Final[int] = 2
+ADAPTER_VERSION: Final[str] = "0.6.0"
 
 DEFAULT_TIMEOUT_S: Final[float] = 600.0
-DEFAULT_MAX_TEXT_CHARS: Final[int] = 1000
 DEFAULT_GIT_TIMEOUT_S: Final[float] = 20.0
 DEFAULT_STALE_IDLE_S: Final[float] = 600.0
 DEFAULT_DEAD_WORKER_GRACE_S: Final[float] = 180.0
@@ -69,6 +69,97 @@ DEFAULT_SERVER_WAIT_S: Final[float] = 10.0
 
 SENTINEL_BEGIN: Final[str] = "BEGIN_OC_SUBTASK_JSON"
 SENTINEL_END: Final[str] = "END_OC_SUBTASK_JSON"
+PAYLOAD_PROTOCOL: Final[str] = "opencode-subtask-payload-v2"
+OUTPUT_MODES: Final[set[str]] = {"machine", "text"}
+DIAGNOSTICS_MODES: Final[set[str]] = {"never", "on-failure", "always"}
+FINISH_OUTCOMES: Final[set[str]] = {
+    "completed",
+    "failed",
+    "timed_out",
+    "cancelled",
+    "internal_error",
+}
+PAYLOAD_STATUSES: Final[set[str]] = {
+    "validated",
+    "not_requested",
+    "missing",
+    "malformed",
+    "ambiguous",
+    "persist_failed",
+}
+DECISION_STATUSES: Final[set[str]] = {
+    "determinate",
+    "abstained",
+    "unavailable",
+    "not_requested",
+}
+DECISION_ROUTES: Final[set[str]] = {"GO_NO_DELTA", "MANDATORY_DELTA"}
+EXECUTION_PROFILES: Final[set[str]] = {"hybrid", "latency", "checkpoint"}
+EXECUTION_ENGINE_SELECTED_VALUES: Final[set[str]] = {
+    "cli",
+    "http",
+    "none",
+    "watchdog",
+    "cancel",
+}
+EXECUTION_ENGINE_FALLBACK_VALUES: Final[set[str]] = {"http"}
+PAYLOAD_DECISIONS: Final[set[str]] = DECISION_ROUTES | {"UNDETERMINED"}
+PAYLOAD_ERROR_CODES: Final[set[str]] = {
+    "PAYLOAD_MISSING",
+    "SENTINEL_MULTIPLE",
+    "SENTINEL_TRAILING_TEXT",
+    "NONCE_MISMATCH",
+    "PAYLOAD_JSON_INVALID",
+    "PAYLOAD_SCHEMA_INVALID",
+    "DECISION_INVALID",
+    "PAYLOAD_PERSIST_FAILED",
+}
+JUDGE_POLICIES: Final[set[str]] = {
+    "execution-only",
+    "require-determinate",
+    "require-go-no-delta",
+}
+JUDGE_REASON: Final[dict[str, str]] = {
+    "finish_not_found": "FINISH_NOT_FOUND",
+    "finish_unreadable": "FINISH_UNREADABLE",
+    "finish_invalid": "FINISH_INVALID",
+    "unknown_policy": "UNKNOWN_POLICY",
+    "payload_digest_mismatch": "PAYLOAD_DIGEST_MISMATCH",
+    "execution_completed": "EXECUTION_COMPLETED",
+    "execution_failed": "EXECUTION_FAILED",
+    "execution_timed_out": "EXECUTION_TIMED_OUT",
+    "execution_internal_error": "EXECUTION_INTERNAL_ERROR",
+    "execution_cancelled": "EXECUTION_CANCELLED",
+    "execution_unknown": "EXECUTION_UNKNOWN",
+    "output_not_machine": "OUTPUT_NOT_MACHINE",
+    "payload_missing": "PAYLOAD_MISSING",
+    "payload_malformed": "PAYLOAD_MALFORMED",
+    "payload_ambiguous": "PAYLOAD_AMBIGUOUS",
+    "payload_persist_failed": "PAYLOAD_PERSIST_FAILED",
+    "decision_go_no_delta": "DECISION_GO_NO_DELTA",
+    "decision_mandatory_delta": "DECISION_MANDATORY_DELTA",
+    "decision_undetermined": "DECISION_UNDETERMINED",
+    "decision_unavailable": "DECISION_UNAVAILABLE",
+}
+JUDGE_EXECUTION_REASON_BY_OUTCOME: Final[dict[str, str]] = {
+    "completed": JUDGE_REASON["execution_completed"],
+    "failed": JUDGE_REASON["execution_failed"],
+    "timed_out": JUDGE_REASON["execution_timed_out"],
+    "internal_error": JUDGE_REASON["execution_internal_error"],
+    "cancelled": JUDGE_REASON["execution_cancelled"],
+}
+JUDGE_PAYLOAD_REASON_BY_STATUS: Final[dict[str, str]] = {
+    "missing": JUDGE_REASON["payload_missing"],
+    "malformed": JUDGE_REASON["payload_malformed"],
+    "ambiguous": JUDGE_REASON["payload_ambiguous"],
+    "persist_failed": JUDGE_REASON["payload_persist_failed"],
+}
+GENERIC_SENTINEL_BEGIN_RE: Final[re.Pattern[str]] = re.compile(
+    rf"{re.escape(SENTINEL_BEGIN)}_([A-Za-z0-9._-]+)"
+)
+GENERIC_SENTINEL_END_RE: Final[re.Pattern[str]] = re.compile(
+    rf"{re.escape(SENTINEL_END)}_([A-Za-z0-9._-]+)"
+)
 
 JSON_FENCE_RE: Final[re.Pattern[str]] = re.compile(
     r"```(?:json)?\s*({[\s\S]*?})\s*```", re.IGNORECASE
@@ -88,7 +179,16 @@ def _json_line(obj: dict[str, Any]) -> str:
     return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
 
 
-def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> Never:
+def _normalize_observed_sentinel_nonce(value: str) -> str:
+    # Review models sometimes echo marker instructions inline and attach sentence
+    # punctuation to the nonce token. Treat that punctuation as non-semantic when
+    # diagnosing marker collisions.
+    normalized = str(value).rstrip("`'\".,:;!?)]}")
+    # Markdown separators like END...--- should not be treated as a distinct nonce.
+    return re.sub(r"-{3,}$", "", normalized)
+
+
+def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> NoReturn:
     """Print a JSON error to stdout and exit. Maintains stdout contract."""
     obj = {
         "type": "opencode-subtask-error",
@@ -108,7 +208,11 @@ class _JsonArgumentParser(argparse.ArgumentParser):
     ArgumentParser that preserves adapter stdout JSON contract on CLI parse errors.
     """
 
-    def error(self, message: str) -> Never:  # pragma: no cover - thin adapter
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> NoReturn:  # pragma: no cover - thin adapter
         _exit_with_error("BadArgs", message, exit_code=2)
 
 
@@ -211,14 +315,6 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
-    if max_chars <= 0:
-        return "", True
-    if len(text) <= max_chars:
-        return text, False
-    return text[: max_chars - 1] + "…", True
-
-
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
@@ -276,6 +372,31 @@ def _tail_bytes(path: Path, max_bytes: int = 2048) -> str:
         return data.decode("utf-8", errors="replace")
     except Exception:
         return ""
+
+
+def _stderr_failure_error(stderr_path: Path, exit_code: int) -> dict[str, str]:
+    tail = _tail_bytes(stderr_path, max_bytes=4096).strip()
+    if tail:
+        lines = [line.strip() for line in tail.splitlines() if line.strip()]
+        condensed = " | ".join(lines[-3:])
+        condensed = " ".join(condensed.split())
+        if (
+            "oh no: Bun has crashed" in tail
+            or "panic(main thread):" in tail
+            or "Segmentation fault" in tail
+        ):
+            return {
+                "name": "EngineCrash",
+                "message": (
+                    f"opencode runtime crashed before producing a stable result "
+                    f"(exit_code={exit_code}); stderr={condensed[:1000]}"
+                ),
+            }
+        return {
+            "name": "NonZeroExit",
+            "message": f"opencode exit_code={exit_code}; stderr={condensed[:1000]}",
+        }
+    return {"name": "NonZeroExit", "message": f"opencode exit_code={exit_code}"}
 
 
 def _join_prompt(args_prompt: list[str]) -> str:
@@ -430,11 +551,11 @@ def _apply_execution_profile(
         or DEFAULT_EXECUTION_PROFILE
     )
     profile = raw_profile.strip().lower()
-    if profile not in ("legacy", "hybrid", "latency", "checkpoint"):
+    if profile not in EXECUTION_PROFILES:
         profile = DEFAULT_EXECUTION_PROFILE
 
     prompt_chars = len(prompt)
-    timeout_s = float(getattr(args, "timeout", DEFAULT_TIMEOUT_S))
+    timeout_s = float(getattr(args, "run_timeout", DEFAULT_TIMEOUT_S))
     (
         hybrid_short_timeout_s,
         hybrid_timeout_source,
@@ -445,21 +566,6 @@ def _apply_execution_profile(
         timeout_s <= hybrid_short_timeout_s
         and prompt_chars <= hybrid_short_prompt_chars
     )
-
-    # Preserve old behavior.
-    if profile == "legacy":
-        return {
-            "profile": profile,
-            "taskClass": "legacy",
-            "promptChars": prompt_chars,
-            "timeoutS": timeout_s,
-            "hybridShortTimeoutS": hybrid_short_timeout_s,
-            "hybridShortPromptChars": hybrid_short_prompt_chars,
-            "hybridThresholdSource": {
-                "timeoutS": hybrid_timeout_source,
-                "promptChars": hybrid_prompt_source,
-            },
-        }
 
     # Explicit modes.
     if profile == "latency":
@@ -1888,11 +1994,195 @@ def _wait_for_pid_dead(pid: int, timeout_s: float, poll_s: float = 0.1) -> bool:
         time.sleep(min(max(poll_s, 0.01), max(0.01, deadline - time.monotonic())))
 
 
-def _finish_unreadable_error() -> dict[str, str]:
-    return {
-        "name": "FinishUnreadable",
-        "message": "finish.json exists but is not readable JSON",
-    }
+def _validate_finish_envelope(obj: Any) -> str | None:
+    if not isinstance(obj, dict):
+        return "root must be an object"
+    if obj.get("type") != "opencode-subtask-finish":
+        return "type must be opencode-subtask-finish"
+    # V2 is a deliberate schema break. Lifecycle commands only trust strict V2
+    # finish envelopes and quarantine anything older or malformed.
+    if obj.get("schemaVersion") != ADAPTER_SCHEMA_VERSION:
+        return f"schemaVersion must be {ADAPTER_SCHEMA_VERSION}"
+
+    output_mode = obj.get("outputMode")
+    if output_mode not in OUTPUT_MODES:
+        return "outputMode must be machine or text"
+
+    outcome = obj.get("outcome")
+    if outcome not in FINISH_OUTCOMES:
+        return "outcome is invalid"
+
+    execution = obj.get("execution")
+    payload = obj.get("payload")
+    decision = obj.get("decision")
+    workspace = obj.get("workspace")
+    artifacts = obj.get("artifacts")
+    if not isinstance(execution, dict):
+        return "execution must be an object"
+    if not isinstance(payload, dict):
+        return "payload must be an object"
+    if not isinstance(decision, dict):
+        return "decision must be an object"
+    if not isinstance(workspace, dict):
+        return "workspace must be an object"
+    if not isinstance(artifacts, dict):
+        return "artifacts must be an object"
+
+    execution_engine = execution.get("engine")
+    if not isinstance(execution_engine, dict):
+        return "execution.engine must be an object"
+    if not isinstance(payload.get("artifact"), dict):
+        return "payload.artifact must be an object"
+    if execution.get("error") is not None and not isinstance(execution.get("error"), dict):
+        return "execution.error must be an object or null"
+    payload_errors = payload.get("errors")
+    if not isinstance(payload_errors, list):
+        return "payload.errors must be a list"
+
+    engine_selected = execution_engine.get("selected")
+    if engine_selected not in EXECUTION_ENGINE_SELECTED_VALUES:
+        return "execution.engine.selected is invalid"
+    engine_fallback = execution_engine.get("fallbackFrom")
+    if engine_fallback is not None and engine_fallback not in EXECUTION_ENGINE_FALLBACK_VALUES:
+        return "execution.engine.fallbackFrom is invalid"
+    if engine_fallback is not None and engine_selected != "cli":
+        return "execution.engine.fallbackFrom requires execution.engine.selected=cli"
+
+    if payload.get("status") not in PAYLOAD_STATUSES:
+        return "payload.status is invalid"
+    decision_status = decision.get("status")
+    if decision_status not in DECISION_STATUSES:
+        return "decision.status is invalid"
+    payload_status = payload.get("status")
+    payload_schema = payload.get("schema")
+    payload_artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {}
+    payload_path = payload_artifact.get("path")
+    payload_digest = payload_artifact.get("digest")
+    if payload_schema is not None and not isinstance(payload_schema, str):
+        return "payload.schema must be a string or null"
+    if payload_path is not None and not isinstance(payload_path, str):
+        return "payload.artifact.path must be a string or null"
+    if payload_digest is not None and not isinstance(payload_digest, str):
+        return "payload.artifact.digest must be a string or null"
+    for idx, entry in enumerate(payload_errors):
+        if not isinstance(entry, dict):
+            return f"payload.errors[{idx}] must be an object"
+        if entry.get("code") not in PAYLOAD_ERROR_CODES:
+            return f"payload.errors[{idx}].code is invalid"
+        if not isinstance(entry.get("message"), str):
+            return f"payload.errors[{idx}].message must be a string"
+
+    if output_mode == "text":
+        if payload_status != "not_requested":
+            return "text outputMode requires payload.status=not_requested"
+        if decision_status != "not_requested":
+            return "text outputMode requires decision.status=not_requested"
+        if payload_path is not None or payload_digest is not None:
+            return "text outputMode requires payload.artifact.path/digest=null"
+    elif payload_status == "not_requested":
+        return "machine outputMode forbids payload.status=not_requested"
+    elif payload_status != "validated" and decision_status != "unavailable":
+        return "decision.status is invalid for non-validated payloads"
+    elif payload_status == "validated":
+        if payload_schema != PAYLOAD_PROTOCOL:
+            return f"validated payload requires payload.schema={PAYLOAD_PROTOCOL}"
+        if not isinstance(payload_path, str) or not payload_path:
+            return "validated payload requires payload.artifact.path"
+        if not isinstance(payload_digest, str) or not payload_digest:
+            return "validated payload requires payload.artifact.digest"
+        if decision_status not in {"determinate", "abstained"}:
+            return "validated payload requires decision.status=determinate|abstained"
+
+    if payload_status != "validated":
+        if payload_path is not None or payload_digest is not None:
+            return "non-validated payload requires payload.artifact.path/digest=null"
+
+    if outcome == "completed" and execution.get("error") is not None:
+        return "completed outcome requires execution.error=null"
+
+    route = decision.get("route")
+    if decision_status == "determinate":
+        if route not in DECISION_ROUTES:
+            return "decision.route must be a known route when determinate"
+    elif route is not None:
+        return "decision.route must be null unless decision.status is determinate"
+
+    return None
+
+
+def _read_finish_envelope(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        raw = json.loads(_read_text(path))
+    except Exception:
+        return None, "FINISH_UNREADABLE"
+    if not isinstance(raw, dict):
+        return None, "FINISH_INVALID"
+    validation_error = _validate_finish_envelope(raw)
+    if validation_error is not None:
+        return None, "FINISH_INVALID"
+    return raw, None
+
+
+def _quarantine_invalid_finish(path: Path) -> Path | None:
+    for attempt in range(5):
+        suffix = "" if attempt == 0 else f".{attempt}"
+        target = path.with_name(f"finish.invalid.{_now_ms()}{suffix}.json")
+        try:
+            os.replace(path, target)
+            return target
+        except FileNotFoundError:
+            return None
+        except Exception:
+            time.sleep(0.01)
+    return None
+
+
+def _load_runtime_finish_envelope(
+    finish_path: Path,
+) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+    if not finish_path.exists():
+        return None, []
+
+    finish, reason_code = _read_finish_envelope(finish_path)
+    if finish is not None:
+        return finish, []
+
+    quarantined_path = _quarantine_invalid_finish(finish_path)
+    reason_text = (
+        "finish.json is not readable JSON"
+        if reason_code == "FINISH_UNREADABLE"
+        else "finish.json failed strict V2 validation"
+    )
+    if quarantined_path is not None:
+        reason_text += f"; moved to {quarantined_path.name}"
+    else:
+        removed = False
+        try:
+            finish_path.unlink(missing_ok=True)  # type: ignore[call-arg]
+            removed = True
+        except Exception:
+            removed = False
+        if removed:
+            reason_text += "; quarantine rename failed, finish.json removed"
+        else:
+            reason_text += "; quarantine rename failed"
+    return None, [_warning("FinishInvalidQuarantined", reason_text)]
+
+
+def _with_execution_warnings(
+    finish: dict[str, Any], warnings: list[dict[str, str]]
+) -> dict[str, Any]:
+    if not warnings:
+        return finish
+    out = json.loads(json.dumps(finish))
+    execution = out.get("execution")
+    if not isinstance(execution, dict):
+        return out
+    existing = execution.get("warnings")
+    warning_list = list(existing) if isinstance(existing, list) else []
+    warning_list.extend(warnings)
+    execution["warnings"] = warning_list
+    return out
 
 
 def _server_lock_timeout_s(wait_s: float | None = None) -> float:
@@ -2158,6 +2448,17 @@ class RunOutcome:
     error: dict[str, Any] | None
 
 
+@dataclass
+class MachinePayloadExtraction:
+    payload_status: str
+    payload_schema: str | None
+    decision_status: str
+    decision_route: str | None
+    payload_obj: dict[str, Any] | None
+    errors: list[dict[str, str]]
+    diagnostics: dict[str, Any]
+
+
 # ============================
 # Structured result extraction
 # ============================
@@ -2176,115 +2477,453 @@ def _metric_output_tokens(metrics: dict[str, Any] | None) -> int | None:
         return None
 
 
-def _is_empty_model_output(
-    outcome: RunOutcome, result_obj: dict[str, Any] | None, summary_source: str
-) -> bool:
+def _is_empty_model_output(outcome: RunOutcome, assistant_text: str) -> bool:
     """
     Detect model-completed-but-empty responses so callers don't treat them as success.
     Conservative gating: only triggers on successful, non-timeout outcomes with no
-    assistant text / structured payload / summary signal.
+    assistant text / payload signal.
     """
     if (not outcome.ok) or outcome.timed_out or (outcome.error is not None):
         return False
-    if (outcome.full_text or "").strip():
-        return False
-    if (summary_source or "").strip():
+    if (assistant_text or "").strip():
         return False
 
     out_tokens = _metric_output_tokens(outcome.metrics)
     if out_tokens is not None and out_tokens > 0:
         return False
-
-    if isinstance(result_obj, dict):
-        for k, v in result_obj.items():
-            if k in ("changed_files", "untracked_files"):
-                continue
-            if isinstance(v, str) and v.strip():
-                return False
-            if isinstance(v, (list, dict)) and len(v) > 0:
-                return False
-            if isinstance(v, (int, float)) and v != 0:
-                return False
-            if isinstance(v, bool) and v:
-                return False
-            if v is None:
-                continue
     return True
 
 
-def _extract_structured_json(
+def _warning(name: str, message: str) -> dict[str, str]:
+    return {"name": str(name), "message": str(message)}
+
+
+def _dedupe_warnings(items: Iterable[dict[str, str]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        name = str(item.get("name") or "")
+        message = str(item.get("message") or "")
+        key = (name, message)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "message": message})
+    return out
+
+
+def _payload_error(code: str, message: str) -> dict[str, str]:
+    if code not in PAYLOAD_ERROR_CODES:
+        code = "PAYLOAD_SCHEMA_INVALID"
+    return {"code": str(code), "message": str(message)}
+
+
+def _normalize_output_mode(mode: str | None) -> str:
+    m = str(mode or "machine").strip().lower()
+    return m if m in OUTPUT_MODES else "machine"
+
+
+def _normalize_diagnostics_mode(mode: str | None) -> str:
+    m = str(mode or "on-failure").strip().lower()
+    return m if m in DIAGNOSTICS_MODES else "on-failure"
+
+
+def _http_unsupported_options(args: argparse.Namespace) -> list[str]:
+    unsupported: list[str] = []
+    if bool(getattr(args, "continue_last", False)):
+        unsupported.append("--continue")
+    if str(getattr(args, "session", "") or "").strip():
+        unsupported.append("--session")
+    if str(getattr(args, "title", "") or "").strip():
+        unsupported.append("--title")
+    files = list(getattr(args, "file", []) or [])
+    if files:
+        unsupported.append("--file")
+    return unsupported
+
+
+def _dedupe_payload_errors(errors: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, str]] = []
+    for v in errors:
+        if not isinstance(v, dict):
+            continue
+        code = str(v.get("code") or "").strip()
+        msg = str(v.get("message") or "").strip()
+        if not code:
+            continue
+        key = (code, msg)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"code": code, "message": msg})
+    return out
+
+
+def _make_contract_nonce() -> str:
+    return secrets.token_hex(8)
+
+
+def _sentinel_markers(nonce: str) -> tuple[str, str]:
+    token = str(nonce or "").strip()
+    return f"{SENTINEL_BEGIN}_{token}", f"{SENTINEL_END}_{token}"
+
+
+def _canonical_json_bytes(obj: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def _extract_heuristic_diagnostics(
     text: str, *, max_scan_chars: int = 80_000
-) -> dict[str, Any] | None:
-    """
-    Extraction order:
-    1) Sentinel block between BEGIN_OC_SUBTASK_JSON and END_OC_SUBTASK_JSON.
-    2) Last fenced JSON block.
-    3) Backward scan for a JSON object.
-    """
-    if not text:
-        return None
-
-    # 1) Sentinel.
-    b = text.rfind(SENTINEL_BEGIN)
-    if b != -1:
-        e = text.find(SENTINEL_END, b + len(SENTINEL_BEGIN))
-        if e != -1:
-            payload = text[b + len(SENTINEL_BEGIN) : e].strip()
-            try:
-                obj = json.loads(payload)
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
-                pass
-
-    # 2) Fenced blocks.
-    blocks = JSON_FENCE_RE.findall(text)
+) -> dict[str, Any]:
+    fence_obj: dict[str, Any] | None = None
+    blocks = JSON_FENCE_RE.findall(text or "")
     for blk in reversed(blocks):
         blk = blk.strip()
         if not blk:
             continue
         try:
             obj = json.loads(blk)
-            if isinstance(obj, dict):
-                return obj
         except Exception:
             continue
+        if isinstance(obj, dict):
+            fence_obj = obj
+            break
 
-    # 3) Backward scan.
+    backscan_obj: dict[str, Any] | None = None
     window = text[-max_scan_chars:] if len(text) > max_scan_chars else text
-    # scan back for '{'
     for i in range(len(window) - 1, -1, -1):
         if window[i] != "{":
             continue
-        candidate = window[i:]
-        # trim trailing noise
-        candidate = candidate.strip()
+        candidate = window[i:].strip()
         try:
             obj = json.loads(candidate)
-            if isinstance(obj, dict):
-                return obj
         except Exception:
             continue
-    return None
+        if isinstance(obj, dict):
+            backscan_obj = obj
+            break
+
+    return {
+        "fence": fence_obj,
+        "backscan": backscan_obj,
+        "fenceCount": len(blocks),
+    }
 
 
-def _default_contract_prompt() -> str:
+def _validate_payload_schema(obj: dict[str, Any] | None, nonce: str) -> list[dict[str, str]]:
+    if not isinstance(obj, dict):
+        return [_payload_error("PAYLOAD_JSON_INVALID", "payload must be a JSON object")]
+    errs: list[str] = []
+    if obj.get("protocol") != PAYLOAD_PROTOCOL:
+        errs.append(f"protocol must equal {PAYLOAD_PROTOCOL!r}")
+    if obj.get("nonce") != nonce:
+        return [_payload_error("NONCE_MISMATCH", f"payload nonce must equal {nonce!r}")]
+
+    raw_decision = obj.get("decision")
+    if not isinstance(raw_decision, str):
+        errs.append("decision must be string enum")
+    else:
+        d = raw_decision.strip().upper()
+        if d not in PAYLOAD_DECISIONS:
+            return [
+                _payload_error(
+                    "DECISION_INVALID",
+                    f"decision must be one of {sorted(PAYLOAD_DECISIONS)}; got {raw_decision!r}",
+                )
+            ]
+    if not isinstance(obj.get("summary"), str):
+        errs.append("summary must be string")
+    for key in ("evidence", "changes", "next_steps"):
+        v = obj.get(key)
+        if not isinstance(v, list):
+            errs.append(f"{key} must be string[]")
+            continue
+        if any((not isinstance(x, str)) for x in v):
+            errs.append(f"{key} must be string[]")
+    return [_payload_error("PAYLOAD_SCHEMA_INVALID", se) for se in errs]
+
+
+def _extract_machine_payload(
+    *,
+    text: str,
+    nonce: str | None,
+    output_mode: str,
+) -> MachinePayloadExtraction:
+    output_mode_n = _normalize_output_mode(output_mode)
+    nonce_n = str(nonce or "").strip()
+    diagnostics: dict[str, Any] = {
+        "expectedNonce": nonce_n or None,
+        "outputMode": output_mode_n,
+        "heuristics": _extract_heuristic_diagnostics(text),
+    }
+
+    if output_mode_n == "text":
+        diagnostics["machine"] = {"status": "not_requested"}
+        return MachinePayloadExtraction(
+            payload_status="not_requested",
+            payload_schema=None,
+            decision_status="not_requested",
+            decision_route=None,
+            payload_obj=None,
+            errors=[],
+            diagnostics=diagnostics,
+        )
+
+    if not nonce_n:
+        err = _payload_error("NONCE_MISMATCH", "missing contract nonce")
+        diagnostics["machine"] = {"status": "malformed"}
+        return MachinePayloadExtraction(
+            payload_status="malformed",
+            payload_schema=None,
+            decision_status="unavailable",
+            decision_route=None,
+            payload_obj=None,
+            errors=[err],
+            diagnostics=diagnostics,
+        )
+
+    begin_marker, end_marker = _sentinel_markers(nonce_n)
+    exact_begin_positions = [m.start() for m in re.finditer(re.escape(begin_marker), text)]
+    exact_end_positions = [m.start() for m in re.finditer(re.escape(end_marker), text)]
+    exact_begin_count = len(exact_begin_positions)
+    exact_end_count = len(exact_end_positions)
+    generic_begins = [
+        {"nonce": _normalize_observed_sentinel_nonce(m.group(1)), "index": m.start()}
+        for m in GENERIC_SENTINEL_BEGIN_RE.finditer(text or "")
+    ]
+    generic_ends = [
+        {"nonce": _normalize_observed_sentinel_nonce(m.group(1)), "index": m.start()}
+        for m in GENERIC_SENTINEL_END_RE.finditer(text or "")
+    ]
+    generic_nonces = sorted(
+        {
+            *(str(item["nonce"]) for item in generic_begins),
+            *(str(item["nonce"]) for item in generic_ends),
+        }
+    )
+    diagnostics["machine"] = {
+        "beginMarker": begin_marker,
+        "endMarker": end_marker,
+        "exactBeginCount": exact_begin_count,
+        "exactEndCount": exact_end_count,
+        "genericBeginCount": len(generic_begins),
+        "genericEndCount": len(generic_ends),
+        "genericNonces": generic_nonces,
+    }
+
+    if len(generic_nonces) > 1:
+        err = _payload_error(
+            "SENTINEL_MULTIPLE",
+            "multiple sentinel nonces found; nonce binding is ambiguous",
+        )
+        return MachinePayloadExtraction(
+            payload_status="ambiguous",
+            payload_schema=None,
+            decision_status="unavailable",
+            decision_route=None,
+            payload_obj=None,
+            errors=[err],
+            diagnostics=diagnostics,
+        )
+
+    if exact_begin_count == 0 and exact_end_count == 0:
+        if generic_nonces and nonce_n not in generic_nonces:
+            err = _payload_error(
+                "NONCE_MISMATCH",
+                f"found sentinel for nonce {generic_nonces[0]!r}, expected {nonce_n!r}",
+            )
+            return MachinePayloadExtraction(
+                payload_status="malformed",
+                payload_schema=None,
+                decision_status="unavailable",
+                decision_route=None,
+                payload_obj=None,
+                errors=[err],
+                diagnostics=diagnostics,
+            )
+        err = _payload_error(
+            "PAYLOAD_MISSING", "no authoritative payload sentinel found"
+        )
+        return MachinePayloadExtraction(
+            payload_status="missing",
+            payload_schema=None,
+            decision_status="unavailable",
+            decision_route=None,
+            payload_obj=None,
+            errors=[err],
+            diagnostics=diagnostics,
+        )
+
+    candidate_results: list[dict[str, Any]] = []
+    for begin_idx in exact_begin_positions:
+        end_idx = text.find(end_marker, begin_idx + len(begin_marker))
+        if end_idx == -1 or end_idx < begin_idx:
+            continue
+        payload_text = text[begin_idx + len(begin_marker) : end_idx].strip()
+        trailing = text[end_idx + len(end_marker) :]
+        candidate_errors: list[dict[str, str]] = []
+        if trailing.strip():
+            candidate_errors.append(
+                _payload_error(
+                    "SENTINEL_TRAILING_TEXT",
+                    "only whitespace is allowed after the END sentinel",
+                )
+            )
+
+        candidate_obj: dict[str, Any] | None = None
+        try:
+            parsed = json.loads(payload_text)
+            if isinstance(parsed, dict):
+                candidate_obj = parsed
+            else:
+                candidate_errors.append(
+                    _payload_error(
+                        "PAYLOAD_JSON_INVALID",
+                        "payload must decode to a JSON object",
+                    )
+                )
+        except Exception as ex:
+            candidate_errors.append(
+                _payload_error(
+                    "PAYLOAD_JSON_INVALID", f"{type(ex).__name__}: {ex}"
+                )
+            )
+
+        if isinstance(candidate_obj, dict):
+            candidate_errors.extend(_validate_payload_schema(candidate_obj, nonce_n))
+
+        candidate_results.append(
+            {
+                "begin": begin_idx,
+                "end": end_idx,
+                "payload_obj": candidate_obj,
+                "errors": _dedupe_payload_errors(candidate_errors),
+            }
+        )
+
+    diagnostics["machine"]["candidateCount"] = len(candidate_results)
+    valid_candidates = [
+        item
+        for item in candidate_results
+        if isinstance(item.get("payload_obj"), dict) and not item.get("errors")
+    ]
+    diagnostics["machine"]["validCandidateCount"] = len(valid_candidates)
+
+    if len(valid_candidates) > 1:
+        err = _payload_error(
+            "SENTINEL_MULTIPLE",
+            "multiple valid sentinel payloads found for the expected nonce",
+        )
+        return MachinePayloadExtraction(
+            payload_status="ambiguous",
+            payload_schema=None,
+            decision_status="unavailable",
+            decision_route=None,
+            payload_obj=None,
+            errors=[err],
+            diagnostics=diagnostics,
+        )
+
+    if len(valid_candidates) == 1:
+        obj = valid_candidates[0]["payload_obj"]
+        assert isinstance(obj, dict)
+        decision = str(obj["decision"]).strip().upper()
+        if decision == "UNDETERMINED":
+            decision_status = "abstained"
+            decision_route = None
+        else:
+            decision_status = "determinate"
+            decision_route = decision
+
+        return MachinePayloadExtraction(
+            payload_status="validated",
+            payload_schema=PAYLOAD_PROTOCOL,
+            decision_status=decision_status,
+            decision_route=decision_route,
+            payload_obj=obj,
+            errors=[],
+            diagnostics=diagnostics,
+        )
+
+    if not candidate_results:
+        err = _payload_error(
+            "PAYLOAD_MISSING",
+            "could not locate a matching payload region between sentinel markers",
+        )
+        return MachinePayloadExtraction(
+            payload_status="malformed",
+            payload_schema=None,
+            decision_status="unavailable",
+            decision_route=None,
+            payload_obj=None,
+            errors=[err],
+            diagnostics=diagnostics,
+        )
+
+    last_candidate = candidate_results[-1]
+    obj = (
+        last_candidate["payload_obj"]
+        if isinstance(last_candidate.get("payload_obj"), dict)
+        else None
+    )
+    deduped_errors = list(last_candidate["errors"])
+    if deduped_errors:
+        return MachinePayloadExtraction(
+            payload_status="malformed",
+            payload_schema=None,
+            decision_status="unavailable",
+            decision_route=None,
+            payload_obj=obj,
+            errors=deduped_errors,
+            diagnostics=diagnostics,
+        )
+
+    assert isinstance(obj, dict)
+    decision = str(obj["decision"]).strip().upper()
+    if decision == "UNDETERMINED":
+        decision_status = "abstained"
+        decision_route = None
+    else:
+        decision_status = "determinate"
+        decision_route = decision
+
+    return MachinePayloadExtraction(
+        payload_status="validated",
+        payload_schema=PAYLOAD_PROTOCOL,
+        decision_status=decision_status,
+        decision_route=decision_route,
+        payload_obj=obj,
+        errors=[],
+        diagnostics=diagnostics,
+    )
+
+
+def _default_contract_prompt(nonce: str) -> str:
+    begin_marker, end_marker = _sentinel_markers(nonce)
     return (
         "\n\n"
         "SUBTASK OUTPUT CONTRACT (strict):\n"
         f"At the very end, output exactly:\n"
-        f"{SENTINEL_BEGIN}\n"
+        f"{begin_marker}\n"
         "{...one JSON object...}\n"
-        f"{SENTINEL_END}\n"
+        f"{end_marker}\n"
         "No markdown, no code fences, no extra text after the END marker.\n"
+        "Do not quote or restate the BEGIN/END markers anywhere except the final block.\n"
         "Schema:\n"
         "{\n"
+        f'  "protocol": "{PAYLOAD_PROTOCOL}",\n'
+        f'  "nonce": "{nonce}",\n'
+        '  "decision": "GO_NO_DELTA" | "MANDATORY_DELTA" | "UNDETERMINED",\n'
         '  "summary": string (<= 800 chars),\n'
         '  "evidence": string[] (each: "path:line - fact", <= 10 items),\n'
         '  "changes": string[] (<= 10 items),\n'
         '  "next_steps": string[] (<= 10 items)\n'
         "}\n"
-        "If you cannot comply, output an object with empty arrays.\n"
+        'If you cannot safely determine the route, use "decision":"UNDETERMINED".\n'
     )
 
 
@@ -2396,10 +3035,6 @@ def _minimal_artifacts(
     job_path: Path,
     finish_path: Path,
 ) -> dict[str, Any]:
-    """Artifact dict for edge/error paths where optional file paths are unavailable.
-
-    Returns the same key set as _artifacts_obj so consumers see a stable shape.
-    """
     return {
         "dir": str(dir_path),
         "jobPath": job_path.name,
@@ -2409,8 +3044,8 @@ def _minimal_artifacts(
         "stderrPath": None,
         "assistantPath": None,
         "wrapperLogPath": None,
-        "resultPath": None,
-        "patchPath": None,
+        "payloadPath": None,
+        "diagnosticsPath": None,
     }
 
 
@@ -2424,8 +3059,9 @@ def _artifacts_obj(
     stderr_path: Path | None,
     assistant_path: Path | None,
     wrapper_log_path: Path | None,
-    result_path: Path | None,
-    patch_path: str | None,
+    patch_path: str | None = None,
+    payload_path: Path | None = None,
+    diagnostics_path: Path | None = None,
 ) -> dict[str, Any]:
     def _name_if_exists(p: Path | None) -> str | None:
         return p.name if p and p.exists() else None
@@ -2439,67 +3075,77 @@ def _artifacts_obj(
         "stderrPath": _name_if_exists(stderr_path),
         "assistantPath": _name_if_exists(assistant_path),
         "wrapperLogPath": _name_if_exists(wrapper_log_path),
-        "resultPath": _name_if_exists(result_path),
-        "patchPath": patch_path,
+        "payloadPath": _name_if_exists(payload_path),
+        "diagnosticsPath": _name_if_exists(diagnostics_path),
     }
 
 
 def _finish_obj(
     *,
-    ok: bool,
-    exit_code: int,
-    timed_out: bool,
     run_id: str,
     workdir: Path,
-    engine: str,
+    output_mode: str,
+    outcome: str,
+    exit_code: int,
+    duration_ms: int,
+    engine_selected: str,
     fallback_from: str | None,
-    server: dict[str, Any] | None,
     session_id: str | None,
-    summary: str,
-    summary_truncated: bool,
-    result_digest: str | None,
+    execution_error: dict[str, Any] | None,
+    execution_warnings: list[dict[str, str]] | None,
+    payload_status: str,
+    payload_schema: str | None,
+    payload_path: str | None,
+    payload_digest: str | None,
+    payload_errors: list[dict[str, str]] | None,
+    decision_status: str,
+    decision_route: str | None,
     changed_files: list[str],
     untracked_files: list[str],
-    warnings: list[dict[str, str]] | None = None,
-    artifacts_dir: Path,
+    patch_path: str | None,
     artifacts: dict[str, Any],
-    metrics: dict[str, Any] | None,
-    error: dict[str, Any] | None,
-    include_debug: bool,
-    debug: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    warnings_out = warnings or []
+    route_out = decision_route if decision_status == "determinate" else None
     obj: dict[str, Any] = {
         "type": "opencode-subtask-finish",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
-        "ok": ok,
-        "exitCode": exit_code,
-        "timedOut": timed_out,
         "runId": run_id,
         "workdir": str(workdir),
-        "engine": {"selected": engine, "fallbackFrom": fallback_from},
-        "sessionId": session_id,
-        "summary": summary,
-        "summaryTruncated": summary_truncated,
-        "resultDigest": result_digest,
-        "changedFiles": changed_files,
-        "untrackedFiles": untracked_files,
-        "warnings": warnings_out,
+        "outputMode": _normalize_output_mode(output_mode),
+        "outcome": outcome,
+        "execution": {
+            "exitCode": int(exit_code),
+            "durationMs": max(0, int(duration_ms)),
+            "engine": {
+                "selected": engine_selected,
+                "fallbackFrom": fallback_from,
+            },
+            "sessionId": session_id,
+            "error": execution_error,
+            "warnings": execution_warnings or [],
+        },
+        "payload": {
+            "status": payload_status,
+            "schema": payload_schema,
+            "artifact": {
+                "path": payload_path,
+                "digest": payload_digest,
+            },
+            "errors": payload_errors or [],
+        },
+        "decision": {
+            "status": decision_status,
+            "route": route_out,
+        },
+        "workspace": {
+            "changedFiles": changed_files,
+            "untrackedFiles": untracked_files,
+            "patchPath": patch_path,
+        },
         "artifacts": artifacts,
-        "server": {
-            "url": (server or {}).get("url"),
-            "version": (server or {}).get("version"),
-            "logPath": (server or {}).get("logPath"),
-        }
-        if server
-        else None,
-        "metrics": metrics,
-        "error": error,
     }
-    if include_debug and isinstance(debug, dict):
-        obj["debug"] = debug
     return obj
 
 
@@ -2510,6 +3156,7 @@ def _start_obj(
     workdir: Path,
     artifacts_dir: Path,
     artifacts: dict[str, Any],
+    output_mode: str,
 ) -> dict[str, Any]:
     return {
         "type": "opencode-subtask-start",
@@ -2521,6 +3168,7 @@ def _start_obj(
         "runId": run_id,
         "pid": pid,
         "workdir": str(workdir),
+        "outputMode": _normalize_output_mode(output_mode),
         "artifacts": artifacts,
     }
 
@@ -2537,9 +3185,10 @@ def _status_obj(
     progress: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
     warnings: list[dict[str, str]] | None = None,
+    wait_expired: bool | None = None,
 ) -> dict[str, Any]:
     warnings_out = warnings or []
-    return {
+    obj = {
         "ok": ok,
         "type": "opencode-subtask-status",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
@@ -2554,6 +3203,84 @@ def _status_obj(
         "error": error,
         "warnings": warnings_out,
     }
+    if wait_expired is not None:
+        obj["waitExpired"] = bool(wait_expired)
+    return obj
+
+
+def _outcome_exit_code(outcome: str) -> int:
+    return {
+        "completed": 0,
+        "failed": 3,
+        "timed_out": 124,
+        "cancelled": 130,
+        "internal_error": 1,
+    }.get(str(outcome), 1)
+
+
+def _execution_outcome_from_error(
+    *,
+    exit_code: int,
+    timed_out: bool,
+    error: dict[str, Any] | None,
+) -> str:
+    if timed_out:
+        return "timed_out"
+    if not error:
+        return "completed"
+    name = str(error.get("name") or "").strip()
+    if name in {
+        "OpencodeNotFound",
+        "NoServer",
+        "ServerUnhealthy",
+        "FinishWriteFailed",
+        "WorkerNotRunning",
+        "StuckAfterCancel",
+        "UnhandledException",
+    }:
+        return "internal_error"
+    if name == "Canceled":
+        return "cancelled"
+    if int(exit_code) == 130:
+        return "cancelled"
+    return "failed"
+
+
+def _maybe_write_diagnostics(
+    *,
+    mode: str,
+    diagnostics_path: Path,
+    run_id: str,
+    output_mode: str,
+    execution_failed: bool,
+    extraction: MachinePayloadExtraction,
+) -> Path | None:
+    mode_n = _normalize_diagnostics_mode(mode)
+    output_mode_n = _normalize_output_mode(output_mode)
+    extraction_failed = (
+        extraction.payload_status != "not_requested"
+        if output_mode_n == "text"
+        else extraction.payload_status != "validated"
+    )
+    should_write = mode_n == "always" or (
+        mode_n == "on-failure" and (execution_failed or extraction_failed)
+    )
+    if not should_write:
+        return None
+    obj = {
+        "type": "opencode-subtask-diagnostics",
+        "schemaVersion": 1,
+        "adapterVersion": ADAPTER_VERSION,
+        "timestamp": _now_ms(),
+        "runId": run_id,
+        "outputMode": _normalize_output_mode(output_mode),
+        "payloadStatus": extraction.payload_status,
+        "decisionStatus": extraction.decision_status,
+        "errors": extraction.errors,
+        "diagnostics": extraction.diagnostics,
+    }
+    _write_json(diagnostics_path, obj)
+    return diagnostics_path
 
 
 # ============================
@@ -2608,18 +3335,62 @@ def _get_http_auth_from_env(env: dict[str, str]) -> HttpAuth | None:
 # ============================
 
 
-def _enforce_artifact_cap(
-    paths: Iterable[Path], max_bytes: int
-) -> tuple[bool, str | None]:
-    if max_bytes <= 0:
-        return True, None
-    for p in paths:
-        try:
-            if p.exists() and p.stat().st_size > max_bytes:
-                return False, p.name
-        except Exception:
-            continue
-    return True, None
+class ArtifactBudgetSupervisor:
+    def __init__(
+        self,
+        *,
+        watched_paths: Iterable[Path],
+        max_bytes: int,
+        on_breach: Any,
+        poll_interval_s: float = 0.1,
+    ) -> None:
+        self._watched_paths = [p for p in watched_paths if isinstance(p, Path)]
+        self._max_bytes = int(max_bytes)
+        self._on_breach = on_breach
+        self._poll_interval_s = max(0.01, float(poll_interval_s))
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._breached_path: Path | None = None
+
+    @property
+    def breached_path(self) -> Path | None:
+        with self._lock:
+            return self._breached_path
+
+    def start(self) -> None:
+        if self._max_bytes <= 0 or not self._watched_paths or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self._poll_interval_s * 4))
+
+    def _run(self) -> None:
+        while not self._stop_evt.is_set():
+            breached = self._first_breached_path()
+            if breached is not None:
+                with self._lock:
+                    if self._breached_path is None:
+                        self._breached_path = breached
+                try:
+                    self._on_breach(breached)
+                except Exception:
+                    pass
+                return
+            self._stop_evt.wait(self._poll_interval_s)
+
+    def _first_breached_path(self) -> Path | None:
+        for path in self._watched_paths:
+            try:
+                if path.exists() and path.stat().st_size > self._max_bytes:
+                    return path
+            except Exception:
+                continue
+        return None
 
 
 def _run_cli(
@@ -2679,7 +3450,7 @@ def _run_cli(
     stderr_fp = open(stderr_path, "ab", buffering=0)
 
     tail = _TailText()
-    session_id: str | None = None
+    observed_session_id: str | None = session_id
     error_event: dict[str, Any] | None = None
     metrics: dict[str, Any] | None = None
 
@@ -2722,9 +3493,31 @@ def _run_cli(
     timed_out = False
     killed_for_size = False
     killed_file: str | None = None
+    kill_lock = threading.Lock()
+
+    def on_artifact_breach(path: Path) -> None:
+        nonlocal killed_for_size, killed_file
+        with kill_lock:
+            if killed_for_size:
+                return
+            killed_for_size = True
+            killed_file = path.name
+        try:
+            sent = _kill_tree(proc.pid, sig=(signal.SIGKILL if os.name != "nt" else None))
+            if (not sent) and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+    supervisor = ArtifactBudgetSupervisor(
+        watched_paths=[p for p in [stderr_path, events_path, assistant_path] if p],
+        max_bytes=max_artifact_bytes,
+        on_breach=on_artifact_breach,
+    )
+    supervisor.start()
 
     def reader() -> None:
-        nonlocal session_id, error_event, metrics, killed_for_size, killed_file
+        nonlocal observed_session_id, error_event, metrics
         assert proc.stdout is not None
         for raw in iter(proc.stdout.readline, b""):
             if not raw:
@@ -2750,11 +3543,11 @@ def _run_cli(
             if not isinstance(evt, dict):
                 continue
             sid = evt.get("sessionID") or evt.get("sessionId")
-            if isinstance(sid, str) and sid and not session_id:
-                session_id = sid
+            if isinstance(sid, str) and sid and sid != observed_session_id:
+                observed_session_id = sid
                 if on_session_id:
                     try:
-                        on_session_id(session_id)
+                        on_session_id(observed_session_id)
                     except Exception:
                         pass
             if evt.get("type") == "error":
@@ -2782,23 +3575,6 @@ def _run_cli(
                         assistant_fp.write(t.encode("utf-8", errors="replace"))
                     except Exception:
                         pass
-            # Artifact cap: check during streaming (events/stderr/assistant)
-            ok_cap, which_file = _enforce_artifact_cap(
-                [p for p in [events_path, stderr_path, assistant_path] if p],
-                max_artifact_bytes,
-            )
-            if not ok_cap and which_file:
-                killed_for_size = True
-                killed_file = which_file
-                try:
-                    sent = _kill_tree(
-                        proc.pid, sig=(signal.SIGKILL if os.name != "nt" else None)
-                    )
-                    if (not sent) and proc.poll() is None:
-                        proc.kill()
-                except Exception:
-                    pass
-                break
 
     th = threading.Thread(target=reader, daemon=True)
     th.start()
@@ -2832,6 +3608,7 @@ def _run_cli(
                 pass
 
     th.join(timeout=5)
+    supervisor.stop()
 
     if events_fp:
         events_fp.close()
@@ -2867,7 +3644,7 @@ def _run_cli(
                 "message": json.dumps(error_event, ensure_ascii=False)[:5000],
             }
         else:
-            err = {"name": "NonZeroExit", "message": f"opencode exit_code={exit_code}"}
+            err = _stderr_failure_error(stderr_path, exit_code)
 
     return RunOutcome(
         ok=ok,
@@ -2875,7 +3652,7 @@ def _run_cli(
         timed_out=timed_out,
         engine="cli",
         fallback_from=None,
-        session_id=session_id,
+        session_id=observed_session_id,
         full_text=full_text,
         metrics=metrics,
         error=err,
@@ -2922,7 +3699,6 @@ def _run_http(
     stderr_path: Path,
     assistant_path: Path | None,
     permission_mode: str,
-    include_debug: bool,
     on_session_id: Any | None,
 ) -> RunOutcome:
     auth = _get_http_auth_from_env(env)
@@ -2960,6 +3736,32 @@ def _run_http(
     stop_evt = threading.Event()
     sse_connected = threading.Event()
     sse_open_error: list[str] = []
+    session_box: dict[str, str | None] = {"id": None}
+
+    def _output_too_large_error(path: Path) -> dict[str, str]:
+        return {
+            "name": "OutputTooLarge",
+            "message": (
+                f"artifact {path.name} exceeded "
+                f"max-artifact-bytes={max_artifact_bytes}"
+            ),
+        }
+
+    def on_artifact_breach(path: Path) -> None:
+        stop_evt.set()
+        session_id_local = session_box.get("id")
+        if session_id_local:
+            try:
+                client.abort(session_id_local)
+            except Exception:
+                pass
+
+    supervisor = ArtifactBudgetSupervisor(
+        watched_paths=[p for p in [stderr_path, events_path, assistant_path] if p],
+        max_bytes=max_artifact_bytes,
+        on_breach=on_artifact_breach,
+    )
+    supervisor.start()
 
     def _noninteractive_permission_response(evt: dict[str, Any]) -> str:
         """
@@ -3139,26 +3941,6 @@ def _run_http(
                                     remember=False,
                                 )
 
-                    # Artifact cap
-                    ok_cap, which_file = _enforce_artifact_cap(
-                        [p for p in [events_path, stderr_path, assistant_path] if p],
-                        max_artifact_bytes,
-                    )
-                    if not ok_cap and which_file:
-                        try:
-                            stderr_fp.write(
-                                f"OutputTooLarge: {which_file}\n".encode("utf-8")
-                            )
-                            stderr_fp.flush()
-                        except Exception:
-                            pass
-                        try:
-                            client.abort(session_id)
-                        except Exception:
-                            pass
-                        stop_evt.set()
-                        break
-
                     continue  # done processing one event
 
                 if s.startswith("data:"):
@@ -3180,12 +3962,37 @@ def _run_http(
         if not sid:
             raise RuntimeError("Session created but missing id")
         session_id = sid
+        session_box["id"] = session_id
         if on_session_id:
             try:
                 on_session_id(session_id)
             except Exception:
                 pass
+        breached_path = supervisor.breached_path
+        if stop_evt.is_set() and breached_path is not None:
+            try:
+                client.abort(session_id)
+            except Exception:
+                pass
+            supervisor.stop()
+            if events_fp:
+                events_fp.close()
+            if assistant_fp:
+                assistant_fp.close()
+            stderr_fp.close()
+            return RunOutcome(
+                ok=False,
+                exit_code=1,
+                timed_out=False,
+                engine="http",
+                fallback_from=None,
+                session_id=session_id,
+                full_text="",
+                metrics=None,
+                error=_output_too_large_error(breached_path),
+            )
     except Exception as e:
+        supervisor.stop()
         if events_fp:
             events_fp.close()
         if assistant_fp:
@@ -3212,6 +4019,7 @@ def _run_http(
         if save_events or permission_mode in ("allow", "noninteractive"):
             client.abort(session_id)
             stop_evt.set()
+            supervisor.stop()
             if events_fp:
                 events_fp.close()
             if assistant_fp:
@@ -3246,14 +4054,17 @@ def _run_http(
     msg_obj: dict[str, Any] | None = None
 
     try:
-        msg_obj = client.send_message_sync(
-            session_id,
-            prompt=prompt,
-            model=model,
-            variant=variant,
-            agent=agent,
-            timeout_s=timeout_s,
-        )
+        if supervisor.breached_path is not None:
+            err = _output_too_large_error(supervisor.breached_path)
+        else:
+            msg_obj = client.send_message_sync(
+                session_id,
+                prompt=prompt,
+                model=model,
+                variant=variant,
+                agent=agent,
+                timeout_s=timeout_s,
+            )
     except Exception as e:
         # If it's a timeout at HTTP layer, abort session.
         if "timed out" in str(e).lower() or "timeout" in str(e).lower():
@@ -3269,6 +4080,7 @@ def _run_http(
         stop_evt.set()
         # best-effort join
         t.join(timeout=2.0)
+        supervisor.stop()
 
     if err is None and isinstance(msg_obj, dict):
         text = _extract_text_from_message_obj(msg_obj)
@@ -3277,20 +4089,13 @@ def _run_http(
                 assistant_fp.write(text.encode("utf-8", errors="replace"))
             except Exception:
                 pass
-        # Artifact cap: also check response size indirectly (assistant file size)
-        ok_cap, which_file = _enforce_artifact_cap(
-            [p for p in [events_path, stderr_path, assistant_path] if p],
-            max_artifact_bytes,
-        )
-        if not ok_cap and which_file:
-            client.abort(session_id)
-            err = {
-                "name": "OutputTooLarge",
-                "message": f"artifact {which_file} exceeded max-artifact-bytes={max_artifact_bytes}",
-            }
         full_text = text
     else:
         full_text = ""
+
+    if supervisor.breached_path is not None:
+        timed_out = False
+        err = _output_too_large_error(supervisor.breached_path)
 
     if events_fp:
         events_fp.close()
@@ -3320,11 +4125,15 @@ def _run_http(
 
 def cmd_run(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
-    run_timeout_s = (
-        float(args.run_timeout)
-        if getattr(args, "run_timeout", None) is not None
-        else float(args.timeout)
+    output_mode_n = _normalize_output_mode(getattr(args, "output_mode", "machine"))
+    diagnostics_mode = _normalize_diagnostics_mode(getattr(args, "diagnostics", None))
+    contract_nonce = (
+        None
+        if output_mode_n == "text"
+        else str(getattr(args, "contract_nonce", None) or _make_contract_nonce())
     )
+    run_timeout_s = float(args.run_timeout)
+    run_started_ms = _now_ms()
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -3334,15 +4143,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Merge env early so profile thresholds can honor --env / --env-file overrides.
     env = _safe_merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
-    # Keep profile short-task classification aligned with effective runtime timeout.
-    args.timeout = run_timeout_s
     requested_engine = str(getattr(args, "engine", "auto"))
     profile_info = _apply_execution_profile(args, prompt, env)
 
     prompt = _apply_persona_policy(prompt, args.persona_mode, args.persona_line)
 
-    if not args.no_contract:
-        prompt = prompt + _default_contract_prompt()
+    if output_mode_n == "machine":
+        assert contract_nonce is not None
+        prompt = prompt + _default_contract_prompt(contract_nonce)
 
     prompt_path = artifacts_dir / "prompt.txt"
     _write_text(prompt_path, prompt)
@@ -3353,6 +4161,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     events_path = artifacts_dir / "events.ndjson" if args.save_events else None
     assistant_path = artifacts_dir / "assistant.txt" if args.save_text else None
     stderr_path = artifacts_dir / "stderr.log"
+    payload_path = artifacts_dir / "payload.json"
+    diagnostics_path = artifacts_dir / "diagnostics.json"
     # wrapper.log is only meaningful in start (background) mode;
     # in foreground run mode the file won't exist, so _artifacts_obj
     # will return null for wrapperLogPath.  But we point to the
@@ -3370,6 +4180,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         "updatedAt": _now_ms(),
         "pid": os.getpid(),
         "engine": args.engine,
+        "outputMode": output_mode_n,
+        "diagnosticsMode": diagnostics_mode,
+        "contractNonce": contract_nonce,
         "stopServerAfterRunMode": str(
             getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
         ),
@@ -3443,21 +4256,41 @@ def cmd_run(args: argparse.Namespace) -> int:
         opencode_bin = _resolve_executable_for_workdir(default_cmd, workdir)
         if not opencode_bin:
             out = _finish_obj(
-                ok=False,
-                exit_code=127,
-                timed_out=False,
                 run_id=run_id,
                 workdir=workdir,
-                engine="none",
+                output_mode=output_mode_n,
+                outcome="internal_error",
+                exit_code=127,
+                duration_ms=max(0, _now_ms() - run_started_ms),
+                engine_selected="none",
                 fallback_from=None,
-                server=None,
                 session_id=None,
-                summary="",
-                summary_truncated=False,
-                result_digest=None,
+                execution_error={
+                    "name": "OpencodeNotFound",
+                    "message": f"Could not find opencode executable: {default_cmd}",
+                },
+                execution_warnings=[],
+                payload_status="not_requested" if output_mode_n == "text" else "missing",
+                payload_schema=None,
+                payload_path=None,
+                payload_digest=None,
+                payload_errors=(
+                    []
+                    if output_mode_n == "text"
+                    else [
+                        _payload_error(
+                            "PAYLOAD_MISSING",
+                            "execution failed before any authoritative payload was produced",
+                        )
+                    ]
+                ),
+                decision_status="not_requested"
+                if output_mode_n == "text"
+                else "unavailable",
+                decision_route=None,
                 changed_files=[],
                 untracked_files=[],
-                artifacts_dir=artifacts_dir,
+                patch_path=None,
                 artifacts=_artifacts_obj(
                     dir_path=artifacts_dir,
                     job_path=job_path,
@@ -3467,27 +4300,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                     stderr_path=stderr_path,
                     assistant_path=assistant_path,
                     wrapper_log_path=wrapper_log_path,
-                    result_path=None,
-                    patch_path=None,
+                    payload_path=None,
+                    diagnostics_path=None,
                 ),
-                metrics=None,
-                error={
-                    "name": "OpencodeNotFound",
-                    "message": f"Could not find opencode executable: {default_cmd}",
-                },
-                include_debug=args.include_debug,
-                debug=None,
             )
             finish_written, _, existing_finish = _write_finish_once(
                 artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
             )
             if (not finish_written) and isinstance(existing_finish, dict):
                 out = existing_finish
-                final_ok = bool(out.get("ok") is True)
                 sys.stdout.write(_json_line(out) + "\n")
-                return 0 if final_ok else 1
+                return _outcome_exit_code(str(out.get("outcome") or "internal_error"))
             sys.stdout.write(_json_line(out) + "\n")
-            return 1  # OpencodeNotFound is an internal/runtime error
+            return _outcome_exit_code("internal_error")
 
     if not attach_url and args.attach_server:
         # Engine policy:
@@ -3568,6 +4393,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     ):
         cli_attach_url = None
 
+    http_unsupported = _http_unsupported_options(args)
+    auto_http_skip_warning: dict[str, str] | None = None
+    if http_unsupported and args.engine == "auto":
+        chosen = "cli"
+        auto_http_skip_warning = _warning(
+            "HttpEngineSkipped",
+            "auto mode selected CLI because HTTP does not support "
+            + ", ".join(http_unsupported),
+        )
+
     def _ensure_opencode_bin_for_cli() -> str | None:
         nonlocal opencode_bin
         if opencode_bin:
@@ -3620,6 +4455,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     def run_http() -> RunOutcome:
+        if http_unsupported:
+            return RunOutcome(
+                ok=False,
+                exit_code=2,
+                timed_out=False,
+                engine="http",
+                fallback_from=None,
+                session_id=None,
+                full_text="",
+                metrics=None,
+                error={
+                    "name": "UnsupportedHttpOptions",
+                    "message": "HTTP engine does not support "
+                    + ", ".join(http_unsupported),
+                },
+            )
         if not attach_url:
             return RunOutcome(
                 ok=False,
@@ -3651,17 +4502,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             stderr_path=stderr_path,
             assistant_path=assistant_path,
             permission_mode=args.permission_mode,
-            include_debug=args.include_debug,
             on_session_id=lambda sid: _update_job({"sessionId": sid}),
         )
 
     changed_files: list[str] = []
     untracked_files: list[str] = []
     patch_name: str | None = None
-    result_obj: dict[str, Any] | None = None
-    summary_source = ""
-    summary = ""
-    truncated = False
+    extraction = _extract_machine_payload(
+        text="",
+        nonce=contract_nonce,
+        output_mode=output_mode_n,
+    )
     baseline_untracked = set(_git_status(workdir)[1])
     while True:
         http_was_attempted = False
@@ -3702,16 +4553,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         assert outcome is not None
 
-        result_obj = _extract_structured_json(outcome.full_text)
-        if isinstance(result_obj, dict) and isinstance(result_obj.get("summary"), str):
-            summary_source = str(result_obj.get("summary"))
-        else:
-            summary_source = outcome.full_text
-        summary, truncated = _truncate(summary_source.strip(), int(args.max_text_chars))
         changed_files, untracked_files = _git_status(workdir)
         patch_name = _git_patch(workdir, artifacts_dir)
 
-        empty_now = _is_empty_model_output(outcome, result_obj, summary_source)
+        assistant_text = (outcome.full_text or "").strip()
+        empty_now = _is_empty_model_output(outcome, assistant_text)
         if empty_now:
             empty_output_detected = True
         new_untracked = set(untracked_files) - baseline_untracked
@@ -3741,76 +4587,103 @@ def cmd_run(args: argparse.Namespace) -> int:
             outcome.ok = False
         break
 
-    # Persist structured result to result.json (always adapter-written)
-    result_path = artifacts_dir / "result.json"
-    result_digest: str | None = None
-    try:
-        record: dict[str, Any]
-        if isinstance(result_obj, dict):
-            record = dict(result_obj)
-        else:
-            record = {
-                "summary": summary,
-                "evidence": [],
-                "changes": [],
-                "next_steps": [],
-                "raw": result_obj,
-            }
-        # Enrich
-        record.setdefault("changed_files", changed_files)
-        record.setdefault("untracked_files", untracked_files)
-        _write_json(result_path, record)
-        result_digest = _sha256_file(result_path)
-    except Exception:
-        result_path = None  # type: ignore[assignment]
-        result_digest = None
+    extraction = _extract_machine_payload(
+        text=outcome.full_text,
+        nonce=contract_nonce,
+        output_mode=output_mode_n,
+    )
+    payload_file_for_finish: str | None = None
+    payload_digest: str | None = None
+    if extraction.payload_status == "validated" and isinstance(extraction.payload_obj, dict):
+        try:
+            _atomic_write_bytes(payload_path, _canonical_json_bytes(extraction.payload_obj))
+            payload_digest = _sha256_file(payload_path)
+            payload_file_for_finish = payload_path.name
+        except Exception as ex:
+            extraction = MachinePayloadExtraction(
+                payload_status="persist_failed",
+                payload_schema=None,
+                decision_status="unavailable",
+                decision_route=None,
+                payload_obj=extraction.payload_obj,
+                errors=_dedupe_payload_errors(
+                    [
+                        *extraction.errors,
+                        _payload_error(
+                            "PAYLOAD_PERSIST_FAILED",
+                            f"{type(ex).__name__}: {ex}",
+                        ),
+                    ]
+                ),
+                diagnostics=extraction.diagnostics,
+            )
 
-    # Final ok
-    ok = outcome.ok and (outcome.error is None)
-
-    # Construct finish
-    debug: dict[str, Any] | None = None
-    if args.include_debug:
-        debug = {
-            "engineSelected": outcome.engine,
-            "fallbackFrom": fallback_from,
-            "httpFallbackError": http_fallback_error,
-            "serverError": server_error,
-            "serverUrl": attach_url,
-            "serverStartedNew": server_started_new,
-            "stopServerAfterRunMode": stop_server_mode,
-            "executionProfile": profile_info,
-            "orphanReaper": reaper_info,
-            "emptyOutputDetected": empty_output_detected,
-            "emptyOutputRetried": empty_output_retried,
-            "emptyOutputRecovered": empty_output_recovered,
-            "emptyOutputRetryAttempts": empty_output_attempts,
-            "emptyOutputRetryMax": max_empty_output_retries,
-            "serverHealth": (
-                OpencodeHttpClient(
-                    attach_url, auth=_get_http_auth_from_env(env)
-                ).health()
-                if attach_url
-                else None
-            ),
-        }
-
-    out = _finish_obj(
-        ok=ok,
+    diagnostics_written_path: Path | None = None
+    execution_error = outcome.error
+    outcome_name = _execution_outcome_from_error(
         exit_code=outcome.exit_code,
         timed_out=outcome.timed_out,
+        error=execution_error,
+    )
+    try:
+        diagnostics_written_path = _maybe_write_diagnostics(
+            mode=diagnostics_mode,
+            diagnostics_path=diagnostics_path,
+            run_id=run_id,
+            output_mode=output_mode_n,
+            execution_failed=(outcome_name != "completed"),
+            extraction=extraction,
+        )
+    except Exception:
+        diagnostics_written_path = None
+
+    execution_warnings: list[dict[str, str]] = []
+    if auto_http_skip_warning:
+        execution_warnings.append(auto_http_skip_warning)
+    if fallback_from:
+        execution_warnings.append(
+            _warning(
+                "EngineFallback",
+                f"execution fell back from {fallback_from} to {outcome.engine}",
+            )
+        )
+    if empty_output_recovered:
+        execution_warnings.append(
+            _warning(
+                "EmptyOutputRecovered",
+                f"empty model output recovered after {empty_output_attempts} retry attempt(s)",
+            )
+        )
+    if empty_output_detected and not empty_output_recovered and outcome.error:
+        execution_warnings.append(
+            _warning(
+                "EmptyOutputDetected",
+                "model completed without assistant output or workspace changes",
+            )
+        )
+
+    out = _finish_obj(
         run_id=run_id,
         workdir=workdir,
-        engine=outcome.engine,
+        output_mode=output_mode_n,
+        outcome=outcome_name,
+        exit_code=outcome.exit_code,
+        duration_ms=max(0, _now_ms() - run_started_ms),
+        engine_selected=outcome.engine,
         fallback_from=fallback_from,
-        server=server_state,
         session_id=outcome.session_id,
-        summary=summary,
-        summary_truncated=truncated,
-        result_digest=result_digest,
+        execution_error=execution_error,
+        execution_warnings=execution_warnings,
+        payload_status=extraction.payload_status,
+        payload_schema=extraction.payload_schema,
+        payload_path=payload_file_for_finish,
+        payload_digest=payload_digest,
+        payload_errors=extraction.errors,
+        decision_status=extraction.decision_status,
+        decision_route=extraction.decision_route,
         changed_files=changed_files,
         untracked_files=untracked_files,
-        artifacts_dir=artifacts_dir,
+        patch_path=patch_name,
         artifacts=_artifacts_obj(
             dir_path=artifacts_dir,
             job_path=job_path,
@@ -3820,13 +4693,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             stderr_path=stderr_path,
             assistant_path=assistant_path,
             wrapper_log_path=wrapper_log_path,
-            result_path=result_path if isinstance(result_path, Path) else None,
-            patch_path=patch_name,
+            payload_path=(payload_path if payload_file_for_finish else None),
+            diagnostics_path=diagnostics_written_path,
         ),
-        metrics=outcome.metrics,
-        error=outcome.error,
-        include_debug=args.include_debug,
-        debug=debug,
     )
 
     finish_written, finish_reason, existing_finish = _write_finish_once(
@@ -3835,26 +4704,36 @@ def cmd_run(args: argparse.Namespace) -> int:
     if (not finish_written) and isinstance(existing_finish, dict):
         out = existing_finish
     elif (not finish_written) and existing_finish is None:
-        # write_failed / unreadable — disk has no finish.json; degrade stdout
-        out["ok"] = False
-        if not out.get("error"):
-            out["error"] = {
+        err = {
+            "type": "opencode-subtask-error",
+            "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "adapterVersion": ADAPTER_VERSION,
+            "timestamp": _now_ms(),
+            "ok": False,
+            "warnings": [],
+            "error": {
                 "name": "FinishWriteFailed",
                 "message": (
                     f"finish.json could not be persisted (reason={finish_reason})"
                 ),
-            }
+            },
+        }
+        sys.stdout.write(_json_line(err) + "\n")
+        return 1
     # Update job state only if this worker won the terminal finish write.
     if finish_written:
         fields: dict[str, Any] = {
             "state": "finished",
-            "ok": ok,
+            "outcome": outcome_name,
+            "outputMode": output_mode_n,
             "serverStartedNew": server_started_new,
             "httpAttempted": http_was_attempted,
             "stopServerAfterRunMode": stop_server_mode,
             "emptyOutputDetected": empty_output_detected,
             "emptyOutputRetried": empty_output_retried,
             "emptyOutputRecovered": empty_output_recovered,
+            "payloadStatus": extraction.payload_status,
+            "decisionStatus": extraction.decision_status,
         }
         if outcome.session_id:
             fields["sessionId"] = outcome.session_id
@@ -3908,13 +4787,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                 f"[opencode-subtask] WARN: stop-server-after-run({stop_server_mode}) failed: {type(e).__name__}: {e}\n"
             )
 
-    final_ok = bool(out.get("ok") is True) if isinstance(out, dict) else bool(ok)
     sys.stdout.write(_json_line(out) + "\n")
-    return 0 if final_ok else 1
+    return _outcome_exit_code(str(out.get("outcome") or outcome_name))
 
 
 def cmd_start(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
+    output_mode_n = _normalize_output_mode(getattr(args, "output_mode", "machine"))
+    diagnostics_mode = _normalize_diagnostics_mode(getattr(args, "diagnostics", None))
+    contract_nonce = (
+        None
+        if output_mode_n == "text"
+        else str(getattr(args, "contract_nonce", None) or _make_contract_nonce())
+    )
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -3923,7 +4808,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     prompt = _resolve_prompt_input(args)
 
     prompt = _apply_persona_policy(prompt, args.persona_mode, args.persona_line)
-    # Note: the worker (`run`) will append the output contract unless --no-contract is set.
+    # Note: the worker (`run`) appends the output contract when outputMode=machine.
 
     prompt_path = artifacts_dir / "prompt.txt"
     _write_text(prompt_path, prompt)
@@ -3940,6 +4825,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             "adapterVersion": ADAPTER_VERSION,
             "workdir": str(workdir),
             "state": "queued",
+            "outputMode": output_mode_n,
+            "diagnosticsMode": diagnostics_mode,
+            "contractNonce": contract_nonce,
             "stopServerAfterRunMode": str(
                 getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
             ),
@@ -3954,20 +4842,13 @@ def cmd_start(args: argparse.Namespace) -> int:
     opencode_arg = _resolve_executable_for_workdir(str(args.opencode), workdir) or str(
         args.opencode
     )
-    run_timeout_s = (
-        float(args.run_timeout)
-        if getattr(args, "run_timeout", None) is not None
-        else float(args.timeout)
-    )
+    run_timeout_s = float(args.run_timeout)
 
     # Apply execution profile so that worker_cmd flags (--engine,
     # --save-events, --save-text) and the start stdout metadata match what
-    # the worker will actually compute in cmd_run.  The function mutates
+    # the worker will actually compute in cmd_run. The function mutates
     # args in place and is idempotent, so the worker calling it again is
     # harmless.
-    # Important: _apply_execution_profile() reads args.timeout, so align it
-    # with the actual worker runtime timeout (run_timeout_s) before applying.
-    args.timeout = float(run_timeout_s)
     env = _safe_merge_env(dict(os.environ), args.env, args.env_file)
     _apply_execution_profile(args, prompt, env)
 
@@ -3987,16 +4868,18 @@ def cmd_start(args: argparse.Namespace) -> int:
         opencode_arg,
         "--engine",
         args.engine,
-        "--timeout",
+        "--run-timeout",
         str(run_timeout_s),
-        "--max-text-chars",
-        str(args.max_text_chars),
         "--max-artifact-bytes",
         str(args.max_artifact_bytes),
         "--permission-mode",
         args.permission_mode,
         "--execution-profile",
         str(args.execution_profile),
+        "--output-mode",
+        output_mode_n,
+        "--diagnostics",
+        diagnostics_mode,
         "--stop-server-after-run",
         str(args.stop_server_after_run),
         "--orphan-reaper-idle-s",
@@ -4013,10 +4896,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         if args.disable_claude_code
         else "--no-disable-claude-code"
     )
-    if args.include_debug:
-        worker_cmd.append("--include-debug")
-    if args.no_contract:
-        worker_cmd.append("--no-contract")
+    if contract_nonce:
+        worker_cmd.extend(["--contract-nonce", contract_nonce])
 
     # prompt persona policy (keep worker behavior consistent with start/run)
     worker_cmd.extend(
@@ -4027,8 +4908,6 @@ def cmd_start(args: argparse.Namespace) -> int:
             str(args.persona_line),
         ]
     )
-    if args.wrapper_log:
-        worker_cmd.append("--wrapper-log")
     if args.workaround_agent_attach:
         worker_cmd.append("--workaround-agent-attach")
     else:
@@ -4037,8 +4916,6 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--retry-empty-output" if args.retry_empty_output else "--no-retry-empty-output"
     )
     worker_cmd.extend(["--empty-output-retries", str(args.empty_output_retries)])
-    if getattr(args, "run_timeout", None) is not None:
-        worker_cmd.extend(["--run-timeout", str(args.run_timeout)])
 
     # attach settings
     if args.attach:
@@ -4123,6 +5000,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         pid=proc.pid,
         workdir=workdir,
         artifacts_dir=artifacts_dir,
+        output_mode=output_mode_n,
         artifacts=_artifacts_obj(
             dir_path=artifacts_dir,
             job_path=job_path,
@@ -4134,8 +5012,8 @@ def cmd_start(args: argparse.Namespace) -> int:
             if args.save_text
             else None,
             wrapper_log_path=wrapper_log_path,
-            result_path=(artifacts_dir / "result.json"),
-            patch_path=None,
+            payload_path=(artifacts_dir / "payload.json"),
+            diagnostics_path=(artifacts_dir / "diagnostics.json"),
         ),
     )
     sys.stdout.write(_json_line(out) + "\n")
@@ -4192,35 +5070,50 @@ def _emit_synthesized_missing_finish(
         if isinstance(job, dict) and job.get("workdir")
         else Path.cwd()
     )
+    output_mode = (
+        _normalize_output_mode(str(job.get("outputMode")))
+        if isinstance(job, dict) and job.get("outputMode")
+        else "machine"
+    )
+    created_ms = _job_ms(job, "createdAt") if isinstance(job, dict) else 0
+    duration_ms = (
+        max(0, _now_ms() - created_ms) if created_ms > 0 else 0
+    )
     out = _finish_obj(
-        ok=False,
-        exit_code=1,
-        timed_out=False,
         run_id=run_id,
         workdir=wd,
-        engine="watchdog",
+        output_mode=output_mode,
+        outcome="internal_error",
+        exit_code=1,
+        duration_ms=duration_ms,
+        engine_selected="watchdog",
         fallback_from=None,
-        server=None,
         session_id=(
             str(job.get("sessionId"))
             if isinstance(job, dict) and job.get("sessionId")
             else None
         ),
-        summary="",
-        summary_truncated=False,
-        result_digest=None,
+        execution_error={"name": error_name, "message": error_message},
+        execution_warnings=[],
+        payload_status="not_requested" if output_mode == "text" else "missing",
+        payload_schema=None,
+        payload_path=None,
+        payload_digest=None,
+        payload_errors=(
+            []
+            if output_mode == "text"
+            else [_payload_error("PAYLOAD_MISSING", error_message)]
+        ),
+        decision_status="not_requested" if output_mode == "text" else "unavailable",
+        decision_route=None,
         changed_files=[],
         untracked_files=[],
-        artifacts_dir=artifacts_dir,
+        patch_path=None,
         artifacts=_minimal_artifacts(
             dir_path=artifacts_dir,
             job_path=job_path,
             finish_path=finish_path,
         ),
-        metrics=None,
-        error={"name": error_name, "message": error_message},
-        include_debug=False,
-        debug=None,
     )
     finish_written, finish_reason, existing_finish = _write_finish_once(
         artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
@@ -4355,38 +5248,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     # over the potentially freshly-generated one from _resolve_artifacts_dir.
     _pre_job = _load_json(job_path)
     run_id = _canonical_run_id(run_id, _pre_job)
+    runtime_warnings: list[dict[str, str]] = []
 
-    if finish_path.exists():
-        fin = _load_json(finish_path)
-        if isinstance(fin, dict):
-            sys.stdout.write(_json_line(fin) + "\n")
-            # Exit 0: status successfully observed terminal state.
-            # Task success/failure is in the JSON (ok/error), not the exit code.
-            return 0
-        out = _status_obj(
-            ok=False,
-            run_id=run_id,
-            status="failed",
-            pid=None,
-            workdir=None,
-            artifacts_dir=artifacts_dir,
-            artifacts=_artifacts_obj(
-                dir_path=artifacts_dir,
-                job_path=job_path,
-                finish_path=finish_path,
-                prompt_path=prompt_path,
-                events_path=artifacts_dir / "events.ndjson",
-                stderr_path=artifacts_dir / "stderr.log",
-                assistant_path=artifacts_dir / "assistant.txt",
-                wrapper_log_path=artifacts_dir / "wrapper.log",
-                result_path=artifacts_dir / "result.json",
-                patch_path=None,
-            ),
-            progress=_progress_snapshot(artifacts_dir),
-            error=_finish_unreadable_error(),
-        )
-        sys.stdout.write(_json_line(out) + "\n")
-        return 1
+    fin, finish_warnings = _load_runtime_finish_envelope(finish_path)
+    runtime_warnings = _dedupe_warnings([*runtime_warnings, *finish_warnings])
+    if isinstance(fin, dict):
+        sys.stdout.write(_json_line(fin) + "\n")
+        # Exit 0: status successfully observed terminal state.
+        return 0
 
     if not job_path.exists():
         out = _status_obj(
@@ -4405,10 +5274,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                 stderr_path=artifacts_dir / "stderr.log",
                 assistant_path=artifacts_dir / "assistant.txt",
                 wrapper_log_path=artifacts_dir / "wrapper.log",
-                result_path=artifacts_dir / "result.json",
-                patch_path=None,
+                payload_path=artifacts_dir / "payload.json",
+                diagnostics_path=artifacts_dir / "diagnostics.json",
             ),
             progress=_progress_snapshot(artifacts_dir),
+            warnings=runtime_warnings or None,
             error={"name": "JobNotFound", "message": "job.json not found"},
         )
         sys.stdout.write(_json_line(out) + "\n")
@@ -4433,7 +5303,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         if isinstance(synthesized, dict):
             sys.stdout.write(_json_line(synthesized) + "\n")
-            return 1
+            return 0
     if (
         pid
         and not _pid_running(pid)
@@ -4459,20 +5329,24 @@ def cmd_status(args: argparse.Namespace) -> int:
             stderr_path=artifacts_dir / "stderr.log",
             assistant_path=artifacts_dir / "assistant.txt",
             wrapper_log_path=artifacts_dir / "wrapper.log",
-            result_path=artifacts_dir / "result.json",
-            patch_path=None,
+            payload_path=artifacts_dir / "payload.json",
+            diagnostics_path=artifacts_dir / "diagnostics.json",
         ),
         progress=progress,
         warnings=(
-            [
-                {
-                    "name": "WorkerMissingPending",
-                    "message": "pid is not running; waiting stale-window before synthesizing finish",
-                }
-            ]
-            if _worker_missing
-            else None
-        ),
+            runtime_warnings
+            + (
+                [
+                    {
+                        "name": "WorkerMissingPending",
+                        "message": "pid is not running; waiting stale-window before synthesizing finish",
+                    }
+                ]
+                if _worker_missing
+                else []
+            )
+        )
+        or None,
     )
     sys.stdout.write(_json_line(out) + "\n")
     return 0
@@ -4500,8 +5374,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
     # Canonicalize run_id from job.json (see _canonical_run_id).
     _pre_job = _load_json(job_path)
     run_id = _canonical_run_id(run_id, _pre_job)
+    runtime_warnings: list[dict[str, str]] = []
 
-    if not job_path.exists() and not finish_path.exists():
+    fin, finish_warnings = _load_runtime_finish_envelope(finish_path)
+    runtime_warnings = _dedupe_warnings([*runtime_warnings, *finish_warnings])
+    if isinstance(fin, dict):
+        sys.stdout.write(_json_line(fin) + "\n")
+        return _outcome_exit_code(str(fin.get("outcome") or "internal_error"))
+
+    if not job_path.exists() and fin is None:
         out = _status_obj(
             ok=False,
             run_id=run_id,
@@ -4514,6 +5395,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 job_path=job_path,
                 finish_path=finish_path,
             ),
+            warnings=runtime_warnings or None,
             error={
                 "name": "JobNotFound",
                 "message": "job.json and finish.json not found",
@@ -4522,36 +5404,14 @@ def cmd_wait(args: argparse.Namespace) -> int:
         sys.stdout.write(_json_line(out) + "\n")
         return 1
 
-    wait_timeout_s = (
-        float(args.wait_timeout)
-        if getattr(args, "wait_timeout", None) is not None
-        else float(args.timeout)
-    )
+    wait_timeout_s = float(args.wait_timeout)
     deadline = time.monotonic() + wait_timeout_s
     while True:
-        if finish_path.exists():
-            fin = _load_json(finish_path)
-            if isinstance(fin, dict):
-                sys.stdout.write(_json_line(fin) + "\n")
-                # Exit 0: wait successfully observed terminal state.
-                # Task success/failure is in the JSON (ok/error), not the exit code.
-                return 0
-            out = _status_obj(
-                ok=False,
-                run_id=run_id,
-                status="failed",
-                pid=None,
-                workdir=None,
-                artifacts_dir=artifacts_dir,
-                artifacts=_minimal_artifacts(
-                    dir_path=artifacts_dir,
-                    job_path=job_path,
-                    finish_path=finish_path,
-                ),
-                error=_finish_unreadable_error(),
-            )
-            sys.stdout.write(_json_line(out) + "\n")
-            return 1
+        fin, finish_warnings = _load_runtime_finish_envelope(finish_path)
+        runtime_warnings = _dedupe_warnings([*runtime_warnings, *finish_warnings])
+        if isinstance(fin, dict):
+            sys.stdout.write(_json_line(_with_execution_warnings(fin, runtime_warnings)) + "\n")
+            return _outcome_exit_code(str(fin.get("outcome") or "internal_error"))
 
         pid = None
         job = _load_json(job_path) or {}
@@ -4577,11 +5437,13 @@ def cmd_wait(args: argparse.Namespace) -> int:
             )
             if isinstance(synthesized, dict):
                 sys.stdout.write(_json_line(synthesized) + "\n")
-                return 1
+                return _outcome_exit_code(
+                    str(synthesized.get("outcome") or "internal_error")
+                )
 
         if time.monotonic() >= deadline:
             out = _status_obj(
-                ok=False,
+                ok=True,
                 run_id=run_id,
                 status="running",
                 pid=pid,
@@ -4593,13 +5455,11 @@ def cmd_wait(args: argparse.Namespace) -> int:
                     finish_path=finish_path,
                 ),
                 progress=progress,
-                error={
-                    "name": "WaitTimeout",
-                    "message": f"timeout waiting for finish.json (timeout={wait_timeout_s}s)",
-                },
+                warnings=runtime_warnings or None,
+                wait_expired=True,
             )
             sys.stdout.write(_json_line(out) + "\n")
-            return 1
+            return 0
 
         time.sleep(poll_interval)
 
@@ -4616,6 +5476,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     job = _load_json(job_path) or {}
     run_id = _canonical_run_id(run_id, job)
+    runtime_warnings: list[dict[str, str]] = []
 
     # ── Idempotency guard ─────────────────────────────────────────────
     # If a valid finish.json already exists the subtask has already
@@ -4623,11 +5484,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     # overwriting job.state would be harmful.  Return early with
     # ``alreadyFinished=true`` so the caller knows cancel was a no-op.
     #
-    # We require the finish to contain at least an ``ok`` key — an empty
-    # or structurally incomplete dict (e.g. ``{}``) is treated as corrupt
-    # and the cancel proceeds normally so the process is still cleaned up.
-    existing_finish = _load_json(finish_path)
-    if isinstance(existing_finish, dict) and "ok" in existing_finish:
+    # Require a recognizable finish envelope; otherwise continue cancel flow.
+    existing_finish, finish_warnings = _load_runtime_finish_envelope(finish_path)
+    runtime_warnings = _dedupe_warnings([*runtime_warnings, *finish_warnings])
+    if isinstance(existing_finish, dict):
         out_idem = {
             "type": "opencode-subtask-cancel",
             "schemaVersion": ADAPTER_SCHEMA_VERSION,
@@ -4635,7 +5495,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             "timestamp": _now_ms(),
             "runId": run_id,
             "ok": True,
-            "warnings": [],
+            "warnings": runtime_warnings,
             "alreadyFinished": True,
             "existingFinish": existing_finish,
             "taskError": None,
@@ -4667,6 +5527,11 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
     stop_attempted = False
     stop_ok: bool | None = None
+    output_mode = (
+        _normalize_output_mode(str(job.get("outputMode")))
+        if isinstance(job, dict) and job.get("outputMode")
+        else "machine"
+    )
     # run_id is already canonical (set via _canonical_run_id above).
     job_run_id = run_id
 
@@ -4851,32 +5716,42 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 "message": "cancel requested but no active worker process remained",
             }
         out = _finish_obj(
-            ok=False,
-            exit_code=130 if ok else 1,
-            timed_out=False,
             run_id=run_id,
             workdir=Path(str(job.get("workdir")))
             if isinstance(job, dict) and job.get("workdir")
             else Path.cwd(),
-            engine="cancel",
+            output_mode=output_mode,
+            outcome="cancelled" if ok else "internal_error",
+            exit_code=130 if ok else 1,
+            duration_ms=(
+                max(0, _now_ms() - _job_ms(job, "createdAt"))
+                if _job_ms(job, "createdAt") > 0
+                else 0
+            ),
+            engine_selected="cancel",
             fallback_from=None,
-            server=None,
             session_id=session_id,
-            summary="Canceled",
-            summary_truncated=False,
-            result_digest=None,
+            execution_error=task_error,
+            execution_warnings=[],
+            payload_status="not_requested" if output_mode == "text" else "missing",
+            payload_schema=None,
+            payload_path=None,
+            payload_digest=None,
+            payload_errors=(
+                []
+                if output_mode == "text"
+                else [_payload_error("PAYLOAD_MISSING", task_error["message"])]
+            ),
+            decision_status="not_requested" if output_mode == "text" else "unavailable",
+            decision_route=None,
             changed_files=[],
             untracked_files=[],
-            artifacts_dir=artifacts_dir,
+            patch_path=None,
             artifacts=_minimal_artifacts(
                 dir_path=artifacts_dir,
                 job_path=job_path,
                 finish_path=finish_path,
             ),
-            metrics=None,
-            error=task_error,
-            include_debug=False,
-            debug=None,
         )
         cancel_fin_written, cancel_fin_reason, _ = _write_finish_once(
             artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
@@ -4979,7 +5854,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "timestamp": _now_ms(),
         "runId": run_id,
         "ok": ok,
-        "warnings": [],
+        "warnings": runtime_warnings,
         "pid": pid or None,
         "sessionId": session_id,
         "terminationConfirmed": termination_confirmed,
@@ -5001,6 +5876,207 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         out2["error"] = cancel_error
     sys.stdout.write(_json_line(out2) + "\n")
     return 0 if ok else 1
+
+
+def _judgment_obj(
+    *,
+    policy: str,
+    verdict: str,
+    reason_code: str,
+    route: str | None,
+    retryable: bool,
+) -> dict[str, Any]:
+    return {
+        "type": "opencode-subtask-judgment",
+        "schemaVersion": 1,
+        "adapterVersion": ADAPTER_VERSION,
+        "timestamp": _now_ms(),
+        "policy": policy,
+        "verdict": verdict,
+        "reasonCode": reason_code,
+        "route": route if route in DECISION_ROUTES else None,
+        "retryable": bool(retryable),
+    }
+
+
+def _judge_exit_code(verdict: str) -> int:
+    return {
+        "accept": 0,
+        "reroute": 10,
+        "retry": 11,
+        "block": 12,
+    }.get(str(verdict), 1)
+
+
+def _judge_reason(name: str) -> str:
+    code = JUDGE_REASON.get(name)
+    if code is None:
+        raise ValueError(f"unknown judge reason key: {name}")
+    return code
+
+
+def _payload_digest_matches(finish: dict[str, Any], finish_path: Path) -> bool:
+    payload = finish.get("payload") if isinstance(finish.get("payload"), dict) else {}
+    artifact = payload.get("artifact") if isinstance(payload, dict) else {}
+    rel_path = artifact.get("path") if isinstance(artifact, dict) else None
+    digest = artifact.get("digest") if isinstance(artifact, dict) else None
+    if not isinstance(rel_path, str) or not rel_path or not isinstance(digest, str) or not digest:
+        return False
+    artifacts = finish.get("artifacts") if isinstance(finish.get("artifacts"), dict) else {}
+    base_dir = Path(str(artifacts.get("dir"))) if artifacts and artifacts.get("dir") else finish_path.parent
+    candidate = Path(rel_path)
+    payload_path = candidate if candidate.is_absolute() else (base_dir / rel_path)
+    if not payload_path.exists():
+        return False
+    try:
+        return _sha256_file(payload_path) == digest
+    except Exception:
+        return False
+
+
+def cmd_judge(args: argparse.Namespace) -> int:
+    finish_path = Path(args.finish).expanduser().resolve()
+    policy = str(args.policy).strip()
+    if not finish_path.exists():
+        out = _judgment_obj(
+            policy=policy,
+            verdict="retry",
+            reason_code=_judge_reason("finish_not_found"),
+            route=None,
+            retryable=True,
+        )
+        sys.stdout.write(_json_line(out) + "\n")
+        return _judge_exit_code(out["verdict"])
+
+    finish, finish_error = _read_finish_envelope(finish_path)
+    if finish_error == "FINISH_UNREADABLE":
+        out = _judgment_obj(
+            policy=policy,
+            verdict="retry",
+            reason_code=_judge_reason("finish_unreadable"),
+            route=None,
+            retryable=True,
+        )
+        sys.stdout.write(_json_line(out) + "\n")
+        return _judge_exit_code(out["verdict"])
+    if finish_error == "FINISH_INVALID" or not isinstance(finish, dict):
+        out = _judgment_obj(
+            policy=policy,
+            verdict="retry",
+            reason_code=_judge_reason("finish_invalid"),
+            route=None,
+            retryable=True,
+        )
+        sys.stdout.write(_json_line(out) + "\n")
+        return _judge_exit_code(out["verdict"])
+
+    outcome = str(finish.get("outcome") or "")
+    output_mode = str(finish.get("outputMode") or "machine")
+    payload = finish.get("payload") if isinstance(finish.get("payload"), dict) else {}
+    decision = finish.get("decision") if isinstance(finish.get("decision"), dict) else {}
+    payload_status = str(payload.get("status") or "")
+    decision_status = str(decision.get("status") or "")
+    route = decision.get("route") if isinstance(decision.get("route"), str) else None
+
+    if policy not in JUDGE_POLICIES:
+        out = _judgment_obj(
+            policy=policy,
+            verdict="retry",
+            reason_code=_judge_reason("unknown_policy"),
+            route=route,
+            retryable=True,
+        )
+        sys.stdout.write(_json_line(out) + "\n")
+        return _judge_exit_code(out["verdict"])
+
+    if policy != "execution-only" and payload_status == "validated":
+        if not _payload_digest_matches(finish, finish_path):
+            out = _judgment_obj(
+                policy=policy,
+                verdict="retry",
+                reason_code=_judge_reason("payload_digest_mismatch"),
+                route=route,
+                retryable=True,
+            )
+            sys.stdout.write(_json_line(out) + "\n")
+            return _judge_exit_code(out["verdict"])
+
+    if policy == "execution-only":
+        if outcome == "completed":
+            verdict, reason_code = "accept", _judge_reason("execution_completed")
+        elif outcome in {"failed", "timed_out", "internal_error"}:
+            verdict, reason_code = "retry", JUDGE_EXECUTION_REASON_BY_OUTCOME[outcome]
+        elif outcome == "cancelled":
+            verdict, reason_code = "block", _judge_reason("execution_cancelled")
+        else:
+            verdict, reason_code = "retry", _judge_reason("execution_unknown")
+        out = _judgment_obj(
+            policy=policy,
+            verdict=verdict,
+            reason_code=reason_code,
+            route=route,
+            retryable=(verdict == "retry"),
+        )
+        sys.stdout.write(_json_line(out) + "\n")
+        return _judge_exit_code(out["verdict"])
+
+    if outcome in {"failed", "timed_out", "internal_error"}:
+        out = _judgment_obj(
+            policy=policy,
+            verdict="retry",
+            reason_code=JUDGE_EXECUTION_REASON_BY_OUTCOME[outcome],
+            route=route,
+            retryable=True,
+        )
+        sys.stdout.write(_json_line(out) + "\n")
+        return _judge_exit_code(out["verdict"])
+    if outcome == "cancelled":
+        out = _judgment_obj(
+            policy=policy,
+            verdict="block",
+            reason_code=_judge_reason("execution_cancelled"),
+            route=route,
+            retryable=False,
+        )
+        sys.stdout.write(_json_line(out) + "\n")
+        return _judge_exit_code(out["verdict"])
+
+    if policy == "require-determinate":
+        if output_mode == "text" or payload_status == "not_requested":
+            verdict, reason_code = "block", _judge_reason("output_not_machine")
+        elif payload_status in {"missing", "malformed", "ambiguous", "persist_failed"}:
+            verdict, reason_code = "retry", JUDGE_PAYLOAD_REASON_BY_STATUS[payload_status]
+        elif payload_status == "validated" and decision_status == "determinate" and route == "GO_NO_DELTA":
+            verdict, reason_code = "accept", _judge_reason("decision_go_no_delta")
+        elif payload_status == "validated" and decision_status == "determinate" and route == "MANDATORY_DELTA":
+            verdict, reason_code = "reroute", _judge_reason("decision_mandatory_delta")
+        elif payload_status == "validated" and decision_status == "abstained":
+            verdict, reason_code = "reroute", _judge_reason("decision_undetermined")
+        else:
+            verdict, reason_code = "retry", _judge_reason("decision_unavailable")
+    else:
+        if output_mode == "text" or payload_status == "not_requested":
+            verdict, reason_code = "block", _judge_reason("output_not_machine")
+        elif payload_status in {"missing", "malformed", "ambiguous", "persist_failed"}:
+            verdict, reason_code = "retry", JUDGE_PAYLOAD_REASON_BY_STATUS[payload_status]
+        elif payload_status == "validated" and decision_status == "determinate" and route == "GO_NO_DELTA":
+            verdict, reason_code = "accept", _judge_reason("decision_go_no_delta")
+        elif payload_status == "validated" and decision_status == "determinate" and route == "MANDATORY_DELTA":
+            verdict, reason_code = "block", _judge_reason("decision_mandatory_delta")
+        elif decision_status == "abstained":
+            verdict, reason_code = "block", _judge_reason("decision_undetermined")
+        else:
+            verdict, reason_code = "retry", _judge_reason("decision_unavailable")
+
+    out = _judgment_obj(
+        policy=policy,
+        verdict=verdict,
+        reason_code=reason_code,
+        route=route,
+        retryable=(verdict == "retry"),
+    )
+    sys.stdout.write(_json_line(out) + "\n")
+    return _judge_exit_code(out["verdict"])
 
 
 def cmd_ensure_server(args: argparse.Namespace) -> int:
@@ -5148,14 +6224,6 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         default=True,
         help="Attach to a per-project opencode server when available (auto), or ensure one is running (http). (default: true)",
     )
-    # Deprecated alias: --no-attach
-    p.add_argument(
-        "--no-attach",
-        dest="no_attach_deprecated",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-
     p.add_argument(
         "--server-hostname",
         default=DEFAULT_SERVER_HOSTNAME,
@@ -5236,16 +6304,10 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     )
 
     p.add_argument(
-        "--timeout",
-        type=float,
-        default=DEFAULT_TIMEOUT_S,
-        help="Legacy timeout seconds (used when --run-timeout / --wait-timeout is not set).",
-    )
-    p.add_argument(
         "--run-timeout",
         type=float,
-        default=None,
-        help="Runtime timeout seconds for run/start worker execution (overrides --timeout when set).",
+        default=DEFAULT_TIMEOUT_S,
+        help="Runtime timeout seconds for run/start worker execution.",
     )
     p.add_argument(
         "--retry-empty-output",
@@ -5284,12 +6346,6 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         default=True,
         help="Save assistant.txt.",
     )
-    p.add_argument(
-        "--wrapper-log",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Retained for compatibility; wrapper.log is always created in start mode.",
-    )
 
     p.add_argument(
         "--permission-mode",
@@ -5299,13 +6355,12 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--execution-profile",
-        choices=["legacy", "hybrid", "latency", "checkpoint"],
+        choices=sorted(EXECUTION_PROFILES),
         default=DEFAULT_EXECUTION_PROFILE,
         help=(
             "Routing policy for engine/artifacts. "
             "hybrid(default): short->HTTP+lighter artifacts, long->CLI+full artifacts; "
-            "latency: prefer HTTP+lighter artifacts; checkpoint: prefer CLI+full artifacts; "
-            "legacy: keep pre-policy behavior."
+            "latency: prefer HTTP+lighter artifacts; checkpoint: prefer CLI+full artifacts."
         ),
     )
     p.add_argument(
@@ -5334,21 +6389,10 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     )
 
     p.add_argument(
-        "--max-text-chars",
-        type=int,
-        default=DEFAULT_MAX_TEXT_CHARS,
-        help="Max chars returned in finish.summary.",
-    )
-    p.add_argument(
         "--max-artifact-bytes",
         type=int,
         default=DEFAULT_MAX_ARTIFACT_BYTES,
         help="Hard cap per artifact file (0 disables).",
-    )
-    p.add_argument(
-        "--include-debug",
-        action="store_true",
-        help="Include debug info under finish.debug (may be noisy).",
     )
     p.add_argument(
         "--workaround-agent-attach",
@@ -5359,9 +6403,24 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     )
 
     p.add_argument(
-        "--no-contract",
-        action="store_true",
-        help="Do not append output contract to the prompt.",
+        "--output-mode",
+        choices=["machine", "text"],
+        default="machine",
+        help=(
+            "machine: request authoritative nonce-bound JSON payload; "
+            "text: freeform assistant text only."
+        ),
+    )
+    p.add_argument(
+        "--diagnostics",
+        choices=["never", "on-failure", "always"],
+        default="on-failure",
+        help="Diagnostics sidecar emission policy.",
+    )
+    p.add_argument(
+        "--contract-nonce",
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
     p.add_argument(
@@ -5424,12 +6483,11 @@ def main(argv: list[str] | None = None) -> int:
         p_wait = sub.add_parser("wait", help="Wait for a background job finish.json.")
         p_wait.add_argument("--run-id", required=False, default=None)
         p_wait.add_argument("--artifacts-dir", required=False, default=None)
-        p_wait.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
         p_wait.add_argument(
             "--wait-timeout",
             type=float,
-            default=None,
-            help="Wait window seconds for wait command (overrides --timeout when set).",
+            default=DEFAULT_TIMEOUT_S,
+            help="Wait window seconds for wait command.",
         )
         p_wait.add_argument("--poll-interval", type=float, default=0.5)
         p_wait.set_defaults(func=cmd_wait)
@@ -5458,6 +6516,22 @@ def main(argv: list[str] | None = None) -> int:
             help="For abort auth: OPENCODE_SERVER_USERNAME/PASSWORD via env-file.",
         )
         p_cancel.set_defaults(func=cmd_cancel)
+
+        p_judge = sub.add_parser(
+            "judge",
+            help="Apply a built-in policy preset to a finish.json envelope.",
+        )
+        p_judge.add_argument("--finish", required=True, help="Path to finish.json")
+        p_judge.add_argument(
+            "--policy",
+            choices=[
+                "execution-only",
+                "require-determinate",
+                "require-go-no-delta",
+            ],
+            required=True,
+        )
+        p_judge.set_defaults(func=cmd_judge)
 
         p_es = sub.add_parser(
             "ensure-server", help="Ensure a per-project opencode server."
@@ -5495,12 +6569,6 @@ def main(argv: list[str] | None = None) -> int:
         p_pc.set_defaults(func=cmd_prune_cache)
 
         args = parser.parse_args(argv)
-
-        # Apply deprecated alias: --no-attach => --no-attach-server
-        if hasattr(args, "no_attach_deprecated") and getattr(
-            args, "no_attach_deprecated"
-        ):
-            setattr(args, "attach_server", False)
 
         return int(args.func(args))  # type: ignore[misc]
     except SystemExit:

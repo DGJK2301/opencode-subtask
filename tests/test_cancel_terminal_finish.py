@@ -1,2603 +1,2024 @@
 import argparse
 import contextlib
-import http.server
-import io
 import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
+from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = str(REPO_ROOT / "scripts" / "opencode_subtask.py")
 
 
-class TestCancelTerminalFinish(unittest.TestCase):
+class TestOpencodeSubtaskV2(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._mod = cls._load_adapter_module(REPO_ROOT)
+
     @staticmethod
     def _load_adapter_module(repo_root: Path):
         script = repo_root / "scripts" / "opencode_subtask.py"
-        module_name = "opencode_subtask_module"
+        module_name = "opencode_subtask_v2_test_module"
         spec = importlib.util.spec_from_file_location(module_name, script)
         assert spec and spec.loader
         mod = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = mod
-        try:
-            spec.loader.exec_module(mod)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
+        spec.loader.exec_module(mod)
         return mod
 
-    def _assert_adapter_version(self, obj: dict) -> None:
-        """Assert adapterVersion field is present and is a non-empty string."""
-        self.assertIn("adapterVersion", obj, "adapterVersion missing from output JSON")
-        self.assertIsInstance(obj["adapterVersion"], str)
-        self.assertTrue(
-            len(obj["adapterVersion"]) > 0, "adapterVersion must be non-empty"
-        )
+    def setUp(self) -> None:
+        self._tmp_paths: list[Path] = []
 
-    @staticmethod
-    def _build_run_args(mod, repo_root: Path, artifacts_dir: Path, run_id: str):
+    def tearDown(self) -> None:
+        for path in reversed(self._tmp_paths):
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _mktempdir(self, prefix: str) -> Path:
+        path = Path(tempfile.mkdtemp(prefix=prefix))
+        self._tmp_paths.append(path)
+        return path
+
+    def _build_run_args(
+        self,
+        *,
+        artifacts_dir: Path,
+        run_id: str,
+        output_mode: str,
+        diagnostics: str = "on-failure",
+        nonce: str | None = None,
+        engine: str = "cli",
+        extra_args: list[str] | None = None,
+    ):
         p = argparse.ArgumentParser(prog="run-test")
-        mod._add_common_run_flags(p)
+        self._mod._add_common_run_flags(p)
         p.add_argument("prompt", nargs=argparse.REMAINDER)
-        return p.parse_args(
-            [
-                "--workdir",
-                str(repo_root),
-                "--engine",
-                "cli",
-                "--run-id",
-                run_id,
-                "--artifacts-dir",
-                str(artifacts_dir),
-                "--opencode",
-                "__dummy_opencode__",
-                "--prompt",
-                "Act as a senior software engineer.",
-                "--include-debug",
-                "--retry-empty-output",
-                "--empty-output-retries",
-                "1",
-            ]
+        argv = [
+            "--workdir",
+            str(REPO_ROOT),
+            "--engine",
+            engine,
+            "--run-id",
+            run_id,
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--opencode",
+            "__dummy_opencode__",
+            "--prompt",
+            "Act as a senior software engineer.",
+            "--output-mode",
+            output_mode,
+            "--diagnostics",
+            diagnostics,
+            "--retry-empty-output",
+            "--empty-output-retries",
+            "1",
+        ]
+        if nonce:
+            argv.extend(["--contract-nonce", nonce])
+        if extra_args:
+            argv.extend(extra_args)
+        return p.parse_args(argv)
+
+    def _build_payload_text(
+        self, *, nonce: str, decision: str, **overrides: object
+    ) -> str:
+        begin, end = self._mod._sentinel_markers(nonce)
+        payload = {
+            "protocol": self._mod.PAYLOAD_PROTOCOL,
+            "nonce": nonce,
+            "decision": decision,
+            "summary": "done",
+            "evidence": ["a.py:1 - fact"],
+            "changes": ["x"],
+            "next_steps": ["y"],
+        }
+        payload.update(overrides)
+        return f"{begin}\n{json.dumps(payload)}\n{end}\n"
+
+    def _make_finish(
+        self,
+        *,
+        artifacts_dir: Path,
+        run_id: str = "finish-test",
+        output_mode: str = "machine",
+        outcome: str = "completed",
+        exit_code: int = 0,
+        fallback_from: str | None = None,
+        execution_error: dict | None = None,
+        execution_warnings: list[dict] | None = None,
+        payload_status: str = "missing",
+        payload_schema: str | None = None,
+        payload_artifact_path: str | None = None,
+        payload_digest: str | None = None,
+        payload_errors: list[dict] | None = None,
+        decision_status: str = "unavailable",
+        decision_route: str | None = None,
+    ) -> dict:
+        return {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 2,
+            "adapterVersion": "0.6.0",
+            "timestamp": 1,
+            "runId": run_id,
+            "workdir": str(REPO_ROOT),
+            "outputMode": output_mode,
+            "outcome": outcome,
+            "execution": {
+                "exitCode": exit_code,
+                "durationMs": 1,
+                "engine": {"selected": "cli", "fallbackFrom": fallback_from},
+                "sessionId": None,
+                "error": execution_error,
+                "warnings": execution_warnings or [],
+            },
+            "payload": {
+                "status": payload_status,
+                "schema": payload_schema,
+                "artifact": {
+                    "path": payload_artifact_path,
+                    "digest": payload_digest,
+                },
+                "errors": payload_errors or [],
+            },
+            "decision": {"status": decision_status, "route": decision_route},
+            "workspace": {
+                "changedFiles": [],
+                "untrackedFiles": [],
+                "patchPath": None,
+            },
+            "artifacts": {
+                "dir": str(artifacts_dir),
+                "jobPath": "job.json",
+                "finishPath": "finish.json",
+                "promptPath": None,
+                "stderrPath": None,
+                "assistantPath": None,
+                "eventsPath": None,
+                "wrapperLogPath": None,
+                "payloadPath": payload_artifact_path,
+                "diagnosticsPath": None,
+            },
+        }
+
+    def _write_finish(self, artifacts_dir: Path, finish: dict) -> Path:
+        finish_path = artifacts_dir / "finish.json"
+        finish_path.write_text(json.dumps(finish), encoding="utf-8")
+        return finish_path
+
+    def _make_fake_opencode(self, script_body: str) -> Path:
+        fake_dir = self._mktempdir("ocsubtask_fake_opencode_")
+        script_path = fake_dir / "fake_opencode_impl.py"
+        script_path.write_text(script_body, encoding="utf-8")
+        if os.name == "nt":
+            wrapper_path = fake_dir / "fake-opencode.cmd"
+            wrapper_path.write_text(
+                '@echo off\r\n"%s" "%%~dp0fake_opencode_impl.py" %%*\r\n'
+                % sys.executable,
+                encoding="utf-8",
+            )
+        else:
+            wrapper_path = fake_dir / "fake-opencode"
+            wrapper_path.write_text(
+                "#!/bin/sh\n"
+                'exec "%s" "$0.impl.py" "$@"\n' % sys.executable,
+                encoding="utf-8",
+            )
+            impl_link = fake_dir / "fake-opencode.impl.py"
+            impl_link.write_text(script_body, encoding="utf-8")
+            wrapper_path.chmod(0o755)
+            return wrapper_path
+        return wrapper_path
+
+    def _mocked_run(
+        self,
+        *,
+        text: str,
+        output_mode: str = "machine",
+        diagnostics: str = "on-failure",
+        nonce: str | None = None,
+        changed_files: list[str] | None = None,
+        untracked_files: list[str] | None = None,
+        patch_name: str | None = None,
+        run_outcome=None,
+        fail_payload_write: bool = False,
+    ) -> tuple[int, dict, Path]:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_run_")
+        nonce_n = nonce or ("nonce-test" if output_mode == "machine" else None)
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id=f"run-{artifacts_dir.name}",
+            output_mode=output_mode,
+            diagnostics=diagnostics,
+            nonce=nonce_n,
+        )
+        outcome = run_outcome or self._mod.RunOutcome(
+            ok=True,
+            exit_code=0,
+            timed_out=False,
+            engine="cli",
+            fallback_from=None,
+            session_id="ses_test",
+            full_text=text,
+            metrics=None,
+            error=None,
+        )
+        original_atomic_write = self._mod._atomic_write_bytes
+
+        def _atomic_write_wrapper(path, data, **kwargs):
+            if fail_payload_write and isinstance(path, Path) and path.name == "payload.json":
+                raise PermissionError("simulated payload write failure")
+            return original_atomic_write(path, data, **kwargs)
+
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_resolve_executable_for_workdir",
+                return_value="__dummy_opencode__",
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_apply_execution_profile",
+                side_effect=lambda args, prompt, env: {"profile": args.execution_profile},
+            ),
+            unittest.mock.patch.object(self._mod, "_run_cli", return_value=outcome),
+            unittest.mock.patch.object(
+                self._mod,
+                "_git_status",
+                return_value=(changed_files or [], untracked_files or []),
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_git_patch",
+                return_value=patch_name,
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_atomic_write_bytes",
+                side_effect=_atomic_write_wrapper,
+            ),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        out = json.loads(buf.getvalue().strip())
+        return rc, out, artifacts_dir
+
+    def _run_cli_command(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, SCRIPT, *args],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
         )
 
-    def test_cancel_writes_finish_when_worker_dead_and_abort_fails(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-        self.assertTrue(script.exists(), f"missing: {script}")
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_cancel_") as td:
-            artifacts_dir = Path(td)
-            job_path = artifacts_dir / "job.json"
-            finish_path = artifacts_dir / "finish.json"
-
-            # Deterministic reproduction of the state-machine gap:
-            # - serverUrl + sessionId present so abort is attempted
-            # - worker PID is dead so no normal finish.json can appear
-            # - abort fails (connection refused) so ok remains false
-            job = {
-                "runId": "test-run",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": 2147483647,  # extremely unlikely to exist
-                # Use an invalid port to force a deterministic abort failure without
-                # depending on network conditions.
-                "serverUrl": "http://127.0.0.1:99999",
-                "sessionId": "ses_test",
-                "httpAttempted": True,
-                "serverStartedNew": False,
-                "stopServerAfterRunMode": "never",
-            }
-            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            # Dead worker means "already terminated" for cancel semantics:
-            # cancel should return success and still write terminal finish.json.
-            self.assertEqual(proc.returncode, 0, proc.stdout)
-            # Stdout invariant: ok=true => error absent, taskError present.
-            stdout_obj = json.loads(proc.stdout)
-            self.assertTrue(stdout_obj["ok"])
-            self.assertNotIn(
-                "error",
-                stdout_obj,
-                "ok=true => error must be absent in cancel stdout",
-            )
-            self.assertIsInstance(stdout_obj.get("taskError"), dict)
-            self.assertEqual(stdout_obj["taskError"]["name"], "Canceled")
-            self.assertTrue(
-                finish_path.exists(),
-                f"finish.json was not written; stdout={proc.stdout!r}",
-            )
-            fin = json.loads(finish_path.read_text(encoding="utf-8"))
-            self.assertEqual(fin.get("type"), "opencode-subtask-finish")
-            self.assertIsInstance(fin.get("error"), dict)
-            self.assertEqual(fin["error"].get("name"), "Canceled")
-
-    def test_status_fail_fast_when_finish_unreadable(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_unreadable_status_"
-        ) as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            finish_path.write_text("{not valid json", encoding="utf-8")
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "status",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            out = json.loads(proc.stdout)
-            self.assertEqual(out.get("type"), "opencode-subtask-status")
-            self._assert_adapter_version(out)
-            self.assertEqual((out.get("error") or {}).get("name"), "FinishUnreadable")
-
-    def test_wait_fail_fast_when_finish_unreadable(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_unreadable_wait_"
-        ) as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            finish_path.write_text("{still not valid json", encoding="utf-8")
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "wait",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                    "--timeout",
-                    "60",
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            out = json.loads(proc.stdout)
-            self.assertEqual(out.get("type"), "opencode-subtask-status")
-            self._assert_adapter_version(out)
-            self.assertEqual((out.get("error") or {}).get("name"), "FinishUnreadable")
-
-    def test_wait_timeout_override_takes_precedence(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_wait_timeout_override_"
-        ) as td:
-            artifacts_dir = Path(td)
-            job = {
-                "runId": "test-run-wait-timeout",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-            }
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(job, indent=2), encoding="utf-8"
-            )
-
-            orig_finalize = mod._maybe_finalize_stale_running_job
-            buf = io.StringIO()
-            try:
-                mod._maybe_finalize_stale_running_job = lambda **kwargs: None
-                with contextlib.redirect_stdout(buf):
-                    rc = mod.cmd_wait(
-                        argparse.Namespace(
-                            run_id=None,
-                            artifacts_dir=str(artifacts_dir),
-                            timeout=60.0,
-                            wait_timeout=0.05,
-                            poll_interval=0.01,
-                        )
-                    )
-            finally:
-                mod._maybe_finalize_stale_running_job = orig_finalize
-
-            self.assertNotEqual(rc, 0)
-            out = json.loads(buf.getvalue().strip())
-            self._assert_adapter_version(out)
-            self.assertEqual((out.get("error") or {}).get("name"), "WaitTimeout")
-            self.assertIn("timeout=0.05s", (out.get("error") or {}).get("message", ""))
-
-    def test_cancel_succeeds_when_abort_succeeds_with_stale_pid(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        class _AbortHandler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # noqa: N802
-                if self.path == "/session/ses_test/abort":
-                    body = b"{}"
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
-                self.send_error(404)
-
-            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
-                return
-
-        srv = http.server.HTTPServer(("127.0.0.1", 0), _AbortHandler)
-        th = threading.Thread(target=srv.serve_forever, daemon=True)
-        th.start()
-        try:
-            with tempfile.TemporaryDirectory(prefix="ocsubtask_test_abort_ok_") as td:
-                artifacts_dir = Path(td)
-                job_path = artifacts_dir / "job.json"
-                finish_path = artifacts_dir / "finish.json"
-                job = {
-                    "runId": "test-run-abort-ok",
-                    "workdir": str(repo_root),
-                    "state": "running",
-                    "createdAt": 1,
-                    "updatedAt": 1,
-                    # Positive, live PID that is not this adapter worker.
-                    "pid": os.getpid(),
-                    "serverUrl": f"http://127.0.0.1:{srv.server_port}",
-                    "sessionId": "ses_test",
-                    "httpAttempted": True,
-                    "serverStartedNew": False,
-                    "stopServerAfterRunMode": "never",
-                }
-                job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
-
-                proc = subprocess.run(
-                    [
-                        sys.executable,
-                        str(script),
-                        "cancel",
-                        "--artifacts-dir",
-                        str(artifacts_dir),
-                    ],
-                    cwd=str(repo_root),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=20,
-                )
-                self.assertEqual(proc.returncode, 0, proc.stdout)
-                out = json.loads(proc.stdout)
-                self.assertTrue(out.get("ok"))
-                self._assert_adapter_version(out)
-                # Stdout invariant: ok=true => error absent, taskError present.
-                self.assertNotIn(
-                    "error",
-                    out,
-                    "ok=true => error must be absent in cancel stdout",
-                )
-                self.assertIsInstance(out.get("taskError"), dict)
-                self.assertEqual(out["taskError"]["name"], "Canceled")
-                self.assertTrue(
-                    finish_path.exists(),
-                    f"finish.json was not written; stdout={proc.stdout!r}",
-                )
-                fin = json.loads(finish_path.read_text(encoding="utf-8"))
-                self.assertEqual(fin.get("type"), "opencode-subtask-finish")
-                self.assertEqual((fin.get("error") or {}).get("name"), "Canceled")
-        finally:
-            srv.shutdown()
-            th.join(timeout=5)
-            srv.server_close()
-
-    def test_cancel_writes_finish_when_live_pid_and_abort_unreachable(self) -> None:
-        """Live PID (not the worker) + unreachable server → cancel detects
-        ownership mismatch, refuses to kill (safety), returns ok=false,
-        and does NOT write finish.json (cannot confirm worker is dead)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_live_unreach_") as td:
-            artifacts_dir = Path(td)
-            job_path = artifacts_dir / "job.json"
-            finish_path = artifacts_dir / "finish.json"
-
-            job = {
-                "runId": "test-live-pid-unreach",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": os.getpid(),  # live but not the worker
-                "serverUrl": "http://127.0.0.1:1",  # unreachable
-                "sessionId": "ses_test",
-                "httpAttempted": True,
-                "serverStartedNew": False,
-                "stopServerAfterRunMode": "never",
-            }
-            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            # Cancel returns ok=false (ownership mismatch → refuses to kill)
-            stdout_obj = json.loads(proc.stdout.strip().splitlines()[-1])
-            self.assertFalse(stdout_obj["ok"])
-            self._assert_adapter_version(stdout_obj)
-            self.assertEqual(
-                stdout_obj.get("workerOwnership"),
-                "mismatch",
-                "cancel should detect PID ownership mismatch",
-            )
-            self.assertFalse(stdout_obj.get("killSignalDelivered", True))
-            # finish.json must NOT be written — can't mark a job terminal
-            # when the worker couldn't be confirmed dead
-            self.assertFalse(
-                finish_path.exists(),
-                "finish.json should NOT be written on ownership mismatch",
-            )
-
-    def test_cancel_no_finish_when_live_pid_and_no_server(self) -> None:
-        """Live PID (not the worker) + no serverUrl/sessionId → cancel detects
-        ownership mismatch, refuses to kill, returns ok=false,
-        and does NOT write finish.json (kill-only path, safety)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_live_nosrv_") as td:
-            artifacts_dir = Path(td)
-            job_path = artifacts_dir / "job.json"
-            finish_path = artifacts_dir / "finish.json"
-
-            job = {
-                "runId": "test-live-pid-nosrv",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": os.getpid(),  # live but not the worker
-                "httpAttempted": False,
-                "serverStartedNew": False,
-                "stopServerAfterRunMode": "never",
-            }
-            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            # Cancel returns ok=false (ownership mismatch → refuses to kill)
-            stdout_obj = json.loads(proc.stdout.strip().splitlines()[-1])
-            self.assertFalse(stdout_obj["ok"])
-            self._assert_adapter_version(stdout_obj)
-            self.assertEqual(
-                stdout_obj.get("workerOwnership"),
-                "mismatch",
-                "cancel should detect PID ownership mismatch",
-            )
-            self.assertFalse(stdout_obj.get("killSignalDelivered", True))
-            # finish.json must NOT be written on ownership mismatch
-            self.assertFalse(
-                finish_path.exists(),
-                "finish.json should NOT be written on ownership mismatch",
-            )
-
-    def test_abort_client_handles_connection_refused(self) -> None:
-        """OpencodeHttpClient.abort to unreachable server must not crash.
-        Connection refused is caught internally and handled gracefully."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        client = mod.OpencodeHttpClient("http://127.0.0.1:1")
-        # abort() catches connection errors internally; must not raise
-        try:
-            client.abort("ses_nonexistent")
-        except Exception as exc:
-            self.fail(
-                f"abort() should handle connection refused gracefully, but raised: {exc}"
-            )
-
-    def test_cancel_does_not_overwrite_existing_finish(self) -> None:
-        """Cancel must not overwrite an already-written finish.json."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_no_overwrite_") as td:
-            artifacts_dir = Path(td)
-            job_path = artifacts_dir / "job.json"
-            finish_path = artifacts_dir / "finish.json"
-
-            original = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": True,
-                "runId": "existing",
-                "summary": "existing-finish",
-            }
-            finish_path.write_text(json.dumps(original, indent=2), encoding="utf-8")
-            before = finish_path.read_text(encoding="utf-8")
-
-            job = {
-                "runId": "test-run-no-overwrite",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": 2147483647,
-            }
-            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertEqual(proc.returncode, 0)
-            after = finish_path.read_text(encoding="utf-8")
-            self.assertEqual(after, before)
-
-    def test_run_reuses_existing_finish_when_opencode_not_found(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_run_reuse_finish_"
-        ) as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            existing = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": True,
-                "runId": "reuse-run",
-                "summary": "already-finished",
-            }
-            finish_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-            before = finish_path.read_text(encoding="utf-8")
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
+    def test_removed_public_flags_are_rejected(self) -> None:
+        removed_flags = [
+            ("--include-debug",),
+            ("--max-text-chars", "10"),
+            ("--no-contract",),
+            ("--wrapper-log",),
+            ("--timeout", "1"),
+            ("--no-attach",),
+        ]
+        for removed in removed_flags:
+            with self.subTest(flag=" ".join(removed)):
+                proc = self._run_cli_command(
                     "run",
                     "--workdir",
-                    str(repo_root),
-                    "--engine",
-                    "cli",
-                    "--run-id",
-                    "reuse-run",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
+                    str(REPO_ROOT),
                     "--opencode",
-                    "__definitely_missing_opencode_bin__",
+                    "__dummy_opencode__",
                     "--prompt",
                     "Act as a senior software engineer.",
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stdout)
-            out = json.loads(proc.stdout)
-            self.assertEqual(out.get("type"), "opencode-subtask-finish")
-            # NOTE: adapterVersion not asserted here because the adapter
-            # returns the pre-existing finish.json as-is (no rewrite).
-            self.assertEqual(out.get("runId"), "reuse-run")
-            self.assertTrue(out.get("ok"))
-            after = finish_path.read_text(encoding="utf-8")
-            self.assertEqual(after, before)
-
-    def test_server_lock_timeout_scales_with_wait(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-        base = float(mod.DEFAULT_FILE_LOCK_TIMEOUT_S)
-        self.assertEqual(mod._server_lock_timeout_s(None), base)
-        self.assertGreaterEqual(mod._server_lock_timeout_s(60.0), 65.0)
-        self.assertEqual(mod._server_lock_timeout_s(-5.0), base)
-
-    def test_cancel_treats_kill_signal_as_success_when_probe_inconclusive(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_probe_unknown_") as td:
-            artifacts_dir = Path(td)
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(
-                    {
-                        "runId": "probe-unknown",
-                        "workdir": str(repo_root),
-                        "state": "running",
-                        "createdAt": 1,
-                        "updatedAt": 1,
-                        "pid": 12345,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-
-            call_idx = {"n": 0}
-
-            def fake_pid_running_state(pid: int):
-                call_idx["n"] += 1
-                if call_idx["n"] == 1:
-                    return (True, True)  # alive before cancel
-                return (False, False)  # probe inconclusive after kill
-
-            orig_pid_running_state = mod._pid_running_state
-            orig_pid_owner = mod._pid_subtask_worker_ownership_status
-            orig_kill_tree = mod._kill_tree
-            orig_wait_dead = mod._wait_for_pid_dead
-            try:
-                mod._pid_running_state = fake_pid_running_state
-                mod._pid_subtask_worker_ownership_status = (
-                    lambda pid, run_id, require_run_id=False: "verified"
+                    *removed,
                 )
-                mod._kill_tree = lambda pid, sig=None: True
-                mod._wait_for_pid_dead = lambda pid, timeout_s, poll_s=0.1: False
+                self.assertEqual(proc.returncode, 2, proc.stdout)
+                out = json.loads(proc.stdout)
+                self.assertEqual(out["type"], "opencode-subtask-error")
+                self.assertEqual(out["error"]["name"], "BadArgs")
+                self.assertIn(removed[0], out["error"]["message"])
 
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = mod.cmd_cancel(
-                        argparse.Namespace(
-                            run_id=None,
-                            artifacts_dir=str(artifacts_dir),
-                            env=[],
-                            env_file=[],
-                        )
-                    )
-                self.assertEqual(rc, 0)
-                # Stdout invariant: ok=true => error absent, taskError present.
-                cancel_out = json.loads(buf.getvalue().strip())
-                self.assertTrue(cancel_out["ok"])
-                self.assertNotIn(
-                    "error",
-                    cancel_out,
-                    "ok=true => error must be absent in cancel stdout",
-                )
-                self.assertIsInstance(cancel_out.get("taskError"), dict)
-                self.assertEqual(cancel_out["taskError"]["name"], "Canceled")
-                self.assertIn(
-                    "termination not confirmed",
-                    cancel_out["taskError"]["message"],
-                )
-                out = json.loads(
-                    (artifacts_dir / "job.json").read_text(encoding="utf-8")
-                )
-                self.assertTrue(bool(out.get("cancelUnverified")))
-                fin = json.loads(
-                    (artifacts_dir / "finish.json").read_text(encoding="utf-8")
-                )
-                self.assertEqual((fin.get("error") or {}).get("name"), "Canceled")
-                self.assertIn(
-                    "termination not confirmed",
-                    (fin.get("error") or {}).get("message", ""),
-                )
-            finally:
-                mod._pid_running_state = orig_pid_running_state
-                mod._pid_subtask_worker_ownership_status = orig_pid_owner
-                mod._kill_tree = orig_kill_tree
-                mod._wait_for_pid_dead = orig_wait_dead
+    def test_wait_rejects_removed_timeout_flag(self) -> None:
+        proc = self._run_cli_command("wait", "--run-id", "dummy", "--timeout", "1")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["type"], "opencode-subtask-error")
+        self.assertEqual(out["error"]["name"], "BadArgs")
+        self.assertIn("--timeout", out["error"]["message"])
 
-    def test_cancel_clears_task_error_when_finish_write_failed(self) -> None:
-        """P2: If cancel cannot persist finish.json, stdout taskError must be null.
+    def test_legacy_execution_profile_is_rejected(self) -> None:
+        proc = self._run_cli_command(
+            "run",
+            "--workdir",
+            str(REPO_ROOT),
+            "--opencode",
+            "__dummy_opencode__",
+            "--execution-profile",
+            "legacy",
+            "--prompt",
+            "Act as a senior software engineer.",
+        )
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["type"], "opencode-subtask-error")
+        self.assertEqual(out["error"]["name"], "BadArgs")
+        self.assertIn("--execution-profile", out["error"]["message"])
 
-        The adapter should emit ok=false + error=CancelFinishWriteFailed, and must
-        NOT publish a taskError that implies a persisted terminal finish exists.
-        """
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
+    def test_stderr_failure_error_detects_bun_crash(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_bun_crash_")
+        stderr_path = artifacts_dir / "stderr.log"
+        stderr_path.write_text(
+            "panic(main thread): Segmentation fault at address 0x123\n"
+            "oh no: Bun has crashed. This indicates a bug in Bun, not your code.\n",
+            encoding="utf-8",
+        )
+        err = self._mod._stderr_failure_error(stderr_path, 3)
+        self.assertEqual(err["name"], "EngineCrash")
+        self.assertIn("runtime crashed", err["message"])
 
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_cancel_writefail_") as td:
-            artifacts_dir = Path(td)
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(
-                    {
-                        "runId": "cancel-writefail",
-                        "workdir": str(repo_root),
-                        "state": "running",
-                        "createdAt": 1,
-                        "updatedAt": 1,
-                        "pid": 12345,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+    def test_stderr_failure_error_enriches_nonzero_exit(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_nonzero_stderr_")
+        stderr_path = artifacts_dir / "stderr.log"
+        stderr_path.write_text("fatal: something bad happened\n", encoding="utf-8")
+        err = self._mod._stderr_failure_error(stderr_path, 7)
+        self.assertEqual(err["name"], "NonZeroExit")
+        self.assertIn("fatal:", err["message"])
 
-            orig_pid_running_state = mod._pid_running_state
-            orig_pid_owner = mod._pid_subtask_worker_ownership_status
-            orig_kill_tree = mod._kill_tree
-            orig_wait_dead = mod._wait_for_pid_dead
-            orig_write_finish_once = mod._write_finish_once
-            try:
-                # Simulate a successful cancel (confirmed termination), but force
-                # finish.json persistence to fail.
-                mod._pid_running_state = lambda pid: (True, True)
-                mod._pid_subtask_worker_ownership_status = (
-                    lambda pid, run_id, require_run_id=False: "verified"
-                )
-                mod._kill_tree = lambda pid, sig=None: True
-                mod._wait_for_pid_dead = lambda pid, timeout_s, poll_s=0.1: True
-
-                def fake_write_finish_once(*, artifacts_dir, finish_path, finish_obj):
-                    return (False, "write_failed", None)
-
-                mod._write_finish_once = fake_write_finish_once
-
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = mod.cmd_cancel(
-                        argparse.Namespace(
-                            run_id=None,
-                            artifacts_dir=str(artifacts_dir),
-                            env=[],
-                            env_file=[],
-                        )
-                    )
-
-                self.assertEqual(rc, 1)
-                out = json.loads(buf.getvalue().strip())
-                self.assertFalse(out.get("ok"))
-                self._assert_adapter_version(out)
-                self.assertIn("error", out)
-                self.assertEqual(out["error"]["name"], "CancelFinishWriteFailed")
-                self.assertIsNone(out.get("taskError"))
-                self.assertFalse((artifacts_dir / "finish.json").exists())
-            finally:
-                mod._pid_running_state = orig_pid_running_state
-                mod._pid_subtask_worker_ownership_status = orig_pid_owner
-                mod._kill_tree = orig_kill_tree
-                mod._wait_for_pid_dead = orig_wait_dead
-                mod._write_finish_once = orig_write_finish_once
-
-    def test_empty_output_retry_once_then_fail(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_empty_output_fail_"
-        ) as td:
-            artifacts_dir = Path(td)
-            args = self._build_run_args(mod, repo_root, artifacts_dir, "empty-fail")
-            calls = {"n": 0}
-
-            def fake_run_cli(**kwargs):
-                calls["n"] += 1
-                return mod.RunOutcome(
-                    ok=True,
-                    exit_code=0,
-                    timed_out=False,
-                    engine="cli",
-                    fallback_from=None,
-                    session_id="ses_test",
-                    full_text="",
-                    metrics={"tokens": {"output": 0}},
-                    error=None,
-                )
-
-            orig_resolve = mod._resolve_executable_for_workdir
-            orig_run_cli = mod._run_cli
-            orig_git_status = mod._git_status
-            orig_git_patch = mod._git_patch
-            try:
-                mod._resolve_executable_for_workdir = (
-                    lambda cmd, wd: "__dummy_opencode__"
-                )
-                mod._run_cli = fake_run_cli
-                mod._git_status = lambda wd: ([], [])
-                mod._git_patch = lambda wd, ad: None
-
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = mod.cmd_run(args)
-                self.assertEqual(calls["n"], 2)
-                self.assertNotEqual(rc, 0)
-                fin = json.loads(buf.getvalue().strip())
-                self.assertEqual(
-                    (fin.get("error") or {}).get("name"), "EmptyModelOutput"
-                )
-                dbg = fin.get("debug") or {}
-                self.assertTrue(bool(dbg.get("emptyOutputDetected")))
-                self.assertTrue(bool(dbg.get("emptyOutputRetried")))
-                self.assertFalse(bool(dbg.get("emptyOutputRecovered")))
-            finally:
-                mod._resolve_executable_for_workdir = orig_resolve
-                mod._run_cli = orig_run_cli
-                mod._git_status = orig_git_status
-                mod._git_patch = orig_git_patch
-
-    def test_empty_output_retry_recovers(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_empty_output_recover_"
-        ) as td:
-            artifacts_dir = Path(td)
-            args = self._build_run_args(mod, repo_root, artifacts_dir, "empty-recover")
-            calls = {"n": 0}
-
-            def fake_run_cli(**kwargs):
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return mod.RunOutcome(
-                        ok=True,
-                        exit_code=0,
-                        timed_out=False,
-                        engine="cli",
-                        fallback_from=None,
-                        session_id="ses_test",
-                        full_text="",
-                        metrics={"tokens": {"output": 0}},
-                        error=None,
-                    )
-                return mod.RunOutcome(
-                    ok=True,
-                    exit_code=0,
-                    timed_out=False,
-                    engine="cli",
-                    fallback_from=None,
-                    session_id="ses_test",
-                    full_text="No major issues found.",
-                    metrics={"tokens": {"output": 12}},
-                    error=None,
-                )
-
-            orig_resolve = mod._resolve_executable_for_workdir
-            orig_run_cli = mod._run_cli
-            orig_git_status = mod._git_status
-            orig_git_patch = mod._git_patch
-            try:
-                mod._resolve_executable_for_workdir = (
-                    lambda cmd, wd: "__dummy_opencode__"
-                )
-                mod._run_cli = fake_run_cli
-                mod._git_status = lambda wd: ([], [])
-                mod._git_patch = lambda wd, ad: None
-
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = mod.cmd_run(args)
-                self.assertEqual(calls["n"], 2)
-                self.assertEqual(rc, 0)
-                fin = json.loads(buf.getvalue().strip())
-                self.assertTrue(bool(fin.get("ok")))
-                dbg = fin.get("debug") or {}
-                self.assertTrue(bool(dbg.get("emptyOutputDetected")))
-                self.assertTrue(bool(dbg.get("emptyOutputRetried")))
-                self.assertTrue(bool(dbg.get("emptyOutputRecovered")))
-            finally:
-                mod._resolve_executable_for_workdir = orig_resolve
-                mod._run_cli = orig_run_cli
-                mod._git_status = orig_git_status
-                mod._git_patch = orig_git_patch
-
-    def test_status_uses_canonical_run_id_from_job_json(self) -> None:
-        """When status is invoked with only --artifacts-dir (no --run-id),
-        and finish.json does NOT exist, the output runId must match
-        job.json's recorded runId, not a freshly generated one.
-        This tests the _canonical_run_id path that actually uses run_id.
-
-        NOTE: state="finished" prevents _maybe_finalize_stale_running_job
-        from triggering (it only acts on running/queued), ensuring we test
-        the primary cmd_status canonicalization, not the defensive one
-        inside the stale finalizer."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_canonical_rid_") as td:
-            artifacts_dir = Path(td)
-            real_run_id = "run_canonical_test_12345"
-            now_ms = int(time.time() * 1000)
-            job = {
-                "runId": real_run_id,
-                "workdir": str(repo_root),
-                "state": "finished",
-                "createdAt": now_ms,
-                "updatedAt": now_ms,
-                "pid": 0,
-            }
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(job, indent=2), encoding="utf-8"
-            )
-            # NOTE: no finish.json — forces status through the active-job
-            # path where _canonical_run_id actually determines the output runId.
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "status",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                    # NOTE: no --run-id provided
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            out = json.loads(proc.stdout)
-            # The runId in stdout must be the canonical one from job.json,
-            # not a freshly generated run_XXXX_YYYY.
-            self._assert_adapter_version(out)
-            self.assertEqual(out.get("runId"), real_run_id)
-
-    def test_cancel_uses_canonical_run_id_from_job_json(self) -> None:
-        """When cancel is invoked with only --artifacts-dir, the output
-        and finish.json must use job.json's recorded runId."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_cancel_canonical_"
-        ) as td:
-            artifacts_dir = Path(td)
-            real_run_id = "run_cancel_canonical_67890"
-            job = {
-                "runId": real_run_id,
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": 2147483647,
-            }
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(job, indent=2), encoding="utf-8"
-            )
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                    # NOTE: no --run-id provided
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stdout)
-            out = json.loads(proc.stdout)
-            self.assertEqual(out.get("runId"), real_run_id)
-            # Stdout invariant: ok=true => error absent, taskError present.
-            self.assertTrue(out["ok"])
-            self.assertNotIn(
-                "error",
-                out,
-                "ok=true => error must be absent in cancel stdout",
-            )
-            self.assertIsInstance(out.get("taskError"), dict)
-
-            fin = json.loads(
-                (artifacts_dir / "finish.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(fin.get("runId"), real_run_id)
-
-    def test_write_finish_once_recovers_corrupt_finish(self) -> None:
-        """When finish.json exists but is corrupt, _write_finish_once
-        should rename the corrupt file and write a new valid finish."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_corrupt_recover_"
-        ) as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            corrupt_content = "{this is not valid json!!!"
-            finish_path.write_text(corrupt_content, encoding="utf-8")
-
-            new_finish = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": True,
-                "runId": "recover-test",
-                "summary": "recovered",
-            }
-            written, reason, _ = mod._write_finish_once(
-                artifacts_dir=artifacts_dir,
-                finish_path=finish_path,
-                finish_obj=new_finish,
-            )
-            self.assertTrue(written)
-            self.assertEqual(reason, "recovered")
-
-            # New finish.json must be valid and match what we wrote.
-            fin = json.loads(finish_path.read_text(encoding="utf-8"))
-            self.assertEqual(fin.get("runId"), "recover-test")
-            self.assertTrue(fin.get("ok"))
-
-            # Corrupt file must be preserved as finish.corrupt.<ts>.json
-            corrupt_files = list(artifacts_dir.glob("finish.corrupt.*.json"))
-            self.assertEqual(len(corrupt_files), 1)
-            self.assertEqual(
-                corrupt_files[0].read_text(encoding="utf-8"), corrupt_content
-            )
-
-    def test_run_wrapper_log_not_created_in_foreground_mode(self) -> None:
-        """In foreground run mode, wrapper.log should not be referenced
-        in the finish JSON (wrapperLogPath should be null)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_no_wrapper_") as td:
-            artifacts_dir = Path(td)
-            args = self._build_run_args(mod, repo_root, artifacts_dir, "no-wrapper")
-            calls = {"n": 0}
-
-            def fake_run_cli(**kwargs):
-                calls["n"] += 1
-                return mod.RunOutcome(
-                    ok=True,
-                    exit_code=0,
-                    timed_out=False,
-                    engine="cli",
-                    fallback_from=None,
-                    session_id="ses_test",
-                    full_text="All good.",
-                    metrics={"tokens": {"output": 5}},
-                    error=None,
-                )
-
-            orig_resolve = mod._resolve_executable_for_workdir
-            orig_run_cli = mod._run_cli
-            orig_git_status = mod._git_status
-            orig_git_patch = mod._git_patch
-            try:
-                mod._resolve_executable_for_workdir = lambda cmd, wd: "__dummy__"
-                mod._run_cli = fake_run_cli
-                mod._git_status = lambda wd: ([], [])
-                mod._git_patch = lambda wd, ad: None
-
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = mod.cmd_run(args)
-                self.assertEqual(rc, 0)
-                fin = json.loads(buf.getvalue().strip())
-                artifacts = fin.get("artifacts") or {}
-                # wrapperLogPath should be absent or null in run mode
-                self.assertIsNone(
-                    artifacts.get("wrapperLogPath"),
-                    f"wrapperLogPath should be null in run mode, got: {artifacts.get('wrapperLogPath')}",
-                )
-                # wrapper.log file should NOT exist on disk
-                self.assertFalse(
-                    (artifacts_dir / "wrapper.log").exists(),
-                    "wrapper.log should not exist in foreground run mode",
-                )
-            finally:
-                mod._resolve_executable_for_workdir = orig_resolve
-                mod._run_cli = orig_run_cli
-                mod._git_status = orig_git_status
-                mod._git_patch = orig_git_patch
-
-    def test_run_wrapper_log_referenced_when_present(self) -> None:
-        """Fix D: when wrapper.log exists on disk (start-mode worker reusing
-        cmd_run code path), finish JSON should reference it via wrapperLogPath."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_wrapper_ref_") as td:
-            artifacts_dir = Path(td)
-            # Pre-create wrapper.log to simulate start-mode scenario
-            (artifacts_dir / "wrapper.log").write_text(
-                "wrapper boot log line\n", encoding="utf-8"
-            )
-            args = self._build_run_args(mod, repo_root, artifacts_dir, "wrapper-ref")
-
-            def fake_run_cli(**kwargs):
-                return mod.RunOutcome(
-                    ok=True,
-                    exit_code=0,
-                    timed_out=False,
-                    engine="cli",
-                    fallback_from=None,
-                    session_id="ses_wrapper",
-                    full_text="Done.",
-                    metrics={"tokens": {"output": 3}},
-                    error=None,
-                )
-
-            orig_resolve = mod._resolve_executable_for_workdir
-            orig_run_cli = mod._run_cli
-            orig_git_status = mod._git_status
-            orig_git_patch = mod._git_patch
-            try:
-                mod._resolve_executable_for_workdir = lambda cmd, wd: "__dummy__"
-                mod._run_cli = fake_run_cli
-                mod._git_status = lambda wd: ([], [])
-                mod._git_patch = lambda wd, ad: None
-
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = mod.cmd_run(args)
-                self.assertEqual(rc, 0)
-                fin = json.loads(buf.getvalue().strip())
-                artifacts = fin.get("artifacts") or {}
-                self.assertEqual(
-                    artifacts.get("wrapperLogPath"),
-                    "wrapper.log",
-                    "wrapperLogPath should reference wrapper.log when it exists on disk",
-                )
-            finally:
-                mod._resolve_executable_for_workdir = orig_resolve
-                mod._run_cli = orig_run_cli
-                mod._git_status = orig_git_status
-                mod._git_patch = orig_git_patch
-
-    # ------------------------------------------------------------------ #
-    # Degradation & edge-case tests (added per expert review feedback)   #
-    # ------------------------------------------------------------------ #
-
-    def test_canonical_run_id_malformed_inputs(self) -> None:
-        """_canonical_run_id must gracefully handle missing, empty, and
-        non-string runId values without crashing."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        fallback = "run_fallback_999"
-
-        # job is None (job.json missing)
-        self.assertEqual(mod._canonical_run_id(fallback, None), fallback)
-
-        # job is not a dict
-        self.assertEqual(mod._canonical_run_id(fallback, "garbage"), fallback)
-        self.assertEqual(mod._canonical_run_id(fallback, [1, 2]), fallback)
-
-        # job dict without runId key
-        self.assertEqual(mod._canonical_run_id(fallback, {}), fallback)
-
-        # runId is empty string (falsy)
-        self.assertEqual(mod._canonical_run_id(fallback, {"runId": ""}), fallback)
-
-        # runId is None
-        self.assertEqual(mod._canonical_run_id(fallback, {"runId": None}), fallback)
-
-        # runId is 0 (falsy int)
-        self.assertEqual(mod._canonical_run_id(fallback, {"runId": 0}), fallback)
-
-        # runId is a valid string
+    def test_validate_finish_rejects_completed_outcome_with_execution_error(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_completed_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            outcome="completed",
+            execution_error={"name": "RuntimeError", "message": "bad"},
+        )
         self.assertEqual(
-            mod._canonical_run_id(fallback, {"runId": "run_real_123"}),
-            "run_real_123",
+            self._mod._validate_finish_envelope(finish),
+            "completed outcome requires execution.error=null",
         )
 
-        # runId is an int (truthy non-string) — should str() it
+    def test_validate_finish_rejects_text_mode_payload_artifact(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_text_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            output_mode="text",
+            payload_status="not_requested",
+            decision_status="not_requested",
+            payload_artifact_path="payload.json",
+        )
         self.assertEqual(
-            mod._canonical_run_id(fallback, {"runId": 42}),
-            "42",
+            self._mod._validate_finish_envelope(finish),
+            "text outputMode requires payload.artifact.path/digest=null",
         )
 
-    def test_write_finish_once_replace_fails_unlink_succeeds(self) -> None:
-        """When os.replace fails for the rename but unlink succeeds,
-        _write_finish_once should still write the new finish (recovered)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
+    def test_validate_finish_rejects_validated_payload_without_schema(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_schema_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            payload_status="validated",
+            payload_schema=None,
+            payload_artifact_path="payload.json",
+            payload_digest="abc",
+            decision_status="determinate",
+            decision_route="GO_NO_DELTA",
+        )
+        self.assertEqual(
+            self._mod._validate_finish_envelope(finish),
+            f"validated payload requires payload.schema={self._mod.PAYLOAD_PROTOCOL}",
+        )
 
-        import unittest.mock as mock
+    def test_validate_finish_rejects_validated_payload_without_digest(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_digest_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            payload_status="validated",
+            payload_schema=self._mod.PAYLOAD_PROTOCOL,
+            payload_artifact_path="payload.json",
+            payload_digest=None,
+            decision_status="determinate",
+            decision_route="GO_NO_DELTA",
+        )
+        self.assertEqual(
+            self._mod._validate_finish_envelope(finish),
+            "validated payload requires payload.artifact.digest",
+        )
 
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_replace_fail_") as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            finish_path.write_text("NOT JSON!!!", encoding="utf-8")
+    def test_validate_finish_rejects_validated_payload_with_unavailable_decision(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_decision_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            payload_status="validated",
+            payload_schema=self._mod.PAYLOAD_PROTOCOL,
+            payload_artifact_path="payload.json",
+            payload_digest="abc",
+            decision_status="unavailable",
+        )
+        self.assertEqual(
+            self._mod._validate_finish_envelope(finish),
+            "validated payload requires decision.status=determinate|abstained",
+        )
 
-            new_finish = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": True,
-                "runId": "replace-fail-test",
-                "summary": "recovered after replace fail",
-            }
+    def test_validate_finish_rejects_invalid_engine_selected(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_engine_selected_")
+        finish = self._make_finish(artifacts_dir=artifacts_dir)
+        finish["execution"]["engine"]["selected"] = "ftp"
+        self.assertEqual(
+            self._mod._validate_finish_envelope(finish),
+            "execution.engine.selected is invalid",
+        )
 
-            orig_replace = os.replace
-            call_count = {"n": 0}
+    def test_validate_finish_rejects_invalid_engine_fallback(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_engine_fallback_")
+        finish = self._make_finish(artifacts_dir=artifacts_dir)
+        finish["execution"]["engine"]["fallbackFrom"] = "cli"
+        self.assertEqual(
+            self._mod._validate_finish_envelope(finish),
+            "execution.engine.fallbackFrom is invalid",
+        )
 
-            def selective_replace(src, dst):
-                """Fail only the first call (rename corrupt → backup),
-                allow subsequent calls (_atomic_write_bytes)."""
-                call_count["n"] += 1
-                if call_count["n"] == 1:
-                    raise PermissionError("AV lock simulated")
-                return orig_replace(src, dst)
+    def test_validate_finish_rejects_fallback_without_cli_engine(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_engine_pair_")
+        finish = self._make_finish(artifacts_dir=artifacts_dir, fallback_from="http")
+        finish["execution"]["engine"]["selected"] = "http"
+        self.assertEqual(
+            self._mod._validate_finish_envelope(finish),
+            "execution.engine.fallbackFrom requires execution.engine.selected=cli",
+        )
 
-            with mock.patch("os.replace", side_effect=selective_replace):
-                written, reason, _ = mod._write_finish_once(
-                    artifacts_dir=artifacts_dir,
-                    finish_path=finish_path,
-                    finish_obj=new_finish,
-                )
+    def test_validate_finish_rejects_invalid_payload_error_code(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_validate_payload_error_code_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            payload_errors=[{"code": "NOT_REAL", "message": "bad"}],
+        )
+        self.assertEqual(
+            self._mod._validate_finish_envelope(finish),
+            "payload.errors[0].code is invalid",
+        )
 
-            self.assertTrue(written)
-            self.assertEqual(reason, "recovered")
-            fin = json.loads(finish_path.read_text(encoding="utf-8"))
-            self.assertEqual(fin["runId"], "replace-fail-test")
+    def test_run_machine_validated_go(self) -> None:
+        nonce = "nonce-go"
+        text = self._build_payload_text(nonce=nonce, decision="GO_NO_DELTA")
+        rc, out, artifacts_dir = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["schemaVersion"], 2)
+        self.assertEqual(out["outcome"], "completed")
+        self.assertEqual(out["outputMode"], "machine")
+        self.assertEqual(out["payload"]["status"], "validated")
+        self.assertEqual(out["decision"]["status"], "determinate")
+        self.assertEqual(out["decision"]["route"], "GO_NO_DELTA")
+        payload_path = artifacts_dir / "payload.json"
+        self.assertTrue(payload_path.exists())
+        self.assertEqual(out["payload"]["artifact"]["path"], "payload.json")
+        self.assertEqual(
+            out["payload"]["artifact"]["digest"], self._mod._sha256_file(payload_path)
+        )
+        self.assertFalse((artifacts_dir / "diagnostics.json").exists())
 
-    def test_write_finish_once_replace_and_unlink_both_fail(self) -> None:
-        """When both os.replace and unlink fail, _write_finish_once should
-        return (False, 'unreadable', None) without crashing."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
+    def test_run_machine_validated_when_markers_are_echoed_in_prose(self) -> None:
+        nonce = "nonce-echoed"
+        begin, end = self._mod._sentinel_markers(nonce)
+        text = (
+            f"The required terminal block uses {begin} and {end}.\n"
+            f"{self._build_payload_text(nonce=nonce, decision='GO_NO_DELTA')}"
+        )
+        rc, out, _ = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "validated")
+        self.assertEqual(out["decision"]["route"], "GO_NO_DELTA")
 
-        import unittest.mock as mock
+    def test_run_machine_validated_mandatory(self) -> None:
+        nonce = "nonce-mandatory"
+        text = self._build_payload_text(nonce=nonce, decision="MANDATORY_DELTA")
+        rc, out, _ = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["outcome"], "completed")
+        self.assertEqual(out["payload"]["status"], "validated")
+        self.assertEqual(out["decision"]["route"], "MANDATORY_DELTA")
 
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_both_fail_") as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            finish_path.write_text("CORRUPT!!!", encoding="utf-8")
+    def test_run_machine_validated_undetermined(self) -> None:
+        nonce = "nonce-undetermined"
+        text = self._build_payload_text(nonce=nonce, decision="UNDETERMINED")
+        rc, out, _ = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "validated")
+        self.assertEqual(out["decision"]["status"], "abstained")
+        self.assertIsNone(out["decision"]["route"])
 
-            new_finish = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": True,
-                "runId": "both-fail-test",
-            }
+    def test_run_machine_missing_sentinel_emits_diagnostics(self) -> None:
+        rc, out, artifacts_dir = self._mocked_run(text="plain assistant text only")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["outcome"], "completed")
+        self.assertEqual(out["payload"]["status"], "missing")
+        self.assertEqual(out["decision"]["status"], "unavailable")
+        self.assertTrue((artifacts_dir / "diagnostics.json").exists())
+        codes = {item["code"] for item in out["payload"]["errors"]}
+        self.assertIn("PAYLOAD_MISSING", codes)
 
-            with (
-                mock.patch("os.replace", side_effect=PermissionError("locked")),
-                mock.patch.object(
-                    Path, "unlink", side_effect=PermissionError("also locked")
-                ),
-            ):
-                written, reason, existing = mod._write_finish_once(
-                    artifacts_dir=artifacts_dir,
-                    finish_path=finish_path,
-                    finish_obj=new_finish,
-                )
+    def test_run_machine_multiple_sentinels_is_ambiguous(self) -> None:
+        nonce = "nonce-ambiguous"
+        text = (
+            self._build_payload_text(nonce=nonce, decision="GO_NO_DELTA")
+            + self._build_payload_text(nonce="other-nonce", decision="MANDATORY_DELTA")
+        )
+        rc, out, artifacts_dir = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "ambiguous")
+        codes = {item["code"] for item in out["payload"]["errors"]}
+        self.assertIn("SENTINEL_MULTIPLE", codes)
+        self.assertTrue((artifacts_dir / "diagnostics.json").exists())
 
-            self.assertFalse(written)
-            self.assertEqual(reason, "unreadable")
-            self.assertIsNone(existing)
-            # Original corrupt file must still be there
-            self.assertEqual(finish_path.read_text(encoding="utf-8"), "CORRUPT!!!")
+    def test_run_machine_trailing_markdown_after_end_is_malformed_not_ambiguous(self) -> None:
+        nonce = "nonce-trailing-markdown"
+        text = self._build_payload_text(nonce=nonce, decision="GO_NO_DELTA") + "---\n\nextra"
+        rc, out, artifacts_dir = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "malformed")
+        self.assertEqual(out["decision"]["status"], "unavailable")
+        codes = [item["code"] for item in out["payload"]["errors"]]
+        self.assertIn("SENTINEL_TRAILING_TEXT", codes)
+        self.assertNotIn("SENTINEL_MULTIPLE", codes)
+        self.assertTrue((artifacts_dir / "diagnostics.json").exists())
 
-    def test_write_finish_once_double_corrupt_recovery(self) -> None:
-        """After recovering from corrupt finish.json, a second call with
-        a different finish should return (False, 'exists', first_finish)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
+    def test_run_machine_trailing_text_is_malformed(self) -> None:
+        nonce = "nonce-trailing"
+        text = self._build_payload_text(nonce=nonce, decision="GO_NO_DELTA") + "extra"
+        rc, out, _ = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "malformed")
+        codes = {item["code"] for item in out["payload"]["errors"]}
+        self.assertIn("SENTINEL_TRAILING_TEXT", codes)
 
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_double_recover_") as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            finish_path.write_text("{bad json", encoding="utf-8")
+    def test_run_machine_nonce_mismatch_is_malformed(self) -> None:
+        text = self._build_payload_text(nonce="wrong-nonce", decision="GO_NO_DELTA")
+        rc, out, _ = self._mocked_run(text=text, nonce="expected-nonce")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "malformed")
+        codes = {item["code"] for item in out["payload"]["errors"]}
+        self.assertIn("NONCE_MISMATCH", codes)
 
-            first_finish = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": True,
-                "runId": "first-recovery",
-                "summary": "first",
-            }
-            written1, reason1, _ = mod._write_finish_once(
-                artifacts_dir=artifacts_dir,
-                finish_path=finish_path,
-                finish_obj=first_finish,
-            )
-            self.assertTrue(written1)
-            self.assertEqual(reason1, "recovered")
+    def test_run_machine_invalid_json_is_malformed(self) -> None:
+        nonce = "nonce-json"
+        begin, end = self._mod._sentinel_markers(nonce)
+        text = f"{begin}\n{{not-json}}\n{end}\n"
+        rc, out, _ = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "malformed")
+        codes = {item["code"] for item in out["payload"]["errors"]}
+        self.assertIn("PAYLOAD_JSON_INVALID", codes)
 
-            # Second call: finish.json now has valid content from first recovery
-            second_finish = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": False,
-                "runId": "second-attempt",
-                "summary": "second",
-            }
-            written2, reason2, existing2 = mod._write_finish_once(
-                artifacts_dir=artifacts_dir,
-                finish_path=finish_path,
-                finish_obj=second_finish,
-            )
-            self.assertFalse(written2)
-            self.assertEqual(reason2, "exists")
-            self.assertIsInstance(existing2, dict)
-            self.assertEqual(existing2["runId"], "first-recovery")
+    def test_run_machine_schema_invalid_is_malformed(self) -> None:
+        nonce = "nonce-schema"
+        text = self._build_payload_text(
+            nonce=nonce,
+            decision="GO_NO_DELTA",
+            summary=123,
+        )
+        rc, out, _ = self._mocked_run(text=text, nonce=nonce)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "malformed")
+        codes = {item["code"] for item in out["payload"]["errors"]}
+        self.assertIn("PAYLOAD_SCHEMA_INVALID", codes)
 
-    # ── PR #10 regression tests ────────────────────────────────────────
+    def test_run_payload_persist_failed(self) -> None:
+        nonce = "nonce-persist"
+        text = self._build_payload_text(nonce=nonce, decision="GO_NO_DELTA")
+        rc, out, artifacts_dir = self._mocked_run(
+            text=text,
+            nonce=nonce,
+            fail_payload_write=True,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["payload"]["status"], "persist_failed")
+        self.assertEqual(out["decision"]["status"], "unavailable")
+        codes = {item["code"] for item in out["payload"]["errors"]}
+        self.assertIn("PAYLOAD_PERSIST_FAILED", codes)
+        self.assertTrue((artifacts_dir / "diagnostics.json").exists())
 
-    def test_write_finish_once_not_exists_write_failure(self):
-        """P0: _write_finish_once must catch _write_json failure on the
-        'not exists' path and return (False, 'write_failed', None)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-        with tempfile.TemporaryDirectory() as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            finish_obj = {"ok": True, "runId": "wf-test"}
-            # Make artifacts_dir read-only so _write_json fails
-            # (on Windows, patch _write_json directly instead)
-            original_write_json = mod._write_json
-            call_count = 0
+    def test_run_text_mode_marks_payload_not_requested(self) -> None:
+        rc, out, artifacts_dir = self._mocked_run(
+            text="freeform text",
+            output_mode="text",
+            nonce=None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["outputMode"], "text")
+        self.assertEqual(out["payload"]["status"], "not_requested")
+        self.assertEqual(out["decision"]["status"], "not_requested")
+        self.assertFalse((artifacts_dir / "payload.json").exists())
+        self.assertFalse((artifacts_dir / "diagnostics.json").exists())
 
-            def _failing_write_json(path, obj):
-                nonlocal call_count
-                call_count += 1
-                raise OSError("disk full")
+    def test_run_text_mode_failure_emits_diagnostics(self) -> None:
+        timeout_outcome = self._mod.RunOutcome(
+            ok=False,
+            exit_code=124,
+            timed_out=True,
+            engine="cli",
+            fallback_from=None,
+            session_id=None,
+            full_text="",
+            metrics=None,
+            error={"name": "Timeout", "message": "timed out"},
+        )
+        rc, out, artifacts_dir = self._mocked_run(
+            text="",
+            output_mode="text",
+            nonce=None,
+            run_outcome=timeout_outcome,
+        )
+        self.assertEqual(rc, 124)
+        self.assertEqual(out["outputMode"], "text")
+        self.assertEqual(out["outcome"], "timed_out")
+        self.assertTrue((artifacts_dir / "diagnostics.json").exists())
 
-            with unittest.mock.patch.object(mod, "_write_json", _failing_write_json):
-                written, reason, existing = mod._write_finish_once(
-                    artifacts_dir=artifacts_dir,
-                    finish_path=finish_path,
-                    finish_obj=finish_obj,
-                )
-            self.assertFalse(written)
-            self.assertEqual(reason, "write_failed")
-            self.assertIsNone(existing)
-            self.assertEqual(call_count, 1)
-            self.assertFalse(finish_path.exists())
+    def test_run_timeout_maps_exit_code_from_execution_outcome(self) -> None:
+        timeout_outcome = self._mod.RunOutcome(
+            ok=False,
+            exit_code=124,
+            timed_out=True,
+            engine="cli",
+            fallback_from=None,
+            session_id=None,
+            full_text="",
+            metrics=None,
+            error={"name": "Timeout", "message": "timed out"},
+        )
+        rc, out, _ = self._mocked_run(text="", run_outcome=timeout_outcome)
+        self.assertEqual(rc, 124)
+        self.assertEqual(out["outcome"], "timed_out")
 
-    def test_canonical_run_id_strip_and_control_char_rejection(self):
-        """P3: _canonical_run_id strips whitespace and rejects control chars."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-        fallback = "safe-uuid-1234"
+    def test_run_cli_captures_session_id_from_event_stream(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_cli_session_")
+        prompt_path = artifacts_dir / "prompt.txt"
+        prompt_path.write_text("prompt", encoding="utf-8")
+        stderr_path = artifacts_dir / "stderr.log"
 
-        # Strip whitespace from job runId
-        result = mod._canonical_run_id(fallback, {"runId": "  abc-123  "})
-        self.assertEqual(result, "abc-123")
+        class _FakeStdout:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self._chunks = list(chunks)
 
-        # Strip whitespace from fallback when job has no runId
-        result = mod._canonical_run_id("  fallback-id  ", {})
-        self.assertEqual(result, "fallback-id")
+            def readline(self) -> bytes:
+                if not self._chunks:
+                    return b""
+                return self._chunks.pop(0)
 
-        # Reject newline in job runId → fall back to stripped run_id
-        result = mod._canonical_run_id(fallback, {"runId": "bad\nid"})
-        self.assertEqual(result, fallback)
+        class _FakeProc:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.stdout = _FakeStdout(chunks)
+                self.pid = 12345
+                self.returncode = 0
 
-        # Reject tab in job runId
-        result = mod._canonical_run_id(fallback, {"runId": "bad\tid"})
-        self.assertEqual(result, fallback)
+            def wait(self, timeout=None) -> int:
+                return 0
 
-        # Reject NUL in job runId
-        result = mod._canonical_run_id(fallback, {"runId": "bad\x00id"})
-        self.assertEqual(result, fallback)
+            def poll(self):
+                return self.returncode
 
-        # Reject DEL (0x7f) in job runId
-        result = mod._canonical_run_id(fallback, {"runId": "bad\x7fid"})
-        self.assertEqual(result, fallback)
+            def kill(self) -> None:
+                self.returncode = -9
 
-        # Clean job runId passes through
-        result = mod._canonical_run_id(fallback, {"runId": "clean-id-99"})
-        self.assertEqual(result, "clean-id-99")
-
-    def test_artifacts_obj_nonexistent_files_are_null(self):
-        """P2: _artifacts_obj returns null for optional paths that don't exist."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            job_path = d / "job.json"
-            finish_path = d / "finish.json"
-            prompt_path = d / "prompt.md"
-            # Create only mandatory files
-            for p in (job_path, finish_path, prompt_path):
-                p.write_text("{}")
-            # Optional paths that do NOT exist on disk
-            events_path = d / "events.ndjson"
-            stderr_path = d / "stderr.log"
-            assistant_path = d / "assistant.txt"
-            wrapper_log_path = d / "wrapper.log"
-            result_path = d / "result.json"
-
-            arts = mod._artifacts_obj(
-                dir_path=d,
-                job_path=job_path,
-                finish_path=finish_path,
+        seen_session_ids: list[str] = []
+        proc = _FakeProc(
+            [b'{"type":"session.start","sessionID":"ses_stream"}\n', b""]
+        )
+        with unittest.mock.patch.object(self._mod.subprocess, "Popen", return_value=proc):
+            outcome = self._mod._run_cli(
+                opencode_bin="__dummy_opencode__",
+                workdir=REPO_ROOT,
+                env={},
+                attach_url=None,
                 prompt_path=prompt_path,
+                continue_last=False,
+                session_id=None,
+                title=None,
+                agent=None,
+                model=None,
+                variant=None,
+                files=[],
+                timeout_s=1.0,
+                quiet=True,
+                save_events=False,
+                save_text=False,
+                max_artifact_bytes=1024 * 1024,
+                events_path=None,
+                stderr_path=stderr_path,
+                assistant_path=None,
+                on_session_id=seen_session_ids.append,
+            )
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.session_id, "ses_stream")
+        self.assertEqual(seen_session_ids, ["ses_stream"])
+
+    def test_cancel_writes_cancelled_finish_when_worker_dead(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_cancel_")
+        job = {
+            "runId": "cancel-test",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": 1,
+            "updatedAt": 1,
+            "pid": 2147483647,
+            "serverUrl": "http://127.0.0.1:99999",
+            "sessionId": "ses_test",
+            "httpAttempted": True,
+            "serverStartedNew": False,
+            "stopServerAfterRunMode": "never",
+            "outputMode": "machine",
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        proc = self._run_cli_command("cancel", "--artifacts-dir", str(artifacts_dir))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        out = json.loads(proc.stdout)
+        self.assertTrue(out["ok"])
+        finish = json.loads((artifacts_dir / "finish.json").read_text(encoding="utf-8"))
+        self.assertEqual(finish["outcome"], "cancelled")
+        self.assertEqual(finish["payload"]["status"], "missing")
+
+    def test_status_returns_terminal_finish_unchanged(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_status_")
+        finish = {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 2,
+            "adapterVersion": "0.6.0",
+            "timestamp": 1,
+            "runId": "status-test",
+            "workdir": str(REPO_ROOT),
+            "outputMode": "machine",
+            "outcome": "completed",
+            "execution": {
+                "exitCode": 0,
+                "durationMs": 1,
+                "engine": {"selected": "cli", "fallbackFrom": None},
+                "sessionId": None,
+                "error": None,
+                "warnings": [],
+            },
+            "payload": {
+                "status": "missing",
+                "schema": None,
+                "artifact": {"path": None, "digest": None},
+                "errors": [],
+            },
+            "decision": {"status": "unavailable", "route": None},
+            "workspace": {
+                "changedFiles": [],
+                "untrackedFiles": [],
+                "patchPath": None,
+            },
+            "artifacts": {
+                "dir": str(artifacts_dir),
+                "jobPath": "job.json",
+                "finishPath": "finish.json",
+                "promptPath": None,
+                "stderrPath": None,
+                "assistantPath": None,
+                "eventsPath": None,
+                "wrapperLogPath": None,
+                "payloadPath": None,
+                "diagnosticsPath": None,
+            },
+        }
+        (artifacts_dir / "finish.json").write_text(json.dumps(finish), encoding="utf-8")
+        proc = self._run_cli_command("status", "--artifacts-dir", str(artifacts_dir))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout), finish)
+
+    def test_wait_timeout_returns_status_with_wait_expired(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_wait_")
+        now_ms = self._mod._now_ms()
+        job = {
+            "runId": "wait-test",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        proc = self._run_cli_command(
+            "wait",
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--wait-timeout",
+            "0.01",
+            "--poll-interval",
+            "0.01",
+        )
+        self.assertEqual(proc.returncode, 0)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["type"], "opencode-subtask-status")
+        self.assertTrue(out["waitExpired"])
+
+    def test_wait_uses_finish_outcome_exit_code(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_wait_finish_")
+        finish = {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 2,
+            "adapterVersion": "0.6.0",
+            "timestamp": 1,
+            "runId": "wait-finish-test",
+            "workdir": str(REPO_ROOT),
+            "outputMode": "machine",
+            "outcome": "timed_out",
+            "execution": {
+                "exitCode": 124,
+                "durationMs": 1,
+                "engine": {"selected": "cli", "fallbackFrom": None},
+                "sessionId": None,
+                "error": {"name": "Timeout", "message": "timed out"},
+                "warnings": [],
+            },
+            "payload": {
+                "status": "missing",
+                "schema": None,
+                "artifact": {"path": None, "digest": None},
+                "errors": [{"code": "PAYLOAD_MISSING", "message": "missing"}],
+            },
+            "decision": {"status": "unavailable", "route": None},
+            "workspace": {
+                "changedFiles": [],
+                "untrackedFiles": [],
+                "patchPath": None,
+            },
+            "artifacts": {
+                "dir": str(artifacts_dir),
+                "jobPath": "job.json",
+                "finishPath": "finish.json",
+                "promptPath": None,
+                "stderrPath": None,
+                "assistantPath": None,
+                "eventsPath": None,
+                "wrapperLogPath": None,
+                "payloadPath": None,
+                "diagnosticsPath": None,
+            },
+        }
+        (artifacts_dir / "finish.json").write_text(json.dumps(finish), encoding="utf-8")
+        proc = self._run_cli_command("wait", "--artifacts-dir", str(artifacts_dir))
+        self.assertEqual(proc.returncode, 124)
+        self.assertEqual(json.loads(proc.stdout)["outcome"], "timed_out")
+
+    def test_wait_synthesized_finish_uses_outcome_exit_code(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_wait_synth_")
+        job = {
+            "runId": "wait-synth-test",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": 1,
+            "updatedAt": 1,
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        synthesized = {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 2,
+            "adapterVersion": "0.6.0",
+            "timestamp": 1,
+            "runId": "wait-synth-test",
+            "workdir": str(REPO_ROOT),
+            "outputMode": "machine",
+            "outcome": "cancelled",
+            "execution": {
+                "exitCode": 130,
+                "durationMs": 1,
+                "engine": {"selected": "cli", "fallbackFrom": None},
+                "sessionId": None,
+                "error": {"name": "Canceled", "message": "cancelled"},
+                "warnings": [],
+            },
+            "payload": {
+                "status": "missing",
+                "schema": None,
+                "artifact": {"path": None, "digest": None},
+                "errors": [{"code": "PAYLOAD_MISSING", "message": "missing"}],
+            },
+            "decision": {"status": "unavailable", "route": None},
+            "workspace": {
+                "changedFiles": [],
+                "untrackedFiles": [],
+                "patchPath": None,
+            },
+            "artifacts": {
+                "dir": str(artifacts_dir),
+                "jobPath": "job.json",
+                "finishPath": "finish.json",
+                "promptPath": None,
+                "stderrPath": None,
+                "assistantPath": None,
+                "eventsPath": None,
+                "wrapperLogPath": None,
+                "payloadPath": None,
+                "diagnosticsPath": None,
+            },
+        }
+        args = argparse.Namespace(
+            run_id=None,
+            artifacts_dir=str(artifacts_dir),
+            wait_timeout=1.0,
+            poll_interval=0.01,
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_maybe_finalize_stale_running_job",
+                return_value=synthesized,
+            ),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_wait(args)
+        self.assertEqual(rc, 130)
+        self.assertEqual(json.loads(buf.getvalue().strip())["outcome"], "cancelled")
+
+    def test_status_quarantines_invalid_finish_and_continues(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_status_invalid_")
+        now_ms = self._mod._now_ms()
+        job = {
+            "runId": "status-invalid",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        (artifacts_dir / "finish.json").write_text("{}", encoding="utf-8")
+        proc = self._run_cli_command("status", "--artifacts-dir", str(artifacts_dir))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["type"], "opencode-subtask-status")
+        self.assertEqual(out["status"], "running")
+        warning_names = {item["name"] for item in out["warnings"]}
+        self.assertIn("FinishInvalidQuarantined", warning_names)
+        self.assertFalse((artifacts_dir / "finish.json").exists())
+        self.assertTrue(list(artifacts_dir.glob("finish.invalid.*.json")))
+
+    def test_status_quarantines_legacy_v1_finish_and_continues(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_status_legacy_")
+        now_ms = self._mod._now_ms()
+        job = {
+            "runId": "status-legacy",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
+        }
+        legacy_finish = {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 1,
+            "ok": True,
+            "runId": "status-legacy",
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        (artifacts_dir / "finish.json").write_text(
+            json.dumps(legacy_finish), encoding="utf-8"
+        )
+        proc = self._run_cli_command("status", "--artifacts-dir", str(artifacts_dir))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["type"], "opencode-subtask-status")
+        self.assertEqual(out["status"], "running")
+        warning_names = {item["name"] for item in out["warnings"]}
+        self.assertIn("FinishInvalidQuarantined", warning_names)
+        self.assertFalse((artifacts_dir / "finish.json").exists())
+        self.assertTrue(list(artifacts_dir.glob("finish.invalid.*.json")))
+
+    def test_wait_quarantines_invalid_finish_and_continues(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_wait_invalid_")
+        now_ms = self._mod._now_ms()
+        job = {
+            "runId": "wait-invalid",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        (artifacts_dir / "finish.json").write_text("{}", encoding="utf-8")
+        proc = self._run_cli_command(
+            "wait",
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--wait-timeout",
+            "0.01",
+            "--poll-interval",
+            "0.01",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["type"], "opencode-subtask-status")
+        self.assertTrue(out["waitExpired"])
+        warning_names = {item["name"] for item in out["warnings"]}
+        self.assertIn("FinishInvalidQuarantined", warning_names)
+        self.assertFalse((artifacts_dir / "finish.json").exists())
+        self.assertTrue(list(artifacts_dir.glob("finish.invalid.*.json")))
+
+    def test_cancel_quarantines_invalid_finish_and_continues(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_cancel_invalid_")
+        now_ms = self._mod._now_ms()
+        job = {
+            "runId": "cancel-invalid",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
+            "outputMode": "machine",
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        (artifacts_dir / "finish.json").write_text("{}", encoding="utf-8")
+        proc = self._run_cli_command("cancel", "--artifacts-dir", str(artifacts_dir))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        out = json.loads(proc.stdout)
+        warning_names = {item["name"] for item in out["warnings"]}
+        self.assertIn("FinishInvalidQuarantined", warning_names)
+        finish = json.loads((artifacts_dir / "finish.json").read_text(encoding="utf-8"))
+        self.assertEqual(finish["outcome"], "internal_error")
+        self.assertTrue(list(artifacts_dir.glob("finish.invalid.*.json")))
+
+    def test_status_synthesizes_finish_for_dead_worker_after_grace(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_status_stale_dead_")
+        old_ms = self._mod._now_ms() - int((self._mod.DEFAULT_DEAD_WORKER_GRACE_S + 5) * 1000)
+        job = {
+            "runId": "stale-dead",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": old_ms,
+            "updatedAt": old_ms,
+            "pid": 2147483647,
+            "outputMode": "machine",
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        buf = io.StringIO()
+        args = argparse.Namespace(run_id=None, artifacts_dir=str(artifacts_dir))
+        with contextlib.redirect_stdout(buf):
+            rc = self._mod.cmd_status(args)
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["type"], "opencode-subtask-finish")
+        self.assertEqual(out["execution"]["error"]["name"], "WorkerNotRunning")
+        self.assertTrue((artifacts_dir / "finish.json").exists())
+
+    def test_status_synthesizes_finish_for_stuck_after_cancel(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_status_stale_cancel_")
+        stale_age_s = max(
+            self._mod.DEFAULT_STALE_IDLE_S, self._mod.DEFAULT_CANCEL_STUCK_GRACE_S
+        ) + 5
+        old_touch_ms = self._mod._now_ms() - int(stale_age_s * 1000)
+        old_cancel_ms = self._mod._now_ms() - int(stale_age_s * 1000)
+        job = {
+            "runId": "stale-cancel",
+            "workdir": str(REPO_ROOT),
+            "state": "canceled",
+            "createdAt": old_touch_ms,
+            "updatedAt": old_touch_ms,
+            "cancelAttemptedAt": old_cancel_ms,
+            "pid": 99999,
+            "outputMode": "machine",
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        buf = io.StringIO()
+        args = argparse.Namespace(run_id=None, artifacts_dir=str(artifacts_dir))
+        with (
+            unittest.mock.patch.object(self._mod, "_pid_running", return_value=True),
+            unittest.mock.patch.object(
+                self._mod,
+                "_pid_subtask_worker_ownership_status",
+                return_value="verified",
+            ),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_status(args)
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["type"], "opencode-subtask-finish")
+        self.assertEqual(out["execution"]["error"]["name"], "StuckAfterCancel")
+
+    def test_run_auto_skips_http_when_cli_only_options_requested(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_auto_cli_")
+        extra_file = artifacts_dir / "context.txt"
+        extra_file.write_text("context", encoding="utf-8")
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="run-auto-cli",
+            output_mode="text",
+            engine="auto",
+            extra_args=["--attach", "http://127.0.0.1:8765", "--file", str(extra_file)],
+        )
+        outcome = self._mod.RunOutcome(
+            ok=True,
+            exit_code=0,
+            timed_out=False,
+            engine="cli",
+            fallback_from=None,
+            session_id="ses_auto_cli",
+            full_text="text response",
+            metrics=None,
+            error=None,
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_resolve_executable_for_workdir",
+                return_value="__dummy_opencode__",
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_apply_execution_profile",
+                side_effect=lambda args, prompt, env: {"profile": args.execution_profile},
+            ),
+            unittest.mock.patch.object(self._mod, "_run_cli", return_value=outcome),
+            unittest.mock.patch.object(
+                self._mod,
+                "_run_http",
+                side_effect=AssertionError("auto mode should skip HTTP here"),
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_git_status",
+                return_value=([], []),
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_git_patch",
+                return_value=None,
+            ),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["execution"]["engine"]["selected"], "cli")
+        warning_names = {item["name"] for item in out["execution"]["warnings"]}
+        self.assertIn("HttpEngineSkipped", warning_names)
+
+    def test_run_http_rejects_cli_only_options(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_http_flags_")
+        extra_file = artifacts_dir / "context.txt"
+        extra_file.write_text("context", encoding="utf-8")
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="run-http-flags",
+            output_mode="text",
+            engine="http",
+            extra_args=["--attach", "http://127.0.0.1:8765", "--file", str(extra_file)],
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_apply_execution_profile",
+                side_effect=lambda args, prompt, env: {"profile": args.execution_profile},
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_git_status",
+                return_value=([], []),
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_git_patch",
+                return_value=None,
+            ),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(rc, 3)
+        self.assertEqual(out["outcome"], "failed")
+        self.assertEqual(
+            out["execution"]["error"]["name"],
+            "UnsupportedHttpOptions",
+        )
+
+    def test_run_auto_falls_back_from_http_to_cli(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_auto_fallback_")
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="run-auto-fallback",
+            output_mode="text",
+            engine="auto",
+            extra_args=["--attach", "http://127.0.0.1:8765"],
+        )
+        http_outcome = self._mod.RunOutcome(
+            ok=False,
+            exit_code=1,
+            timed_out=False,
+            engine="http",
+            fallback_from=None,
+            session_id="ses_http",
+            full_text="",
+            metrics=None,
+            error={"name": "HttpError", "message": "server rejected request"},
+        )
+        cli_outcome = self._mod.RunOutcome(
+            ok=True,
+            exit_code=0,
+            timed_out=False,
+            engine="cli",
+            fallback_from=None,
+            session_id="ses_cli",
+            full_text="text response",
+            metrics=None,
+            error=None,
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_resolve_executable_for_workdir",
+                return_value="__dummy_opencode__",
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_apply_execution_profile",
+                side_effect=lambda args, prompt, env: {"profile": args.execution_profile},
+            ),
+            unittest.mock.patch.object(self._mod, "_run_http", return_value=http_outcome),
+            unittest.mock.patch.object(self._mod, "_run_cli", return_value=cli_outcome),
+            unittest.mock.patch.object(self._mod, "_git_status", return_value=([], [])),
+            unittest.mock.patch.object(self._mod, "_git_patch", return_value=None),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["execution"]["engine"]["selected"], "cli")
+        self.assertEqual(out["execution"]["engine"]["fallbackFrom"], "http")
+        warning_names = {item["name"] for item in out["execution"]["warnings"]}
+        self.assertIn("EngineFallback", warning_names)
+
+    def test_run_cli_stderr_only_output_hits_artifact_cap(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_cli_cap_stderr_")
+        fake_opencode = self._make_fake_opencode(
+            "import sys, time\n"
+            "chunk = 'x' * 2048\n"
+            "while True:\n"
+            "    sys.stderr.write(chunk)\n"
+            "    sys.stderr.flush()\n"
+            "    time.sleep(0.01)\n"
+        )
+        prompt_path = artifacts_dir / "prompt.txt"
+        prompt_path.write_text("prompt", encoding="utf-8")
+        outcome = self._mod._run_cli(
+            opencode_bin=str(fake_opencode),
+            workdir=artifacts_dir,
+            env=os.environ.copy(),
+            attach_url=None,
+            prompt_path=prompt_path,
+            continue_last=False,
+            session_id=None,
+            title=None,
+            agent=None,
+            model=None,
+            variant=None,
+            files=[],
+            timeout_s=10.0,
+            quiet=True,
+            save_events=True,
+            save_text=True,
+            max_artifact_bytes=4096,
+            events_path=artifacts_dir / "events.ndjson",
+            stderr_path=artifacts_dir / "stderr.log",
+            assistant_path=artifacts_dir / "assistant.txt",
+            on_session_id=None,
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error["name"], "OutputTooLarge")
+        self.assertIn("stderr.log", outcome.error["message"])
+
+    def test_run_cli_event_output_hits_artifact_cap(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_cli_cap_events_")
+        fake_opencode = self._make_fake_opencode(
+            "import json, sys, time\n"
+            "evt = {'type': 'message', 'text': 'y' * 2048}\n"
+            "while True:\n"
+            "    sys.stdout.write(json.dumps(evt) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "    time.sleep(0.01)\n"
+        )
+        prompt_path = artifacts_dir / "prompt.txt"
+        prompt_path.write_text("prompt", encoding="utf-8")
+        outcome = self._mod._run_cli(
+            opencode_bin=str(fake_opencode),
+            workdir=artifacts_dir,
+            env=os.environ.copy(),
+            attach_url=None,
+            prompt_path=prompt_path,
+            continue_last=False,
+            session_id=None,
+            title=None,
+            agent=None,
+            model=None,
+            variant=None,
+            files=[],
+            timeout_s=10.0,
+            quiet=True,
+            save_events=True,
+            save_text=True,
+            max_artifact_bytes=4096,
+            events_path=artifacts_dir / "events.ndjson",
+            stderr_path=artifacts_dir / "stderr.log",
+            assistant_path=artifacts_dir / "assistant.txt",
+            on_session_id=None,
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error["name"], "OutputTooLarge")
+        self.assertIn("events.ndjson", outcome.error["message"])
+
+    def test_run_http_event_output_hits_artifact_cap(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_http_cap_events_")
+        stop_evt = threading.Event()
+
+        class _FakeSseResponse:
+            def __init__(self) -> None:
+                self._pending: list[bytes] = []
+
+            def readline(self) -> bytes:
+                if stop_evt.is_set():
+                    return b""
+                if not self._pending:
+                    evt = {
+                        "type": "message",
+                        "sessionID": "ses_http",
+                        "text": "z" * 2048,
+                    }
+                    self._pending = [
+                        f"data: {json.dumps(evt)}\n".encode("utf-8"),
+                        b"\n",
+                    ]
+                    time.sleep(0.01)
+                return self._pending.pop(0)
+
+            def close(self) -> None:
+                stop_evt.set()
+
+        class _FakeHttpClient:
+            def __init__(self, server_url, auth=None, timeout_s=10.0) -> None:
+                self._aborted = stop_evt
+
+            def health(self) -> dict:
+                return {"healthy": True}
+
+            def create_session(self) -> dict:
+                return {"id": "ses_http"}
+
+            def open_sse(self, path, timeout_s=2.0):
+                return _FakeSseResponse()
+
+            def abort(self, session_id: str) -> None:
+                self._aborted.set()
+
+            def reply_permission(self, session_id: str, permission_id: str, response: str, remember: bool) -> None:
+                return None
+
+            def send_message_sync(self, session_id: str, prompt: str, model, variant, agent, timeout_s: float) -> dict:
+                deadline = time.time() + 5.0
+                while not self._aborted.is_set() and time.time() < deadline:
+                    time.sleep(0.01)
+                if self._aborted.is_set():
+                    raise RuntimeError("aborted for size")
+                return {"parts": [{"type": "text", "text": "done"}]}
+
+        with unittest.mock.patch.object(self._mod, "OpencodeHttpClient", _FakeHttpClient):
+            outcome = self._mod._run_http(
+                server_url="http://127.0.0.1:8765",
+                workdir=artifacts_dir,
+                env=os.environ.copy(),
+                prompt="Act as a senior software engineer.",
+                agent=None,
+                model=None,
+                variant=None,
+                timeout_s=10.0,
+                save_events=True,
+                save_text=False,
+                max_artifact_bytes=1024,
+                events_path=artifacts_dir / "events.ndjson",
+                stderr_path=artifacts_dir / "stderr.log",
+                assistant_path=None,
+                permission_mode="inherit",
+                on_session_id=None,
+            )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error["name"], "OutputTooLarge")
+        self.assertIn("events.ndjson", outcome.error["message"])
+
+    def test_run_http_preexisting_artifact_breach_aborts_created_session(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_http_cap_race_")
+        stderr_path = artifacts_dir / "stderr.log"
+        stderr_path.write_text("x" * 2048, encoding="utf-8")
+        events_path = artifacts_dir / "events.ndjson"
+        assistant_path = artifacts_dir / "assistant.txt"
+        state: dict[str, object] = {
+            "abort_calls": [],
+            "send_called": False,
+            "open_sse_called": False,
+        }
+
+        class _FakeHttpClient:
+            def __init__(self, server_url, auth=None, timeout_s=10.0) -> None:
+                return None
+
+            def health(self) -> dict:
+                return {"healthy": True}
+
+            def create_session(self) -> dict:
+                time.sleep(0.25)
+                return {"id": "ses_race"}
+
+            def open_sse(self, path, timeout_s=2.0):
+                state["open_sse_called"] = True
+                raise AssertionError("open_sse should not run after preexisting breach")
+
+            def abort(self, session_id: str) -> None:
+                cast(list[str], state["abort_calls"]).append(session_id)
+
+            def reply_permission(
+                self, session_id: str, permission_id: str, response: str, remember: bool
+            ) -> None:
+                return None
+
+            def send_message_sync(
+                self, session_id: str, prompt: str, model, variant, agent, timeout_s: float
+            ) -> dict:
+                state["send_called"] = True
+                raise AssertionError(
+                    "send_message_sync should not run after preexisting breach"
+                )
+
+        with unittest.mock.patch.object(self._mod, "OpencodeHttpClient", _FakeHttpClient):
+            outcome = self._mod._run_http(
+                server_url="http://127.0.0.1:8765",
+                workdir=artifacts_dir,
+                env=os.environ.copy(),
+                prompt="Act as a senior software engineer.",
+                agent=None,
+                model=None,
+                variant=None,
+                timeout_s=10.0,
+                save_events=True,
+                save_text=True,
+                max_artifact_bytes=1024,
                 events_path=events_path,
                 stderr_path=stderr_path,
                 assistant_path=assistant_path,
-                wrapper_log_path=wrapper_log_path,
-                result_path=result_path,
-                patch_path=None,
+                permission_mode="inherit",
+                on_session_id=None,
             )
-            # Non-existent optional files should be null
-            self.assertIsNone(arts["eventsPath"])
-            self.assertIsNone(arts["stderrPath"])
-            self.assertIsNone(arts["assistantPath"])
-            self.assertIsNone(arts["wrapperLogPath"])
-            self.assertIsNone(arts["resultPath"])
-            # Mandatory files should still have names
-            self.assertEqual(arts["jobPath"], "job.json")
-            self.assertEqual(arts["finishPath"], "finish.json")
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.session_id, "ses_race")
+        self.assertEqual(outcome.error["name"], "OutputTooLarge")
+        self.assertIn("stderr.log", outcome.error["message"])
+        self.assertEqual(state["abort_calls"], ["ses_race"])
+        self.assertFalse(cast(bool, state["open_sse_called"]))
+        self.assertFalse(cast(bool, state["send_called"]))
 
-    def test_artifacts_obj_existing_files_have_names(self):
-        """P2: _artifacts_obj returns file names for paths that DO exist."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            job_path = d / "job.json"
-            finish_path = d / "finish.json"
-            prompt_path = d / "prompt.md"
-            events_path = d / "events.ndjson"
-            stderr_path = d / "stderr.log"
-            # Create all files
-            for p in (job_path, finish_path, prompt_path, events_path, stderr_path):
-                p.write_text("{}")
+    def test_run_reports_finish_write_failed_as_json_error(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_finish_write_failed_")
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="finish-write-failed",
+            output_mode="machine",
+            nonce="nonce-finish-write",
+        )
+        outcome = self._mod.RunOutcome(
+            ok=True,
+            exit_code=0,
+            timed_out=False,
+            engine="cli",
+            fallback_from=None,
+            session_id="ses_finish_write",
+            full_text=self._build_payload_text(
+                nonce="nonce-finish-write",
+                decision="GO_NO_DELTA",
+            ),
+            metrics=None,
+            error=None,
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_resolve_executable_for_workdir",
+                return_value="__dummy_opencode__",
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_apply_execution_profile",
+                side_effect=lambda args, prompt, env: {"profile": args.execution_profile},
+            ),
+            unittest.mock.patch.object(self._mod, "_run_cli", return_value=outcome),
+            unittest.mock.patch.object(self._mod, "_git_status", return_value=([], [])),
+            unittest.mock.patch.object(self._mod, "_git_patch", return_value=None),
+            unittest.mock.patch.object(
+                self._mod,
+                "_write_finish_once",
+                return_value=(False, "io-error", None),
+            ),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        self.assertEqual(rc, 1)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["type"], "opencode-subtask-error")
+        self.assertEqual(out["error"]["name"], "FinishWriteFailed")
 
-            arts = mod._artifacts_obj(
-                dir_path=d,
-                job_path=job_path,
-                finish_path=finish_path,
-                prompt_path=prompt_path,
-                events_path=events_path,
-                stderr_path=stderr_path,
-                assistant_path=None,
-                wrapper_log_path=None,
-                result_path=None,
-                patch_path=None,
-            )
-            self.assertEqual(arts["eventsPath"], "events.ndjson")
-            self.assertEqual(arts["stderrPath"], "stderr.log")
-            # None paths stay None
-            self.assertIsNone(arts["assistantPath"])
-            self.assertIsNone(arts["wrapperLogPath"])
-            self.assertIsNone(arts["resultPath"])
-
-    def test_cancel_idempotent_when_finish_exists(self):
-        """P1: cmd_cancel returns early with alreadyFinished=true when
-        finish.json already contains a valid terminal state."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-        with tempfile.TemporaryDirectory() as td:
-            artifacts_dir = Path(td)
-            # Write a valid finish.json (successful completion)
-            finish = {
-                "ok": True,
+    def test_judge_execution_only_accepts_completed(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_exec_")
+        finish = {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 2,
+            "adapterVersion": "0.6.0",
+            "timestamp": 1,
+            "runId": "judge-exec",
+            "workdir": str(REPO_ROOT),
+            "outputMode": "machine",
+            "outcome": "completed",
+            "execution": {
                 "exitCode": 0,
-                "runId": "already-done",
-                "summary": "completed successfully",
-            }
-            (artifacts_dir / "finish.json").write_text(
-                json.dumps(finish), encoding="utf-8"
-            )
-            # Write a job.json with a PID that doesn't exist
-            job = {
-                "runId": "already-done",
-                "workdir": str(repo_root),
-                "state": "finished",
-                "createdAt": int(time.time() * 1000),
-                "updatedAt": int(time.time() * 1000),
-                "pid": 0,
-            }
-            (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
-            out = json.loads(result.stdout.strip())
-            self.assertTrue(out.get("ok"))
-            self._assert_adapter_version(out)
-            self.assertTrue(out.get("alreadyFinished"))
-            self.assertEqual(out["existingFinish"]["runId"], "already-done")
-            # job.json state should NOT have been changed to 'canceled'
-            job_after = json.loads(
-                (artifacts_dir / "job.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(job_after.get("state"), "finished")
-
-    def test_cancel_telemetry_no_state_overwrite_when_finish_exists(self):
-        """P1b: When _write_finish_once returns 'exists' during cancel,
-        telemetry must NOT overwrite job.state to 'canceled'."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-        with tempfile.TemporaryDirectory() as td:
-            artifacts_dir = Path(td)
-            finish_path = artifacts_dir / "finish.json"
-            job_path = artifacts_dir / "job.json"
-
-            # Pre-existing successful finish
-            finish = {"ok": True, "exitCode": 0, "runId": "success-run"}
-            finish_path.write_text(json.dumps(finish), encoding="utf-8")
-
-            # Job in 'finished' state
-            job = {
-                "runId": "success-run",
-                "workdir": str(repo_root),
-                "state": "finished",
-                "createdAt": int(time.time() * 1000),
-                "updatedAt": int(time.time() * 1000),
-                "pid": 0,
-            }
-            job_path.write_text(json.dumps(job), encoding="utf-8")
-
-            # Try to write a cancel finish — should return 'exists'
-            cancel_finish = {
-                "ok": False,
-                "exitCode": 130,
-                "runId": "success-run",
-                "engine": "cancel",
-            }
-            written, reason, existing = mod._write_finish_once(
-                artifacts_dir=artifacts_dir,
-                finish_path=finish_path,
-                finish_obj=cancel_finish,
-            )
-            self.assertFalse(written)
-            self.assertEqual(reason, "exists")
-            self.assertIsInstance(existing, dict)
-            self.assertTrue(existing["ok"])  # original success preserved
-
-    def test_emit_synthesized_finish_guards_job_state_on_write_failure(self):
-        """P0: _emit_synthesized_missing_finish must NOT set job state='failed'
-        when _write_finish_once itself fails (write_failed reason)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-        with tempfile.TemporaryDirectory() as td:
-            artifacts_dir = Path(td)
-            job_path = artifacts_dir / "job.json"
-            finish_path = artifacts_dir / "finish.json"
-
-            # Job in 'running' state
-            job = {
-                "runId": "synth-test",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": int(time.time() * 1000),
-                "updatedAt": int(time.time() * 1000),
-                "pid": 0,
-            }
-            job_path.write_text(json.dumps(job), encoding="utf-8")
-
-            # Patch _write_json to fail ONLY for finish.json
-            original_write_json = mod._write_json
-
-            def _selective_failing_write_json(path, obj):
-                if Path(path).name == "finish.json":
-                    raise OSError("disk full")
-                return original_write_json(path, obj)
-
-            with unittest.mock.patch.object(
-                mod, "_write_json", _selective_failing_write_json
-            ):
-                out = mod._emit_synthesized_missing_finish(
-                    artifacts_dir=artifacts_dir,
-                    job_path=job_path,
-                    finish_path=finish_path,
-                    job=job,
-                    run_id="synth-test",
-                    error_name="ProcessVanished",
-                    error_message="test vanish",
-                )
-
-            # Output should still be the synthesized failure
-            self.assertFalse(out.get("ok"))
-            # Job state should NOT have been set to 'failed' —
-            # instead lastError should record the write failure
-            job_after = json.loads(job_path.read_text(encoding="utf-8"))
-            self.assertNotEqual(
-                job_after.get("state"),
-                "failed",
-                "job.state must not transition to 'failed' when finish.json "
-                "write itself failed",
-            )
-            self.assertIn("FinishWriteFailed", str(job_after.get("lastError", {})))
-
-    def test_cancel_idempotency_rejects_empty_finish(self):
-        """Codex P1a: cancel idempotency guard must NOT trigger for an empty
-        finish.json ({}) — only for a structurally complete finish with 'ok'."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-        with tempfile.TemporaryDirectory() as td:
-            artifacts_dir = Path(td)
-            # Write an EMPTY finish.json (structurally incomplete)
-            (artifacts_dir / "finish.json").write_text(json.dumps({}), encoding="utf-8")
-            # Write a job.json with pid=0
-            job = {
-                "runId": "empty-finish-test",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": int(time.time() * 1000),
-                "updatedAt": int(time.time() * 1000),
-                "pid": 0,
-            }
-            (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            out = json.loads(result.stdout.strip())
-            # Should NOT have alreadyFinished — the empty finish is not valid
-            self._assert_adapter_version(out)
-            self.assertFalse(
-                out.get("alreadyFinished", False),
-                "cancel must not treat an empty {} finish.json as a valid "
-                "terminal state",
-            )
-
-    def test_cancel_idempotency_accepts_complete_finish(self):
-        """Codex P1a: cancel idempotency guard triggers for finish.json
-        that contains the 'ok' key (structurally complete)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-        with tempfile.TemporaryDirectory() as td:
-            artifacts_dir = Path(td)
-            # Write a COMPLETE finish.json
-            finish = {"ok": False, "exitCode": 1, "runId": "complete-test"}
-            (artifacts_dir / "finish.json").write_text(
-                json.dumps(finish), encoding="utf-8"
-            )
-            job = {
-                "runId": "complete-test",
-                "workdir": str(repo_root),
-                "state": "failed",
-                "createdAt": int(time.time() * 1000),
-                "updatedAt": int(time.time() * 1000),
-                "pid": 0,
-            }
-            (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(result.returncode, 0)
-            out = json.loads(result.stdout.strip())
-            self._assert_adapter_version(out)
-            self.assertTrue(out.get("alreadyFinished"))
-            self.assertTrue(out.get("ok"))
-            # Job state must remain unchanged
-            job_after = json.loads(
-                (artifacts_dir / "job.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(job_after.get("state"), "failed")
-
-    # ── PR #12 regression tests ────────────────────────────────────────
-
-    def test_run_cli_posix_sets_start_new_session(self):
-        """Fix B: _run_cli must set start_new_session=True on POSIX so
-        _kill_tree's os.killpg targets only the subtask process group."""
-        if os.name == "nt":
-            self.skipTest("POSIX-only test")
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-        captured_kwargs: dict = {}
-
-        def _capture_popen(*a, **kw):
-            captured_kwargs.update(kw)
-            raise OSError("intentional — just capturing kwargs")
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_run_cli_posix_") as td:
-            td_path = Path(td)
-            workdir = td_path
-            prompt_path = td_path / "prompt.txt"
-            prompt_path.write_text(
-                "Act as a senior software engineer.\n", encoding="utf-8"
-            )
-            stderr_path = td_path / "stderr.log"
-
-            with unittest.mock.patch.object(mod.subprocess, "Popen", _capture_popen):
-                try:
-                    mod._run_cli(
-                        opencode_bin="__dummy_opencode__",
-                        workdir=workdir,
-                        env=dict(os.environ),
-                        attach_url=None,
-                        prompt_path=prompt_path,
-                        continue_last=False,
-                        session_id=None,
-                        title=None,
-                        agent=None,
-                        model=None,
-                        variant=None,
-                        files=[],
-                        timeout_s=1.0,
-                        quiet=True,
-                        save_events=False,
-                        save_text=False,
-                        max_artifact_bytes=0,
-                        events_path=None,
-                        stderr_path=stderr_path,
-                        assistant_path=None,
-                        on_session_id=None,
-                    )
-                except Exception:
-                    pass  # expected
-
-        self.assertTrue(
-            captured_kwargs.get("start_new_session"),
-            "_run_cli must set start_new_session=True on POSIX",
+                "durationMs": 1,
+                "engine": {"selected": "cli", "fallbackFrom": None},
+                "sessionId": None,
+                "error": None,
+                "warnings": [],
+            },
+            "payload": {
+                "status": "missing",
+                "schema": None,
+                "artifact": {"path": None, "digest": None},
+                "errors": [],
+            },
+            "decision": {"status": "unavailable", "route": None},
+            "workspace": {"changedFiles": [], "untrackedFiles": [], "patchPath": None},
+            "artifacts": {
+                "dir": str(artifacts_dir),
+                "jobPath": "job.json",
+                "finishPath": "finish.json",
+                "promptPath": None,
+                "stderrPath": None,
+                "assistantPath": None,
+                "eventsPath": None,
+                "wrapperLogPath": None,
+                "payloadPath": None,
+                "diagnosticsPath": None,
+            },
+        }
+        finish_path = artifacts_dir / "finish.json"
+        finish_path.write_text(json.dumps(finish), encoding="utf-8")
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "execution-only",
         )
-
-    def test_cmd_start_execution_profile_uses_run_timeout_for_short_class(self):
-        """Fix A: cmd_start should apply execution profile using the effective
-        worker runtime timeout (run_timeout_s), not the legacy args.timeout."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        p = argparse.ArgumentParser(prog="start-test")
-        mod._add_common_run_flags(p)
-        p.add_argument("prompt", nargs=argparse.REMAINDER)
-
-        captured_cmd: list[str] | None = None
-
-        def _fake_popen(cmd, *a, **kw):
-            nonlocal captured_cmd
-            captured_cmd = list(cmd)
-            # Close wrapper log so TemporaryDirectory cleanup works on Windows.
-            out = kw.get("stdout")
-            err = kw.get("stderr")
-            try:
-                if out is not None and hasattr(out, "close"):
-                    out.close()
-            except Exception:
-                pass
-            try:
-                if err is not None and err is not out and hasattr(err, "close"):
-                    err.close()
-            except Exception:
-                pass
-
-            class _Proc:
-                pid = 12345
-
-            return _Proc()
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_cmd_start_profile_"
-        ) as td:
-            artifacts_dir = Path(td) / "artifacts"
-            args = p.parse_args(
-                [
-                    "--workdir",
-                    str(repo_root),
-                    "--engine",
-                    "auto",
-                    "--execution-profile",
-                    "hybrid",
-                    "--run-id",
-                    "profile-short-test",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                    "--opencode",
-                    "__dummy_opencode__",
-                    "--prompt",
-                    "Act as a senior software engineer.",
-                    "--run-timeout",
-                    "30",
-                    # If cmd_start incorrectly uses legacy args.timeout(600),
-                    # this threshold would classify the job as long.
-                    "--hybrid-short-timeout-s",
-                    "100",
-                ]
-            )
-
-            with unittest.mock.patch.object(mod.subprocess, "Popen", _fake_popen):
-                rc = mod.cmd_start(args)
-
-        self.assertEqual(rc, 0)
-        self.assertIsNotNone(captured_cmd)
-        assert captured_cmd is not None
-        engine = captured_cmd[captured_cmd.index("--engine") + 1]
-        self.assertEqual(engine, "http")
-        self.assertIn("--no-save-events", captured_cmd)
-        self.assertIn("--no-save-text", captured_cmd)
-
-    def test_cmd_start_execution_profile_merges_env_thresholds(self):
-        """Fix A: cmd_start should merge --env/--env-file into the env passed to
-        _apply_execution_profile so hybrid thresholds are honored."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        p = argparse.ArgumentParser(prog="start-test-env")
-        mod._add_common_run_flags(p)
-        p.add_argument("prompt", nargs=argparse.REMAINDER)
-
-        captured_cmd: list[str] | None = None
-
-        def _fake_popen(cmd, *a, **kw):
-            nonlocal captured_cmd
-            captured_cmd = list(cmd)
-            out = kw.get("stdout")
-            err = kw.get("stderr")
-            try:
-                if out is not None and hasattr(out, "close"):
-                    out.close()
-            except Exception:
-                pass
-            try:
-                if err is not None and err is not out and hasattr(err, "close"):
-                    err.close()
-            except Exception:
-                pass
-
-            class _Proc:
-                pid = 23456
-
-            return _Proc()
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_cmd_start_env_") as td:
-            artifacts_dir = Path(td) / "artifacts"
-            args = p.parse_args(
-                [
-                    "--workdir",
-                    str(repo_root),
-                    "--engine",
-                    "auto",
-                    "--execution-profile",
-                    "hybrid",
-                    "--run-id",
-                    "profile-env-test",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                    "--opencode",
-                    "__dummy_opencode__",
-                    "--prompt",
-                    "Act as a senior software engineer.",
-                    "--run-timeout",
-                    "30",
-                    # If --env is merged, threshold=10 => classify as long (CLI + full artifacts)
-                    "--env",
-                    "OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S=10",
-                ]
-            )
-
-            with unittest.mock.patch.object(mod.subprocess, "Popen", _fake_popen):
-                rc = mod.cmd_start(args)
-
-        self.assertEqual(rc, 0)
-        self.assertIsNotNone(captured_cmd)
-        assert captured_cmd is not None
-        engine = captured_cmd[captured_cmd.index("--engine") + 1]
-        self.assertEqual(engine, "cli")
-        self.assertIn("--save-events", captured_cmd)
-        self.assertIn("--save-text", captured_cmd)
-
-    # ── PR #17 regression tests (review10) ─────────────────────────────
-
-    def test_status_returns_0_for_failed_task(self) -> None:
-        """Exit code semantics: status observing a failed task should return 0
-        (observation succeeded), not 1.  Task outcome lives in stdout JSON."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_exitcode_") as td:
-            artifacts_dir = Path(td)
-            finish = {
-                "type": "opencode-subtask-finish",
-                "ok": False,
-                "exitCode": 1,
-                "runId": "exitcode-test",
-                "error": {"name": "Timeout", "message": "timed out"},
-            }
-            (artifacts_dir / "finish.json").write_text(
-                json.dumps(finish), encoding="utf-8"
-            )
-
-            p = argparse.ArgumentParser()
-            p.add_argument("--run-id", default="exitcode-test")
-            p.add_argument("--artifacts-dir", default=str(artifacts_dir))
-            p.add_argument("--timeout", default="600")
-            args = p.parse_args([])
-
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                rc = mod.cmd_status(args)
-
-            self.assertEqual(rc, 0, "status should return 0 when observation succeeds")
-            out = json.loads(buf.getvalue().strip())
-            self.assertFalse(out["ok"], "stdout JSON should still report ok=false")
-
-    def test_wait_returns_0_for_failed_task(self) -> None:
-        """Exit code semantics: wait observing a failed task should return 0."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_wait_exitcode_") as td:
-            artifacts_dir = Path(td)
-            finish = {
-                "type": "opencode-subtask-finish",
-                "ok": False,
-                "exitCode": 1,
-                "runId": "wait-exitcode-test",
-                "error": {"name": "EmptyModelOutput", "message": "empty"},
-            }
-            (artifacts_dir / "finish.json").write_text(
-                json.dumps(finish), encoding="utf-8"
-            )
-            (artifacts_dir / "job.json").write_text(
-                json.dumps({"runId": "wait-exitcode-test", "pid": 99999}),
-                encoding="utf-8",
-            )
-
-            p = argparse.ArgumentParser()
-            p.add_argument("--run-id", default="wait-exitcode-test")
-            p.add_argument("--artifacts-dir", default=str(artifacts_dir))
-            p.add_argument("--timeout", default="600")
-            p.add_argument("--wait-timeout", default="5")
-            p.add_argument("--poll-interval", default="0.1")
-            args = p.parse_args([])
-
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                rc = mod.cmd_wait(args)
-
-            self.assertEqual(rc, 0, "wait should return 0 when observation succeeds")
-            out = json.loads(buf.getvalue().strip())
-            self.assertFalse(out["ok"])
-
-    def test_status_worker_missing_uses_warnings_not_error(self) -> None:
-        """Contract fix: WorkerMissingPending must appear in 'warnings' (list),
-        NOT in 'error'.  ok=true, error=null, exit code 0."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_warning_contract_"
-        ) as td:
-            artifacts_dir = Path(td)
-            now_ms = int(time.time() * 1000)
-            job = {
-                "runId": "warning-contract-test",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": now_ms,
-                "updatedAt": now_ms,
-                "pid": 2147483647,  # extremely unlikely to exist
-            }
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(job, indent=2), encoding="utf-8"
-            )
-            # No finish.json — forces the WorkerMissingPending path
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "status",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            out = json.loads(proc.stdout)
-            # Contract: ok=true, error=null
-            self.assertTrue(out.get("ok"), "ok must be true for non-fatal warning")
-            self.assertIsNone(
-                out.get("error"),
-                "error must be null when ok=true (contract invariant)",
-            )
-            # Warning channel carries the signal
-            warnings = out.get("warnings")
-            self.assertIsInstance(warnings, list, "warnings must be a list")
-            self.assertEqual(len(warnings), 1)
-            self.assertEqual(warnings[0]["name"], "WorkerMissingPending")
-            self.assertIn("stale-window", warnings[0]["message"])
-
-    def test_status_no_warnings_when_worker_alive(self) -> None:
-        """When the worker PID is alive, warnings must be null (not [])."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_no_warning_") as td:
-            artifacts_dir = Path(td)
-            now_ms = int(time.time() * 1000)
-            job = {
-                "runId": "no-warning-test",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": now_ms,
-                "updatedAt": now_ms,
-                "pid": os.getpid(),  # current process — alive
-            }
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(job, indent=2), encoding="utf-8"
-            )
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "status",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            out = json.loads(proc.stdout)
-            self.assertTrue(out.get("ok"))
-            self.assertIsNone(out.get("error"))
-            self.assertEqual(
-                out.get("warnings"),
-                [],
-                "warnings must be [] when no warnings are present",
-            )
-
-    def test_status_obj_signature_includes_warnings(self) -> None:
-        """_status_obj must accept 'warnings' kwarg and include it in output."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(
-            prefix="ocsubtask_test_status_obj_warnings_"
-        ) as td:
-            artifacts_dir = Path(td)
-            # With warnings
-            obj = mod._status_obj(
-                ok=True,
-                run_id="sig-test",
-                status="running",
-                pid=None,
-                workdir=None,
-                artifacts_dir=artifacts_dir,
-                artifacts={},
-                warnings=[{"name": "TestWarn", "message": "hello"}],
-            )
-            self.assertIn("warnings", obj)
-            self.assertEqual(len(obj["warnings"]), 1)
-            self.assertEqual(obj["warnings"][0]["name"], "TestWarn")
-            self.assertIsNone(obj.get("error"))
-            self.assertTrue(obj["ok"])
-
-            # Without warnings (default)
-            obj2 = mod._status_obj(
-                ok=True,
-                run_id="sig-test-2",
-                status="running",
-                pid=None,
-                workdir=None,
-                artifacts_dir=artifacts_dir,
-                artifacts={},
-            )
-            self.assertIn("warnings", obj2)
-            self.assertEqual(obj2["warnings"], [])
-
-    def test_run_id_path_traversal_rejected(self) -> None:
-        """run_id with path traversal components must be rejected."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        bad_ids = [
-            "../escape",
-            "..\\escape",
-            "foo/../bar",
-            "foo/bar",
-            "foo\\bar",
-            "hello world",  # space
-            "run_123;rm -rf /",  # semicolon
-            ".",  # resolves to runs root – review17 finding A
-            "..",  # parent traversal alias
-        ]
-        for bad_id in bad_ids:
-            with self.assertRaises(ValueError, msg=f"should reject run_id={bad_id!r}"):
-                mod._validate_run_id_for_path(bad_id)
-
-    def test_safe_resolve_artifacts_dir_emits_bad_run_id(self) -> None:
-        """_safe_resolve_artifacts_dir must exit with BadRunId (exit 2)."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            with self.assertRaises(SystemExit) as cm:
-                mod._safe_resolve_artifacts_dir("../escape", None)
-        self.assertEqual(cm.exception.code, 2)
-        out = json.loads(buf.getvalue())
-        self.assertFalse(out["ok"])
-        self._assert_adapter_version(out)
-        self.assertEqual(out["error"]["name"], "BadRunId")
-
-    def test_safe_merge_env_emits_bad_args(self) -> None:
-        """_safe_merge_env must exit with BadArgs (exit 2) for malformed env."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            with self.assertRaises(SystemExit) as cm:
-                mod._safe_merge_env({}, ["NO_EQUALS_SIGN"], [])
-        self.assertEqual(cm.exception.code, 2)
-        out = json.loads(buf.getvalue())
-        self.assertFalse(out["ok"])
-        self._assert_adapter_version(out)
-        self.assertEqual(out["error"]["name"], "BadArgs")
-
-    def test_safe_merge_env_oserror_emits_bad_args(self) -> None:
-        """_safe_merge_env must exit with BadArgs (exit 2) for missing env-file."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            with self.assertRaises(SystemExit) as cm:
-                mod._safe_merge_env({}, [], ["MY_VAR=/nonexistent/path/to/file.txt"])
-        self.assertEqual(cm.exception.code, 2)
-        out = json.loads(buf.getvalue())
-        self.assertFalse(out["ok"])
-        self.assertEqual(out["error"]["name"], "BadArgs")
-
-    def test_run_id_valid_patterns_accepted(self) -> None:
-        """Normal run_id patterns must be accepted."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        good_ids = [
-            "run_1234567890_12345",
-            "my-custom-run.v2",
-            "test_run_001",
-            "a",
-        ]
-        for good_id in good_ids:
-            # Should not raise
-            mod._validate_run_id_for_path(good_id)
-
-    # ── PR #19 regression tests (review12) ─────────────────────────────
-
-    def test_resolve_artifacts_dir_containment(self) -> None:
-        """_resolve_artifacts_dir must reject run_id that resolves outside
-        _runs_dir even if the regex whitelist somehow passes."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        # Normal valid run_id should work fine
-        rid, ad = mod._resolve_artifacts_dir("test_run_001", None)
-        self.assertEqual(rid, "test_run_001")
-        self.assertTrue(str(ad).endswith("test_run_001"))
-
-        # Explicit --artifacts-dir bypasses containment (by design)
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_ad_") as td:
-            rid2, ad2 = mod._resolve_artifacts_dir("anything", td)
-            self.assertEqual(str(ad2), str(Path(td).resolve()))
-
-    def test_scan_running_job_skips_finished_jobs(self) -> None:
-        """_scan_running_job_server_urls must skip jobs with ANY readable
-        finish.json, not just canceled ones.  A finished (ok=true or ok=false)
-        job should never contribute crashed-owner evidence."""
-        repo_root = Path(__file__).resolve().parents[1]
-        mod = self._load_adapter_module(repo_root)
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_test_reaper_") as td:
-            runs_dir = Path(td)
-
-            # Job 1: running, no finish → should contribute active/crashed
-            run1 = runs_dir / "run_active"
-            run1.mkdir()
-            (run1 / "job.json").write_text(
-                json.dumps(
-                    {
-                        "runId": "run_active",
-                        "state": "running",
-                        "pid": 99999999,  # non-existent PID
-                        "serverUrl": "http://localhost:11111",
-                        "serverStartedNew": True,
-                        "workdir": str(repo_root),
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            # Job 2: running state in job.json BUT has finish.json (ok=true)
-            run2 = runs_dir / "run_finished_ok"
-            run2.mkdir()
-            (run2 / "job.json").write_text(
-                json.dumps(
-                    {
-                        "runId": "run_finished_ok",
-                        "state": "running",
-                        "pid": 99999998,
-                        "serverUrl": "http://localhost:22222",
-                        "serverStartedNew": True,
-                        "workdir": str(repo_root),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (run2 / "finish.json").write_text(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "type": "opencode-subtask-finish",
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            # Job 3: running state BUT has finish.json (ok=false, non-cancel)
-            run3 = runs_dir / "run_finished_fail"
-            run3.mkdir()
-            (run3 / "job.json").write_text(
-                json.dumps(
-                    {
-                        "runId": "run_finished_fail",
-                        "state": "running",
-                        "pid": 99999997,
-                        "serverUrl": "http://localhost:33333",
-                        "serverStartedNew": True,
-                        "workdir": str(repo_root),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (run3 / "finish.json").write_text(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "type": "opencode-subtask-finish",
-                        "error": {"name": "Timeout", "message": "timed out"},
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            # Patch _runs_dir to use our temp directory
-            original_runs_dir = mod._runs_dir
-            mod._runs_dir = lambda: runs_dir
-            try:
-                _active, crashed = mod._scan_running_job_server_urls(
-                    current_project_key=mod._project_key(repo_root),
-                )
-            finally:
-                mod._runs_dir = original_runs_dir
-
-            # Job 1 (no finish) → crashed-owner (PID doesn't exist)
-            self.assertIn(
-                "http://localhost:11111",
-                crashed,
-                "job without finish.json should be in crashed_owner_urls",
-            )
-            # Job 2 (finish ok=true) → skipped entirely
-            self.assertNotIn(
-                "http://localhost:22222",
-                crashed,
-                "finished ok=true job should NOT be in crashed_owner_urls",
-            )
-            # Job 3 (finish ok=false) → skipped entirely
-            self.assertNotIn(
-                "http://localhost:33333",
-                crashed,
-                "finished ok=false job should NOT be in crashed_owner_urls",
-            )
-
-
-class TestExtractStructuredJson(unittest.TestCase):
-    """Unit tests for _extract_structured_json — the 3-strategy extraction pipeline."""
-
-    @classmethod
-    def setUpClass(cls):
-        repo = Path(__file__).resolve().parent.parent
-        module_name = "opencode_subtask_extract_test"
-        if module_name in sys.modules:
-            cls._mod = sys.modules[module_name]
-            return
-        script = repo / "scripts" / "opencode_subtask.py"
-        spec = importlib.util.spec_from_file_location(module_name, script)
-        assert spec and spec.loader
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod
-        try:
-            spec.loader.exec_module(mod)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
-        cls._mod = mod
-
-    def test_sentinel_extraction(self):
-        """Strategy 1: sentinel-wrapped JSON is extracted."""
-        func = self._mod._extract_structured_json
-        BEGIN = self._mod.SENTINEL_BEGIN
-        END = self._mod.SENTINEL_END
-        payload = '{"summary": "done", "evidence": []}'
-        text = f"Some preamble\n{BEGIN}\n{payload}\n{END}\ntrailing"
-        result = func(text)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["summary"], "done")
-
-    def test_fenced_json_extraction(self):
-        """Strategy 2: fenced ```json block is extracted."""
-        func = self._mod._extract_structured_json
-        text = (
-            'Here is output:\n```json\n{"summary": "fenced", "changes": []}\n```\nDone.'
-        )
-        result = func(text)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["summary"], "fenced")
-
-    def test_backward_scan_extraction(self):
-        """Strategy 3: bare JSON object at end of text is found by backward scan."""
-        func = self._mod._extract_structured_json
-        text = 'Some text output\n{"summary": "scanned"}'
-        result = func(text)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["summary"], "scanned")
-
-    def test_empty_and_no_json_returns_none(self):
-        """No JSON anywhere → None; empty string → None."""
-        func = self._mod._extract_structured_json
-        self.assertIsNone(func(""))
-        self.assertIsNone(func("just plain text with no braces"))
-
-
-class TestMinimalArtifactsShape(unittest.TestCase):
-    """Verify _minimal_artifacts returns the same key set as _artifacts_obj."""
-
-    @classmethod
-    def setUpClass(cls):
-        repo = Path(__file__).resolve().parent.parent
-        module_name = "opencode_subtask_extract_test"
-        if module_name in sys.modules:
-            cls._mod = sys.modules[module_name]
-            return
-        script = repo / "scripts" / "opencode_subtask.py"
-        spec = importlib.util.spec_from_file_location(module_name, script)
-        assert spec and spec.loader
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod
-        try:
-            spec.loader.exec_module(mod)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
-        cls._mod = mod
-
-    def test_key_sets_match(self):
-        """_minimal_artifacts and _artifacts_obj must produce identical key sets."""
-        tmp = Path(tempfile.mkdtemp())
-        try:
-            job_path = tmp / "job.json"
-            finish_path = tmp / "finish.json"
-            prompt_path = tmp / "prompt.txt"
-            minimal = self._mod._minimal_artifacts(
-                dir_path=tmp,
-                job_path=job_path,
-                finish_path=finish_path,
-            )
-            full = self._mod._artifacts_obj(
-                dir_path=tmp,
-                job_path=job_path,
-                finish_path=finish_path,
-                prompt_path=prompt_path,
-                events_path=None,
-                stderr_path=None,
-                assistant_path=None,
-                wrapper_log_path=None,
-                result_path=None,
-                patch_path=None,
-            )
-            self.assertEqual(set(minimal.keys()), set(full.keys()))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-
-
-class TestPollIntervalValidation(unittest.TestCase):
-    """--poll-interval <= 0 must produce BadConfig exit 2."""
-
-    def _run(self, interval_val):
-        proc = subprocess.run(
-            [
-                sys.executable,
-                SCRIPT,
-                "wait",
-                "--run-id",
-                "test_run",
-                "--poll-interval",
-                str(interval_val),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return proc
-
-    def test_zero_poll_interval_rejected(self):
-        proc = self._run(0)
-        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.returncode, 0)
         out = json.loads(proc.stdout)
-        self.assertFalse(out["ok"])
-        self.assertIn("adapterVersion", out)
-        self.assertEqual(out["error"]["name"], "BadConfig")
+        self.assertEqual(out["adapterVersion"], self._mod.ADAPTER_VERSION)
+        self.assertEqual(out["verdict"], "accept")
 
-    def test_negative_poll_interval_rejected(self):
-        proc = self._run(-5)
-        self.assertEqual(proc.returncode, 2)
+    def test_judge_require_determinate_reroutes_mandatory_delta(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_det_")
+        payload = {
+            "protocol": self._mod.PAYLOAD_PROTOCOL,
+            "nonce": "judge-det",
+            "decision": "MANDATORY_DELTA",
+            "summary": "done",
+            "evidence": ["a.py:1 - fact"],
+            "changes": ["x"],
+            "next_steps": ["y"],
+        }
+        payload_path = artifacts_dir / "payload.json"
+        payload_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        digest = self._mod._sha256_file(payload_path)
+        finish = {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 2,
+            "adapterVersion": "0.6.0",
+            "timestamp": 1,
+            "runId": "judge-det",
+            "workdir": str(REPO_ROOT),
+            "outputMode": "machine",
+            "outcome": "completed",
+            "execution": {
+                "exitCode": 0,
+                "durationMs": 1,
+                "engine": {"selected": "cli", "fallbackFrom": None},
+                "sessionId": None,
+                "error": None,
+                "warnings": [],
+            },
+            "payload": {
+                "status": "validated",
+                "schema": self._mod.PAYLOAD_PROTOCOL,
+                "artifact": {"path": "payload.json", "digest": digest},
+                "errors": [],
+            },
+            "decision": {"status": "determinate", "route": "MANDATORY_DELTA"},
+            "workspace": {"changedFiles": [], "untrackedFiles": [], "patchPath": None},
+            "artifacts": {
+                "dir": str(artifacts_dir),
+                "jobPath": "job.json",
+                "finishPath": "finish.json",
+                "promptPath": None,
+                "stderrPath": None,
+                "assistantPath": None,
+                "eventsPath": None,
+                "wrapperLogPath": None,
+                "payloadPath": "payload.json",
+                "diagnosticsPath": None,
+            },
+        }
+        finish_path = artifacts_dir / "finish.json"
+        finish_path.write_text(json.dumps(finish), encoding="utf-8")
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-determinate",
+        )
+        self.assertEqual(proc.returncode, 10)
         out = json.loads(proc.stdout)
-        self.assertFalse(out["ok"])
-        self.assertEqual(out["error"]["name"], "BadConfig")
+        self.assertEqual(out["verdict"], "reroute")
+        self.assertEqual(out["route"], "MANDATORY_DELTA")
 
+    def test_judge_require_determinate_accepts_go_no_delta(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_go_")
+        payload = {
+            "protocol": self._mod.PAYLOAD_PROTOCOL,
+            "nonce": "judge-go",
+            "decision": "GO_NO_DELTA",
+            "summary": "done",
+            "evidence": ["a.py:1 - fact"],
+            "changes": ["x"],
+            "next_steps": ["y"],
+        }
+        payload_path = artifacts_dir / "payload.json"
+        payload_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            run_id="judge-go",
+            payload_status="validated",
+            payload_schema=self._mod.PAYLOAD_PROTOCOL,
+            payload_artifact_path="payload.json",
+            payload_digest=self._mod._sha256_file(payload_path),
+            decision_status="determinate",
+            decision_route="GO_NO_DELTA",
+        )
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-determinate",
+        )
+        self.assertEqual(proc.returncode, 0)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "accept")
 
-class TestWaitJobNotFound(unittest.TestCase):
-    """cmd_wait on empty artifacts dir must return ok=false + JobNotFound."""
+    def test_judge_require_go_no_delta_retries_on_digest_mismatch(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_digest_")
+        payload_path = artifacts_dir / "payload.json"
+        payload_path.write_text("{}", encoding="utf-8")
+        finish = {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 2,
+            "adapterVersion": "0.6.0",
+            "timestamp": 1,
+            "runId": "judge-digest",
+            "workdir": str(REPO_ROOT),
+            "outputMode": "machine",
+            "outcome": "completed",
+            "execution": {
+                "exitCode": 0,
+                "durationMs": 1,
+                "engine": {"selected": "cli", "fallbackFrom": None},
+                "sessionId": None,
+                "error": None,
+                "warnings": [],
+            },
+            "payload": {
+                "status": "validated",
+                "schema": self._mod.PAYLOAD_PROTOCOL,
+                "artifact": {"path": "payload.json", "digest": "deadbeef"},
+                "errors": [],
+            },
+            "decision": {"status": "determinate", "route": "GO_NO_DELTA"},
+            "workspace": {"changedFiles": [], "untrackedFiles": [], "patchPath": None},
+            "artifacts": {
+                "dir": str(artifacts_dir),
+                "jobPath": "job.json",
+                "finishPath": "finish.json",
+                "promptPath": None,
+                "stderrPath": None,
+                "assistantPath": None,
+                "eventsPath": None,
+                "wrapperLogPath": None,
+                "payloadPath": "payload.json",
+                "diagnosticsPath": None,
+            },
+        }
+        finish_path = artifacts_dir / "finish.json"
+        finish_path.write_text(json.dumps(finish), encoding="utf-8")
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-go-no-delta",
+        )
+        self.assertEqual(proc.returncode, 11)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "retry")
+        self.assertEqual(out["reasonCode"], "PAYLOAD_DIGEST_MISMATCH")
 
-    def test_wait_empty_dir_returns_job_not_found(self):
-        tmp = Path(tempfile.mkdtemp())
-        try:
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    SCRIPT,
-                    "wait",
-                    "--artifacts-dir",
-                    str(tmp),
-                    "--timeout",
-                    "1",
-                    "--poll-interval",
-                    "0.1",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual(proc.returncode, 1)
-            out = json.loads(proc.stdout)
-            self.assertFalse(out["ok"])
-            self.assertEqual(out["error"]["name"], "JobNotFound")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+    def test_judge_require_go_no_delta_accepts_go_no_delta(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_accept_go_")
+        payload = {
+            "protocol": self._mod.PAYLOAD_PROTOCOL,
+            "nonce": "judge-accept-go",
+            "decision": "GO_NO_DELTA",
+            "summary": "done",
+            "evidence": ["a.py:1 - fact"],
+            "changes": ["x"],
+            "next_steps": ["y"],
+        }
+        payload_path = artifacts_dir / "payload.json"
+        payload_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            run_id="judge-accept-go",
+            payload_status="validated",
+            payload_schema=self._mod.PAYLOAD_PROTOCOL,
+            payload_artifact_path="payload.json",
+            payload_digest=self._mod._sha256_file(payload_path),
+            decision_status="determinate",
+            decision_route="GO_NO_DELTA",
+        )
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-go-no-delta",
+        )
+        self.assertEqual(proc.returncode, 0)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "accept")
 
+    def test_judge_retries_invalid_finish_envelope(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_invalid_")
+        finish_path = artifacts_dir / "finish.json"
+        finish_path.write_text("{}", encoding="utf-8")
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "execution-only",
+        )
+        self.assertEqual(proc.returncode, 11)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["reasonCode"], "FINISH_INVALID")
 
-class TestCancelStdoutInvariant(unittest.TestCase):
-    """Enforce invariant: cancel stdout ok=true => error absent, taskError present.
+    def test_judge_retries_missing_finish_file(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_missing_finish_")
+        finish_path = artifacts_dir / "missing-finish.json"
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "execution-only",
+        )
+        self.assertEqual(proc.returncode, 11)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "retry")
+        self.assertEqual(out["reasonCode"], "FINISH_NOT_FOUND")
 
-    Tests all three ok=true cancel paths:
-    1. Dead worker (termination confirmed, no abort needed)
-    2. Dead worker + abort fails (termination confirmed via pid_dead)
-    3. Idempotent cancel (alreadyFinished=true)
+    def test_judge_execution_only_retries_failed_outcome(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_exec_retry_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            outcome="failed",
+            exit_code=3,
+            execution_error={"name": "NonZeroExit", "message": "boom"},
+        )
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "execution-only",
+        )
+        self.assertEqual(proc.returncode, 11)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "retry")
+        self.assertEqual(out["reasonCode"], "EXECUTION_FAILED")
 
-    And the ok=false path:
-    4. Ownership mismatch (ok=false => error present, taskError null)
-    """
+    def test_judge_require_determinate_blocks_text_output(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_text_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            output_mode="text",
+            payload_status="not_requested",
+            decision_status="not_requested",
+        )
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-determinate",
+        )
+        self.assertEqual(proc.returncode, 12)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "block")
+        self.assertEqual(out["reasonCode"], "OUTPUT_NOT_MACHINE")
 
-    def test_ok_true_dead_worker_no_server(self) -> None:
-        """ok=true, dead PID, no server => error absent, taskError={Canceled}."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
+    def test_judge_require_determinate_reroutes_undetermined(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_abstained_")
+        payload = {
+            "protocol": self._mod.PAYLOAD_PROTOCOL,
+            "nonce": "judge-undetermined",
+            "decision": "UNDETERMINED",
+            "summary": "done",
+            "evidence": ["a.py:1 - fact"],
+            "changes": ["x"],
+            "next_steps": ["y"],
+        }
+        payload_path = artifacts_dir / "payload.json"
+        payload_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            payload_status="validated",
+            payload_schema=self._mod.PAYLOAD_PROTOCOL,
+            payload_artifact_path="payload.json",
+            payload_digest=self._mod._sha256_file(payload_path),
+            decision_status="abstained",
+        )
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-determinate",
+        )
+        self.assertEqual(proc.returncode, 10)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "reroute")
+        self.assertEqual(out["reasonCode"], "DECISION_UNDETERMINED")
 
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_inv_dead_") as td:
-            artifacts_dir = Path(td)
-            job = {
-                "runId": "inv-dead-nosrv",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": 2147483647,
-            }
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(job, indent=2), encoding="utf-8"
-            )
+    def test_judge_require_determinate_retries_missing_payload(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_missing_")
+        finish = self._make_finish(artifacts_dir=artifacts_dir, payload_status="missing")
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-determinate",
+        )
+        self.assertEqual(proc.returncode, 11)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["reasonCode"], "PAYLOAD_MISSING")
 
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertEqual(proc.returncode, 0)
-            out = json.loads(proc.stdout)
-            # Core invariant
-            self.assertTrue(out["ok"])
-            self.assertNotIn(
-                "error",
-                out,
-                "INVARIANT VIOLATION: ok=true but error is present in stdout",
-            )
-            # taskError carries the task termination reason
-            self.assertIsInstance(out.get("taskError"), dict)
-            self.assertEqual(out["taskError"]["name"], "Canceled")
-            # finish.json still has error (task ended)
-            fin = json.loads(
-                (artifacts_dir / "finish.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(fin["error"]["name"], "Canceled")
+    def test_judge_require_go_no_delta_blocks_mandatory_delta(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_block_mandatory_")
+        payload = {
+            "protocol": self._mod.PAYLOAD_PROTOCOL,
+            "nonce": "judge-block",
+            "decision": "MANDATORY_DELTA",
+            "summary": "done",
+            "evidence": ["a.py:1 - fact"],
+            "changes": ["x"],
+            "next_steps": ["y"],
+        }
+        payload_path = artifacts_dir / "payload.json"
+        payload_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            payload_status="validated",
+            payload_schema=self._mod.PAYLOAD_PROTOCOL,
+            payload_artifact_path="payload.json",
+            payload_digest=self._mod._sha256_file(payload_path),
+            decision_status="determinate",
+            decision_route="MANDATORY_DELTA",
+        )
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-go-no-delta",
+        )
+        self.assertEqual(proc.returncode, 12)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "block")
+        self.assertEqual(out["reasonCode"], "DECISION_MANDATORY_DELTA")
 
-    def test_ok_true_idempotent_already_finished(self) -> None:
-        """ok=true, alreadyFinished => error absent, taskError null."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
+    def test_judge_require_go_no_delta_blocks_undetermined(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_block_undetermined_")
+        payload = {
+            "protocol": self._mod.PAYLOAD_PROTOCOL,
+            "nonce": "judge-block-undetermined",
+            "decision": "UNDETERMINED",
+            "summary": "done",
+            "evidence": ["a.py:1 - fact"],
+            "changes": ["x"],
+            "next_steps": ["y"],
+        }
+        payload_path = artifacts_dir / "payload.json"
+        payload_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            payload_status="validated",
+            payload_schema=self._mod.PAYLOAD_PROTOCOL,
+            payload_artifact_path="payload.json",
+            payload_digest=self._mod._sha256_file(payload_path),
+            decision_status="abstained",
+        )
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-go-no-delta",
+        )
+        self.assertEqual(proc.returncode, 12)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "block")
+        self.assertEqual(out["reasonCode"], "DECISION_UNDETERMINED")
 
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_inv_idem_") as td:
-            artifacts_dir = Path(td)
-            existing_finish = {
-                "type": "opencode-subtask-finish",
-                "schemaVersion": 1,
-                "ok": True,
-                "runId": "inv-idem",
-            }
-            (artifacts_dir / "finish.json").write_text(
-                json.dumps(existing_finish, indent=2), encoding="utf-8"
-            )
-            job = {
-                "runId": "inv-idem",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": 2147483647,
-            }
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(job, indent=2), encoding="utf-8"
-            )
+    def test_judge_require_go_no_delta_retries_malformed_payload(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_malformed_")
+        finish = self._make_finish(artifacts_dir=artifacts_dir, payload_status="malformed")
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-go-no-delta",
+        )
+        self.assertEqual(proc.returncode, 11)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["reasonCode"], "PAYLOAD_MALFORMED")
 
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertEqual(proc.returncode, 0)
-            out = json.loads(proc.stdout)
-            self.assertTrue(out["ok"])
-            self.assertTrue(out.get("alreadyFinished"))
-            self.assertNotIn(
-                "error",
-                out,
-                "INVARIANT VIOLATION: ok=true but error is present in stdout",
-            )
-            # taskError is null for idempotent cancel (no cancel finish generated)
-            self.assertIsNone(out.get("taskError"))
-
-    def test_ok_false_mismatch_has_error_no_task_error(self) -> None:
-        """ok=false, ownership mismatch => error present (no finish generated),
-        taskError null."""
-        repo_root = Path(__file__).resolve().parents[1]
-        script = repo_root / "scripts" / "opencode_subtask.py"
-
-        with tempfile.TemporaryDirectory(prefix="ocsubtask_inv_mismatch_") as td:
-            artifacts_dir = Path(td)
-            job = {
-                "runId": "inv-mismatch",
-                "workdir": str(repo_root),
-                "state": "running",
-                "createdAt": 1,
-                "updatedAt": 1,
-                "pid": os.getpid(),  # live but not the worker
-                "httpAttempted": False,
-                "serverStartedNew": False,
-                "stopServerAfterRunMode": "never",
-            }
-            (artifacts_dir / "job.json").write_text(
-                json.dumps(job, indent=2), encoding="utf-8"
-            )
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "cancel",
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                ],
-                cwd=str(repo_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=20,
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            out = json.loads(proc.stdout.strip().splitlines()[-1])
-            self.assertFalse(out["ok"])
-            # taskError is null (no cancel finish was generated)
-            self.assertIsNone(out.get("taskError"))
-            # ok=false invariant: error must be present.
-            self.assertIn("error", out)
-            self.assertEqual(out["error"]["name"], "CancelOwnershipMismatch")
+    def test_judge_require_go_no_delta_blocks_text_output(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_judge_text_block_")
+        finish = self._make_finish(
+            artifacts_dir=artifacts_dir,
+            output_mode="text",
+            payload_status="not_requested",
+            decision_status="not_requested",
+        )
+        finish_path = self._write_finish(artifacts_dir, finish)
+        proc = self._run_cli_command(
+            "judge",
+            "--finish",
+            str(finish_path),
+            "--policy",
+            "require-go-no-delta",
+        )
+        self.assertEqual(proc.returncode, 12)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["verdict"], "block")
+        self.assertEqual(out["reasonCode"], "OUTPUT_NOT_MACHINE")
 
 
 if __name__ == "__main__":

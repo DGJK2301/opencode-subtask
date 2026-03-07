@@ -1,561 +1,471 @@
 ---
 name: opencode-subtask
-description: Run an OpenCode subtask as an isolated sub-agent executor (run/start/status/wait/cancel). Prints exactly one JSON line to stdout and writes full artifacts to disk; prefers HTTP server API with CLI fallback for non-timeout failures. Use when delegating a single well-scoped coding task to OpenCode. Not for task decomposition or orchestration (use subtask-orchestrator). 用 OpenCode 跑一个子任务并返回稳定 JSON。
+description: Run an OpenCode subtask as an isolated sub-agent executor and policy judge (run/start/status/wait/cancel/judge). Prints exactly one JSON line to stdout and writes full artifacts to disk; prefers HTTP server API with CLI fallback for non-timeout failures. Use when delegating a single well-scoped coding task to OpenCode. Not for task decomposition or orchestration (use subtask-orchestrator). 用 OpenCode 跑一个子任务并返回稳定 JSON。
 ---
 
 # OpenCode Subtask Adapter
 
-This skill turns OpenCode into a reliable "subagent primitive" for upstream agents (Codex CLI, Claude Code, etc.):
+`opencode-subtask` is a facts-only executor plus a separate policy judge.
 
-## Core Design
+- `run/start/status/wait/cancel` produce execution facts and artifacts.
+- `judge` consumes `finish.json` and returns a policy verdict.
+- Public machine protocol trusts only the nonce-bound sentinel payload.
+- Heuristic extraction is debug-only and stays in `diagnostics.json`.
 
-```
-+-------------+     +------------------+     +------------------+
-|  Upstream   | --> | opencode-subtask | --> |    OpenCode      |
-|   Agent     |     |   (adapter)      |     | (HTTP or CLI)    |
-+-------------+     +------------------+     +------------------+
-       ^                    |
-       |                    v
-       +--- finish.json ----+  (stable contract)
-```
+## Core Contract
 
-**Key invariants:**
-1. **Stdout stability**: Exactly ONE JSON line to stdout; `type` varies by subcommand:
-   - `run`, `wait` (completed) → `opencode-subtask-finish`
-   - `start` → `opencode-subtask-start`
-   - `status` → `opencode-subtask-status` (or `-finish` if completed)
-   - `cancel` → `opencode-subtask-cancel`
-   - `ensure-server` → `opencode-subtask-server`
-   - `stop-server` → `opencode-subtask-stop-server`
-   - CLI argument errors → `opencode-subtask-error` (with `ok: false`)
-  - `cancel` includes cleanup telemetry fields: `stopServerAttempted`, `stopServerOk`, `workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`
-  - `cancel` stdout uses `taskError` (additive field) to describe why the task ended (mirrors `finish.json`'s `error`) *only when a cancel `finish.json` was successfully persisted*; otherwise `taskError` is null. The top-level `error` field is reserved for cancel-command failures (`ok=false` only). This enforces the `ok=true => error absent` invariant.
-2. **Artifacts-first**: Large outputs (NDJSON, transcript, stderr) written to disk
-3. **Protocol shielding**: Callers depend only on this adapter's schema, not OpenCode internals
-4. **Engine abstraction**: HTTP server API preferred, CLI fallback on non-timeout failures
-5. **Exit codes are informational**: `status`, `wait`, and `cancel` return exit code 0 when they successfully observe the task state — even if the task itself failed (`ok=false`). Always parse the stdout JSON (`ok`, `error`) to determine task outcome; do not rely on the process exit code.
-6. **`ok`/`error` consistency**: When the output includes an `error` field, the following invariants always hold: `ok=true` ⇒ `error=null`; `ok=false` ⇒ `error!=null`. Callers may rely on this for branching without checking both.
-7. **Warnings are non-fatal**: The output may include a `warnings` array of `{name, message}` objects describing non-fatal anomalies observed during execution. A warning does not affect `ok`. Example: `WorkerMissingPending` — the worker PID was not found but `finish.json` has not yet appeared; the adapter continues to poll rather than failing immediately.
-8. **Stdout JSON envelope**: Every stdout JSON object — regardless of subcommand or success/failure — contains at minimum these fields: `type` (string), `schemaVersion` (int), `adapterVersion` (string), `timestamp` (int, ms since epoch), `ok` (bool), `warnings` (array, possibly empty). The `error` field (`{name, message}`) is present only when `ok=false`. Callers may rely on this uniform shape for a single decoder path.
+### Stdout contract
 
-## Prerequisites
+Exactly one JSON line is printed to stdout.
 
-- **Python**: 3.10+ (no third-party dependencies)
-- **OpenCode**: installed and in PATH (or specify via `--opencode <path>`). The adapter resolves `.exe`/`.cmd` shims automatically on Windows.
-- **git**: optional; used for `changedFiles`/`untrackedFiles` and `changes.patch` generation
+| Command | Stdout `type` |
+|---|---|
+| `run` | `opencode-subtask-finish` |
+| `start` | `opencode-subtask-start` |
+| `status` | `opencode-subtask-status` or `opencode-subtask-finish` |
+| `wait` | `opencode-subtask-status` or `opencode-subtask-finish` |
+| `cancel` | `opencode-subtask-cancel` |
+| `judge` | `opencode-subtask-judgment` |
+| arg/command errors | `opencode-subtask-error` |
 
-## Quick Start
+### `finish.json` shape
 
-### Run from anywhere (recommended)
-
-This skill ships a Python script plus a Windows `.cmd` wrapper:
-
-- Script: `scripts/opencode_subtask.py`
-- Windows wrapper: `scripts/opencode-subtask.cmd` (calls the script next to it)
-
-**Option A: Absolute path (invoke from any directory)**
-
-```bat
-REM Windows - using wrapper
-%USERPROFILE%\.claude\skills\opencode-subtask\scripts\opencode-subtask.cmd run ^
-  --workdir C:\path\to\your\project ^
-  --engine auto ^
-  --model google/antigravity-gemini-3-flash --variant minimal ^
-  --permission-mode allow ^
-  -- "Act as a senior software engineer. Summarize the repo structure (3 bullets)."
-```
-
-**Non‑negotiable prompt hygiene (default):**
-- Make the **first line** of every subtask prompt a simple persona: `Act as a [profession]...` (no leading blank lines)
-- This adapter enforces it by default via `--persona-mode require` (fail fast if missing).
-- If you want auto-injection for convenience, use `--persona-mode prepend`.
-- If you hit `PersonaMissing`, either add the persona line yourself or switch to `--persona-mode prepend` (auto-inject) / `off` (disable).
-  - If you pass prompts via `--prompt-file` / piping / generated files, the **first non-empty line of the effective prompt** must still be the persona. Avoid leading BOM/whitespace/headers before `Act as ...`.
-  - If you're using an orchestrator/planner that emits a prompt template, pass that template **verbatim** as the prompt input; do not prepend titles or metadata that would push the persona off line 1.
-
-**Boundary:** This is an executor, not a planner — see [Boundary (planning vs execution)](#boundary-planning-vs-execution) below.
-
-**Practical tip:**
-- Prefer writing the persona line yourself as the first line (it avoids accidentally injecting a generic default persona).
-- Keep personas boring and specific: a clear job title beats role-play.
-
-```bash
-# Unix/macOS - using Python directly
-python ~/.claude/skills/opencode-subtask/scripts/opencode_subtask.py run \
-  --workdir /path/to/your/project \
-  --engine auto \
-  --model google/antigravity-gemini-3-flash --variant minimal \
-  --permission-mode allow \
-  -- "Act as a senior software engineer. Summarize the repo structure (3 bullets)."
-```
-
-**Option B: Relative path (from skill directory)**
-
-```bash
-cd ~/.claude/skills/opencode-subtask  # or %USERPROFILE%\.claude\skills\opencode-subtask on Windows
-python scripts/opencode_subtask.py run --workdir /path/to/project --engine auto -- "Act as a senior software engineer. <your prompt>"
-```
-
-### Background job (recommended for long-running tasks)
-
-```bash
-# 1) Start (returns immediately with runId)
-python scripts/opencode_subtask.py start --workdir . --engine auto --permission-mode allow --execution-profile checkpoint -- \
-  "Act as a senior software engineer. Review src/foo.py exception handling; propose a minimal fix with file:line evidence."
-
-# 2) Poll status (optional)
-python scripts/opencode_subtask.py status --run-id <runId>
-
-# 3) Wait for completion (blocks until done)
-python scripts/opencode_subtask.py wait --run-id <runId>
-```
-
-Behavior note:
-- `run` is foreground and returns automatically when the subtask completes (one final JSON line).
-- `start` only returns a launch record; completion is observed via `wait`/`status` reading `finish.json`.
-- There is no push callback mode in this adapter today.
-
-### Foreground (debug/quick tasks)
-
-```bash
-python scripts/opencode_subtask.py run --workdir . --engine auto --execution-profile latency --no-quiet -- \
-  "Act as a senior software engineer. Explain why tests fail on Windows; point to exact file:line."
-```
-
-## Basic flags (most callers only need these)
-
-| Flag | Default | Notes |
-|------|---------|------|
-| `--workdir` | `.` | Target project directory (not the skill directory). |
-| `--engine` | `auto` | `auto` uses HTTP only if a server URL is available (via `--attach` or `ensure-server`), otherwise CLI. |
-| `--model` | (OpenCode default) | Prefer setting defaults in `opencode.json`. |
-| `--variant` | (none) | Pass as `--variant <name>`; do **not** use `model:suffix`. |
-| `--permission-mode` | `inherit` | Use `allow` for unattended runs; use `inherit` for interactive safety. |
-| `--execution-profile` | `hybrid` | Policy switch for engine/artifact behavior: `hybrid`/`latency`/`checkpoint`/`legacy`. |
-| `--hybrid-short-timeout-s` | (unset) | `hybrid` short-task timeout threshold override (seconds). Precedence: flag > env > default `240`. |
-| `--hybrid-short-prompt-chars` | (unset) | `hybrid` short-task prompt-length threshold override (chars). Precedence: flag > env > default `1600`. |
-| `--orphan-reaper` | `true` | On run start, reap orphan per-project servers left by crashed/hard-killed workers. Use `--no-orphan-reaper` to disable. |
-| `--orphan-reaper-idle-s` | `1800` | Fallback idle timeout for reaping healthy but unreferenced per-project servers. Set `0` to disable idle-timeout reaping. |
-| `--timeout` | (varies) | Legacy timeout input. Used when `--run-timeout` / `--wait-timeout` is not set. |
-| `--run-timeout` | (unset) | Runtime timeout for `run` / `start` worker execution; overrides `--timeout` when set. |
-| `--wait-timeout` | (unset) | Wait window for `wait`; overrides `--timeout` when set. |
-| `--retry-empty-output` | `true` | Retry once when model returns an empty successful response and no tracked file changes are detected. |
-| `--empty-output-retries` | `1` | Max retries for empty-output recovery. |
-
-## Timeout semantics (important)
-
-- `run --run-timeout` / `start --run-timeout`: hard cap for worker runtime.
-- `wait --wait-timeout`: wait-window for the caller, independent from worker runtime timeout.
-- Backward compatibility: if `--run-timeout` / `--wait-timeout` is not provided, adapter falls back to `--timeout`.
-- The adapter does not currently auto-extend runtime timeout based on heartbeat (`events.ndjson` / `assistant.txt` growth).
-- Empty-success guard: if a model returns success with empty assistant output, adapter marks `EmptyModelOutput` and (by default) retries once only when no tracked changes were produced.
-- For heavy reasoning models (especially `opus-4.6-thinking`), prefer larger runtime timeout windows (commonly 1200-1800s for complex reviews).
-
-## Persona-first prompts (default behavior)
-
-For best results (especially with Gemini), every subtask prompt should start with a simple, explicit persona **on the first non-empty line**:
-
-```text
-Act as a [profession]...
-```
-
-Examples:
-
-```text
-Act as a senior software engineer. Review src/foo.py and propose a minimal fix with file:line evidence.
-```
-
-```text
-Act as a MATLAB runtime capture engineer. Design a Frida hook plan; list exact functions and stop conditions.
-```
-
-This adapter supports a lightweight persona policy and enables it by default:
-
-| Flag | Default | Notes |
-|------|---------|------|
-| `--persona-mode` | `require` | `off`/`warn`/`require`/`prepend`. In `require`, the adapter fails fast if the prompt doesn't start with `Act as ...`. In `prepend`, it injects a persona line **only if** missing. |
-| `--persona-line` | `Act as a senior software engineer.` | Used by `prepend` (and can be used as a required prefix). Prefer a simple job title. |
-
-## Boundary (planning vs execution)
-
-This skill is an **execution adapter**: it runs a *single* OpenCode subtask and returns a stable JSON result + on-disk artifacts.
-
-It deliberately does **not** decide:
-- how to decompose a big goal into subtasks,
-- which expert roles to assign,
-- or what acceptance criteria should be.
-
-If you need role allocation, decomposition, and auditable acceptance criteria, use a separate **planner/orchestrator** and feed the resulting per-subtask prompt into `opencode-subtask`.
-
-## Session reuse (CLI engine only; reduces isolation)
-
-Session reuse can reduce cost/time by continuing an existing OpenCode session, avoiding the overhead of starting fresh. However, it increases the risk of "context bleed" across subtasks.
-
-**When to use session reuse:**
-- Multi-step analysis where later steps need context from earlier steps
-- Iterative refinement tasks (review → fix → review again)
-- Cost optimization for related subtasks
-
-**When NOT to use:**
-- Isolated, independent subtasks (default behavior is safer)
-- Tasks requiring clean context
-
-| Flag | Notes |
-|------|------|
-| `--continue` / `-c` | Continue the last OpenCode session. |
-| `--session <id>` / `-s <id>` | Continue a specific OpenCode session. |
-| `--title <text>` | Set/update session title. |
-
-**Practical scenarios:**
-
-| Scenario | Approach | Benefit |
-|----------|----------|---------|
-| Code review → Fix → Verify | `--session <id>` chain | Model remembers identified issues across steps |
-| Incremental refactoring | `--continue` for each step | Maintains refactoring context and decisions |
-| Q&A about a codebase | `--continue` conversation | Avoids re-reading files, uses cached context |
-| Parallel independent tasks | No session reuse (default) | Clean isolation, no cross-contamination |
-
-**Example 1: Multi-step code review (explicit session ID)**
-
-```bash
-# Step 1: Initial analysis (starts new session)
-RESULT1=$(python scripts/opencode_subtask.py run --workdir . --engine cli \
-  --model google/antigravity-gemini-3-flash --variant low \
-  --permission-mode allow \
-  -- "Act as a senior software engineer. Analyze src/foo.py for potential bugs. List them with file:line.")
-
-# Extract sessionId from JSON output
-SESSION_ID=$(echo "$RESULT1" | python -c "import sys,json; print(json.load(sys.stdin).get('sessionId',''))")
-echo "Session: $SESSION_ID"
-
-# Step 2: Continue same session for follow-up (has context from step 1)
-python scripts/opencode_subtask.py run --workdir . --engine cli \
-  --session "$SESSION_ID" \
-  --model google/antigravity-gemini-3-flash --variant low \
-  --permission-mode allow \
-  -- "Act as a senior software engineer. Now fix the first bug you identified. Show the diff."
-
-# Step 3: Continue for verification
-python scripts/opencode_subtask.py run --workdir . --engine cli \
-  --session "$SESSION_ID" \
-  --model google/antigravity-gemini-3-flash --variant low \
-  --permission-mode allow \
-  -- "Act as a senior software engineer. Verify the fix is correct. Any remaining issues?"
-```
-
-**Example 2: Quick Q&A chain (--continue shorthand)**
-
-```bash
-# Step 1: Ask about file structure
-python scripts/opencode_subtask.py run --workdir . --engine cli \
-  --model siliconflow-cn/Pro/moonshotai/Kimi-K2.5 \
-  --permission-mode allow \
-  -- "Act as a senior software engineer. Count how many lines are in SKILL.md."
-
-# Step 2: Follow-up (uses --continue to auto-resume last session)
-python scripts/opencode_subtask.py run --workdir . --engine cli \
-  --continue \
-  --model siliconflow-cn/Pro/moonshotai/Kimi-K2.5 \
-  --permission-mode allow \
-  -- "Act as a senior software engineer. What file did you just count? How many lines?"
-
-# Step 3: Another follow-up
-python scripts/opencode_subtask.py run --workdir . --engine cli \
-  --continue \
-  --model siliconflow-cn/Pro/moonshotai/Kimi-K2.5 \
-  --permission-mode allow \
-  -- "Act as a senior software engineer. What was the first section heading in that file?"
-```
-
-**Verified behavior (tested with GLM-5):**
-
-| Step | Input tokens | Cache read | Observation |
-|------|--------------|------------|-------------|
-| Step 1 (new session) | 5042 | 10240 | Fresh context, reads file |
-| Step 2 (`--session`) | 380 | 15232 | 92% fewer input tokens, remembers "SKILL.md had 318 lines" |
-| Step 3 (`--continue`) | 713 | 15232 | Remembers file, answers from memory |
-
-**Example 3: Windows batch script**
-
-```bat
-@echo off
-setlocal EnableDelayedExpansion
-
-REM Step 1: Analyze
-for /f "delims=" %%i in ('python scripts\opencode_subtask.py run --workdir . --engine cli --model google/antigravity-gemini-3-flash --permission-mode allow -- "Act as a senior software engineer. List all TODO comments in src/."') do set RESULT=%%i
-
-REM Extract sessionId using Python
-for /f %%s in ('echo !RESULT! ^| python -c "import sys,json; print(json.load(sys.stdin).get('sessionId',''))"') do set SESSION_ID=%%s
-
-echo Session: %SESSION_ID%
-
-REM Step 2: Continue
-python scripts\opencode_subtask.py run --workdir . --engine cli ^
-  --session "%SESSION_ID%" ^
-  --model google/antigravity-gemini-3-flash ^
-  --permission-mode allow ^
-  -- "Act as a senior software engineer. Pick the most important TODO and implement it."
-```
-
-**Note:** The `sessionId` is returned in the finish JSON (`finish.sessionId`). The session belongs to OpenCode CLI, not to this adapter. HTTP engine uses different session mechanics (server-managed sessions).
-
-## Output control / debugging
-
-| Flag | Notes |
-|------|------|
-| `--no-quiet` | Allow streaming OpenCode events to stderr (stdout still stays one JSON line). |
-| `--max-text-chars <n>` | Bound the `summary` size in the finish JSON. |
-| `--max-artifact-bytes <n>` | Hard cap per artifact file (0 disables). |
-| `--include-debug` | Include extra debug fields in the finish JSON. |
-| `--retry-empty-output` | Enable/disable empty-output auto-retry safety net. |
-| `--empty-output-retries <n>` | Configure empty-output retry count (default 1). |
-| `--wrapper-log` / `--no-wrapper-log` | Retained for compatibility. In `start` mode, `wrapper.log` is the background worker stdout/stderr sink and is always created regardless of this flag. The flag may gain meaning in future versions but currently has no effect. |
-
-## Prompt / input control
-
-| Flag | Notes |
-|------|------|
-| `--prompt <text>` | Prompt as a single string (alternative to positional args after `--`). |
-| `--prompt-file <path>` | Read prompt from a file (useful for complex prompts or Windows escaping issues). |
-| `-f` / `--file <path>` | Extra files to include (CLI engine only). |
-| `--no-contract` | Don't append the default output contract to the prompt. |
-
-## Environment / executable
-
-| Flag | Notes |
-|------|------|
-| `--opencode <path>` | Path to opencode executable (if not in PATH). |
-| `--agent <name>` | OpenCode agent name to use. |
-| `--env KEY=VALUE` | Set environment variable for the OpenCode process. |
-| `--env-file KEY=PATH` | Set environment variable from file contents. |
-| `OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL` | `1/true/yes/on` enables kill on unknown worker ownership (default is safe-off, i.e. unknown ownership is not killed). |
-
-## Server attachment
-
-| Flag | Notes |
-|------|------|
-| `--attach <url>` | Attach to a specific `opencode serve` URL. |
-| `--no-attach-server` | Don’t attach to a per-project server automatically. (`--engine http` will still require `--attach` or `ensure-server`.) |
-| `--stop-server-after-run <mode>` | HTTP server shutdown policy: `if-started` (default, only stop if this run started the server), `always`, or `never`. |
-| `--orphan-reaper` / `--no-orphan-reaper` | Enable/disable startup orphan-server cleanup before attach/ensure logic. |
-| `--orphan-reaper-idle-s <seconds>` | Idle fallback threshold used by the startup reaper. |
-
-Shutdown note:
-- In `--engine auto`, if HTTP is attempted first and then falls back to CLI (non-timeout failures), shutdown policy is still evaluated for that attempted HTTP path.
-- `if-started` only stops when this invocation created the per-project server; `always` stops regardless of who started it.
-- Safety gate: `always` / `if-started` only stop the currently tracked **local** per-project server URL (prevents stopping unrelated or remote `--attach` targets).
-- `cancel` applies the same policy from persisted job state (`httpAttempted`, `serverStartedNew`, `stopServerAfterRunMode`) to reduce orphaned per-project servers.
-- `cancel` is **idempotent**: if `finish.json` already contains a valid terminal state (has an `ok` key), cancel returns immediately with `alreadyFinished=true` and `ok=true` — no PID kill, no job.state overwrite. An empty or structurally incomplete `finish.json` (e.g. `{}`) is NOT treated as a valid terminal state and cancel proceeds normally.
-- `cancel` success (`ok=true`) is recognized when any of the following holds:
-  - local worker termination is confirmed,
-  - remote `abort` succeeds, or
-  - kill signal is delivered and liveness probe is inconclusive.
-- When `ok=true` comes from inconclusive liveness probing, finish error message explicitly marks cancellation as unverified.
-- `cancel` persists `job.json.state=canceled` (plus `canceledAt`) only when the cancel finish write actually wins (i.e. no prior `finish.json` existed). If `finish.json` was already written by the worker or watchdog, job.state is not overwritten.
-- **CLI engine cancel scope**: cancel terminates the worker process group and writes a terminal `finish.json`. The opencode CLI subprocess (which runs in its own session group via `start_new_session=True`) usually exits due to pipe break, but this is not a protocol guarantee. HTTP engine cancel additionally attempts `abort` on the session. Callers should not assume cancel will deterministically stop all downstream computation — only that a terminal state will be recorded.
-- If `cancel` cannot persist `finish.json` to disk (`write_failed` / `unreadable`), it degrades `ok` to `false` and attaches a `CancelFinishWriteFailed` error so the caller knows wait/status may not see a terminal state.
-- Default safety posture: unknown worker ownership does not trigger kill. Override only when needed via `OPENCODE_SUBTASK_CANCEL_ALLOW_UNKNOWN_KILL`.
-- Startup/attach server lock timeout is aligned with `--server-wait` (instead of fixed 20s) to reduce false concurrent-start failures.
-- In early `OpencodeNotFound` paths, if `finish.json` already exists, adapter reuses existing finish for stdout/exit consistency.
-- Startup reaper uses recent `job.json` evidence and server health: it reaps dead/unhealthy servers immediately, reaps strong crashed-owner orphans, and optionally reaps idle healthy servers after `--orphan-reaper-idle-s`.
-- Startup reaper treats failed health probes (including auth mismatch) as unknown evidence and does not kill solely on probe failure.
-
-## Execution Profile (`--execution-profile`)
-
-`--execution-profile` controls routing and artifact density. This is orthogonal to model selection.
-
-| Mode | Intended use | Behavior |
-|------|--------------|----------|
-| `hybrid` (default) | General-purpose mixed workloads | Heuristic routing: short tasks prefer HTTP and lighter artifacts (`--no-save-events --no-save-text`), long tasks prefer CLI and full artifacts (`--save-events --save-text`). Default short-task thresholds are `timeout <= 240s` and prompt length `<= 1600` chars, configurable via flags/env (below). |
-| `latency` | Fast interactive / probe calls | Prefer HTTP when possible and use lighter artifacts. Best for short, disposable subtasks. |
-| `checkpoint` | Long-chain / auditable / recoverable workflows | Prefer CLI path and keep full artifacts for resume/debug/audit. Recommended for multi-agent chains. |
-| `legacy` | Backward compatibility | Keep pre-policy behavior; use when migrating existing orchestration scripts. |
-
-Policy guidance:
-- For long chains, default to `checkpoint`.
-- For quick probes and low-latency asks, use `latency`.
-- Keep `hybrid` as project default when task mix is unknown.
-- If caller input was `--engine auto`, profile-based HTTP preference preserves HTTP-failure fallback to CLI except HTTP timeout (timeout returns directly, no CLI retry).
-
-Hybrid threshold configuration:
-- Flags: `--hybrid-short-timeout-s`, `--hybrid-short-prompt-chars`
-- Env: `OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S`, `OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS`
-- Precedence: CLI flag > env var > built-in default
-- Example (flags): `python scripts/opencode_subtask.py run --execution-profile hybrid --hybrid-short-timeout-s 120 --hybrid-short-prompt-chars 1200 --run-timeout 90 --prompt "..."`
-- Example (env): set `OPENCODE_SUBTASK_HYBRID_SHORT_TIMEOUT_S=120` and `OPENCODE_SUBTASK_HYBRID_SHORT_PROMPT_CHARS=1200`, then run with `--execution-profile hybrid`
-
-Start-mode alignment: `start` pre-applies the execution profile before spawning the background worker, so that the start stdout metadata (engine, taskClass, save flags) matches what the worker will actually compute. The timeout used for hybrid short/long classification is `--run-timeout` (not the legacy `--timeout`), and `--env`/`--env-file` values are merged into the environment before threshold resolution.
-
-## Engine Selection (`--engine`)
-
-| Mode | Behavior |
-|------|----------|
-| `auto` (default) | **With `--attach-server` (default true):** tries to attach to an existing per-project server first. If a server URL is available (via `--attach` or attached server), uses HTTP; otherwise falls back to CLI. If HTTP fails without timeout, falls back to CLI. When combined with `--execution-profile`, the profile may override `auto` to a specific engine (e.g. hybrid long tasks force `cli`). |
-| `http` | HTTP only (requires server via `--attach` or `ensure-server`) |
-| `cli` | CLI only (`opencode run --format json`) |
-
-**Note:** `--attach-server` defaults to `true`, meaning `auto` mode will attempt to reuse an existing server if one is running for the project. Use `--no-attach-server` to force CLI mode without checking for servers.
-
-**Note (profile overrides engine):** When `--execution-profile` is set alongside `--engine auto`, the profile's engine preference takes precedence. For example, `hybrid` classifies the task as short or long — short tasks use HTTP, long tasks force CLI. The `auto` fallback logic (HTTP failure → CLI retry) still applies within the profile's chosen engine, except for HTTP timeouts which return directly without CLI retry.
-
-**Note (memory):** HTTP engine sessions live inside the per-project `opencode serve` process and are not automatically deleted. If you run many subtasks against a long-lived server, memory can grow over time. Options: run with `--stop-server-after-run if-started` (or `always`), periodically run `stop-server`, or use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`).
-
-**HTTP path** (preferred):
-- Uses OpenCode Server API: `/global/health`, `/session`, `/session/:id/message`
-- SSE event stream for diagnostics and auto-permission replies
-- Lower latency when server is warm
-
-**CLI path** (fallback):
-- Uses `opencode run --format json`
-- NDJSON event stream parsed and written to `events.ndjson`
-- More isolated, no shared server state
-
-## Finish JSON Schema
-
-All commands return a single JSON object to stdout (note: `type` varies by subcommand, see Key invariants above):
+`finish.json` is the only authoritative terminal envelope.
 
 ```json
 {
   "type": "opencode-subtask-finish",
-  "schemaVersion": 1,
-  "adapterVersion": "0.5.19",
-  "ok": true,
-  "exitCode": 0,
-  "timedOut": false,
-  "runId": "run_1234567890_12345",
-  "workdir": "/path/to/project",
-  "engine": {"selected": "http", "fallbackFrom": null},
-  "sessionId": "session-abc123",
-  "summary": "Fixed auth bug in login.py:42...",
-  "summaryTruncated": false,
-  "resultDigest": "abc123def456...",
-  "changedFiles": ["src/login.py"],
-  "untrackedFiles": [],
-  "warnings": [],
+  "schemaVersion": 2,
+  "adapterVersion": "0.6.0",
+  "timestamp": 0,
+  "runId": "run_...",
+  "workdir": "...",
+  "outputMode": "machine|text",
+  "outcome": "completed|failed|timed_out|cancelled|internal_error",
+  "execution": {
+    "exitCode": 0,
+    "durationMs": 0,
+    "engine": {"selected": "cli|http|none|watchdog|cancel", "fallbackFrom": "http|null"},
+    "sessionId": null,
+    "error": null,
+    "warnings": []
+  },
+  "payload": {
+    "status": "validated|not_requested|missing|malformed|ambiguous|persist_failed",
+    "schema": "opencode-subtask-payload-v2|null",
+    "artifact": {"path": "payload.json|null", "digest": "sha256|null"},
+    "errors": []
+  },
+  "decision": {
+    "status": "determinate|abstained|unavailable|not_requested",
+    "route": "GO_NO_DELTA|MANDATORY_DELTA|null"
+  },
+  "workspace": {
+    "changedFiles": [],
+    "untrackedFiles": [],
+    "patchPath": null
+  },
   "artifacts": {
-    "dir": "/path/to/artifacts",
+    "dir": "...",
     "jobPath": "job.json",
     "finishPath": "finish.json",
-    "promptPath": "prompt.txt",
-    "eventsPath": "events.ndjson",
-    "stderrPath": "stderr.log",
-    "assistantPath": null,
-    "wrapperLogPath": null,
-    "resultPath": "result.json",
-    "patchPath": "changes.patch"
-  },
-  "error": null
+    "promptPath": "prompt.txt|null",
+    "stderrPath": "stderr.log|null",
+    "assistantPath": "assistant.txt|null",
+    "eventsPath": "events.ndjson|null",
+    "wrapperLogPath": "wrapper.log|null",
+    "payloadPath": "payload.json|null",
+    "diagnosticsPath": "diagnostics.json|null"
+  }
 }
 ```
 
-**Note:** `adapterVersion` is a semver string identifying the adapter release that produced this output. Callers may use it for diagnostics or compatibility checks but must not gate logic on it.
+### Writer invariants
 
-**Note:** `warnings` is an array (possibly empty) of `{name, message}` objects. Warnings signal non-fatal anomalies (e.g. `WorkerMissingPending` when the worker PID disappears but `finish.json` has not yet been written). Presence of warnings does not affect `ok`.
+- `outputMode="machine"` never emits `payload.status="not_requested"`.
+- `outputMode="text"` requires `payload.status="not_requested"`, `decision.status="not_requested"`, and `payload.artifact.path/digest=null`.
+- `payload.status="validated"` requires:
+  - `payload.schema == "opencode-subtask-payload-v2"`
+  - `payload.artifact.path != null`
+  - `payload.artifact.digest != null`
+  - `decision.status in {"determinate", "abstained"}`
+- Non-validated payloads keep `payload.artifact.path/digest=null`.
+- `decision.route` is non-null only when `decision.status="determinate"`.
+- `outcome="completed"` requires `execution.error=null`.
 
-**Note:** `resultDigest` is a raw SHA-256 hex string (no `sha256:` prefix).
+### Frozen machine vocabulary
 
-**Note:** Optional artifact paths (`eventsPath`, `assistantPath`, `wrapperLogPath`, `resultPath`) are `null` in JSON when the corresponding file does not exist on disk. Only paths whose files have actually been created are populated with file names. `stderrPath` is effectively always present once execution begins (the file is opened in append mode), but may be absent in early preflight failures before `artifacts_dir` is initialized. `patchPath` follows its own logic (non-null only when git tracked changes exist).
+#### `execution.engine.selected`
 
-**Schema evolution:** `schemaVersion=1` is the current stable schema. Within v1, new fields may be added (additive-only) but existing field names, types, and semantics will not change. A breaking change (field removal, type change, or semantic redefinition) requires bumping `schemaVersion` to 2+. Callers should ignore unknown fields and must not depend on field ordering.
+| Value | Meaning |
+|---|---|
+| `cli` | Foreground/background worker used the OpenCode CLI engine. |
+| `http` | Run completed on the OpenCode HTTP server path. |
+| `none` | Adapter failed before any engine run could start. |
+| `watchdog` | Terminal finish was synthesized by stale-run watchdog recovery. |
+| `cancel` | Terminal finish was synthesized by `cancel`. |
 
-## Artifacts (on disk)
+#### `execution.engine.fallbackFrom`
 
-**Note:** "always" below means the file is created once `artifacts_dir` has been initialized. Early-fatal exits (e.g. `BadArgs`, `PersonaMissing`) may terminate before directory creation, in which case no artifacts exist on disk — the error is reported solely via stdout JSON.
+| Value | Meaning |
+|---|---|
+| `null` | No engine fallback occurred. |
+| `http` | Initial HTTP attempt failed and adapter reran on CLI. |
 
-| File | Condition | Description |
-|------|-----------|-------------|
-| `prompt.txt` | always | Effective prompt (with contract appended) |
-| `job.json` | always | Runtime/diagnostic job state for status/wait/cancel (not authoritative for terminal outcome) |
-| `finish.json` | always | **Authoritative terminal state** — the single source of truth for task outcome (same schema as stdout) |
-| `stderr.log` | always | CLI stderr or HTTP errors |
-| `result.json` | best-effort | Adapter-extracted structured result (may be missing if disk write fails) |
-| `events.ndjson` | `--save-events` (profile-dependent) | Full event stream (CLI NDJSON or HTTP SSE→NDJSON) |
-| `assistant.txt` | `--save-text` (profile-dependent) | Full assistant transcript |
-| `changes.patch` | when git tracked changes exist | git diff for tracked changes |
-| `wrapper.log` | `start` mode only | Background worker output |
+#### `payload.errors[].code`
 
-## Permission Modes
+| Code | Meaning |
+|---|---|
+| `PAYLOAD_MISSING` | No authoritative nonce-bound payload was produced. |
+| `SENTINEL_MULTIPLE` | Multiple authoritative sentinel candidates were found. |
+| `SENTINEL_TRAILING_TEXT` | Non-whitespace text appeared after the terminal sentinel. |
+| `NONCE_MISMATCH` | Payload nonce did not match the run contract. |
+| `PAYLOAD_JSON_INVALID` | Sentinel block did not parse into a JSON object. |
+| `PAYLOAD_SCHEMA_INVALID` | JSON parsed, but payload fields failed schema validation. |
+| `DECISION_INVALID` | `decision` field was present but outside the allowed enum. |
+| `PAYLOAD_PERSIST_FAILED` | Canonical `payload.json` write failed after validation. |
 
-| Mode | HTTP Behavior | CLI Behavior |
-|------|---------------|--------------|
-| `inherit` | No auto-reply | Use existing OPENCODE_PERMISSION |
-| `allow` | Auto-allow via API | OPENCODE_PERMISSION=`{\"*\":\"allow\"}` |
-| `noninteractive` | Auto-reply via API (conservative allow/deny; denies `external_directory`/`doom_loop`/nested agents and `*.env` reads when detectable) | OPENCODE_PERMISSION=<no-ask preset JSON (deny `external_directory`/`doom_loop`/nested agents; deny `*.env` reads)> |
+### Authoritative machine payload
 
-## Model Selection
+Machine mode requires a single nonce-bound terminal sentinel block:
 
-| Use Case | Recommended Model |
-|----------|-------------------|
-| Quick probes, connectivity checks | `google/antigravity-gemini-3-flash` (variants: `minimal`, `low`, `medium`, `high`) |
-| Routine analysis, code review | `google/antigravity-claude-opus-4-6-thinking` (variants: `low`, `max`)  |
-| Complex analysis, multi-step refactors | `google/antigravity-claude-opus-4-6-thinking` (variants: `low`, `max`) |
-| Pure formatting, minimal reasoning | `google/antigravity-claude-sonnet-4-6` (no thinking) |
-| Simple isolated tasks | `google/antigravity-gemini-3.1-pro` (variants: `low`, `high`) |
-| Cost-effective alternative (SiliconFlow) |  `siliconflow-cn/Pro/moonshotai/Kimi-K2.5` (comparable to sonnet-4.5, lower cost) |
-| High-capability alternative (SiliconFlow) | `siliconflow-cn/Pro/zai-org/GLM-5` |
-
-> **Note:** The models above are from specific providers. For other environments or additional models, consult your `opencode.json` configuration.
-
-**Variant selection:** pass variants with `--variant <name>` (e.g. `--model google/antigravity-gemini-3-flash --variant low`). Do not use `model:suffix` strings.
-
-## Server Management
-
-```bash
-# Ensure a per-project server is running
-python scripts/opencode_subtask.py ensure-server --workdir .
-
-# Stop server
-python scripts/opencode_subtask.py stop-server --workdir .
-
-# One-shot runs (start server if needed, then stop it after completion)
-python scripts/opencode_subtask.py run --engine http --stop-server-after-run if-started --workdir . --prompt "..."
+```text
+BEGIN_OC_SUBTASK_JSON_<nonce>
+{"protocol":"opencode-subtask-payload-v2","nonce":"<nonce>",...}
+END_OC_SUBTASK_JSON_<nonce>
 ```
 
-## Operational Notes
+Payload schema:
 
-- **Stuck detection**: Use `status` output's `progress.idleForSeconds` + artifact sizes
-- **Prompt hygiene**: Use Facts/Hypotheses/Constraints/Acceptance capsule (see `subtask-orchestrator`)
-- **Result extraction**: Prefers sentinel-wrapped JSON (`BEGIN_OC_SUBTASK_JSON`/`END_OC_SUBTASK_JSON`)
-- **Windows**: Default executable is `opencode` (the wrapper prefers `opencode.exe` if available and falls back to `opencode.cmd`); uses `taskkill /T /F` for process cleanup
-- **Fallback logging**: When HTTP→CLI fallback occurs, `engine.fallbackFrom` is set in finish JSON
-- **`--env` security**: Values passed via `--env KEY=VALUE` are visible in the process argument list. For secrets, prefer `--env-file` pointing to a file with restricted permissions.
-- **Summary length**: The contract prompt requests summaries `<=800 chars`. The `--max-text-chars` default (1000) provides headroom so the adapter does not truncate borderline-compliant model output.
-- **Orphan reaper telemetry**: run debug/job state may include `orphanReaper` details; cancel output includes `stopServerAttempted` / `stopServerOk` and ownership/probe fields (`workerOwnership`, `allowUnknownOwnershipKill`, `probeInconclusiveAfterKill`)
-- **Cache pruning**: `prune-cache` subcommand deletes old run artifact directories. Safe-by-default (dry-run); pass `--apply` to delete. `--keep-last N` (default 200) retains the N most-recent directories by mtime. Output: `type=opencode-subtask-prune-cache` JSON with `applied`, `report`, and `ok` fields.
-  - **Note:** On failure (`ok=false`), output includes a top-level `error` object.
+```json
+{
+  "protocol": "opencode-subtask-payload-v2",
+  "nonce": "<nonce>",
+  "decision": "GO_NO_DELTA|MANDATORY_DELTA|UNDETERMINED",
+  "summary": "string",
+  "evidence": ["string"],
+  "changes": ["string"],
+  "next_steps": ["string"]
+}
+```
 
-## Troubleshooting
+`payload.json` is canonical JSON written by the adapter after validation. `assistant.txt` keeps the raw text trace. `diagnostics.json` is optional debug output and never part of the public decision contract.
 
-### Exit Code Reference
+## Machine Vocabulary
 
-| Exit Code | Meaning | `ok` field | Error type |
-|-----------|---------|------------|------------|
-| 0 | Success (including successful observation of a failed task) | `true` | — |
-| 1 | Internal/runtime error (adapter bug, OpenCode crash, disk I/O failure, `prune-cache` failure, etc.) | `false` | `UnhandledException`, `ServerUnhealthy`, `OpencodeNotFound`, `Timeout`, `EmptyModelOutput`, `OutputTooLarge`, `FinishWriteFailed`, etc. |
-| 2 | Caller-input error (bad CLI args, invalid config, missing required input) | `false` | `BadRunId`, `BadArgs`, `BadConfig`, `MissingPrompt`, `PromptConflict`, `MissingRunId`, `PromptFileReadError`, `PersonaMissing`, `BadPersonaMode` |
+### `finish.outcome`
+
+| Value | Meaning |
+|---|---|
+| `completed` | Execution completed without execution-layer error. |
+| `failed` | Execution failed but was not a timeout. |
+| `timed_out` | Execution timed out. |
+| `cancelled` | Run was cancelled. |
+| `internal_error` | Adapter synthesized or reported an internal failure. |
+
+### `payload.status`
+
+| Value | Meaning |
+|---|---|
+| `validated` | Authoritative payload validated and `payload.json` persisted. |
+| `not_requested` | `outputMode=text`; no machine payload expected. |
+| `missing` | No authoritative sentinel payload found. |
+| `malformed` | Sentinel candidate found but JSON/schema/nonce was invalid. |
+| `ambiguous` | Multiple candidates or ambiguous sentinel extraction. |
+| `persist_failed` | Payload validated but `payload.json` could not be written. |
+
+### `decision.status`
+
+| Value | Meaning |
+|---|---|
+| `determinate` | Business route is available in `decision.route`. |
+| `abstained` | Payload explicitly returned `UNDETERMINED`. |
+| `unavailable` | No usable decision is available. |
+| `not_requested` | `outputMode=text`; no decision requested. |
+
+### `decision.route`
+
+| Value | Meaning |
+|---|---|
+| `GO_NO_DELTA` | No code change required. |
+| `MANDATORY_DELTA` | Code or artifact delta is required. |
+
+### `payload.errors[].code`
+
+| Code | Meaning |
+|---|---|
+| `PAYLOAD_MISSING` | No authoritative payload found. |
+| `SENTINEL_MULTIPLE` | Multiple sentinel candidates were found. |
+| `SENTINEL_TRAILING_TEXT` | Non-whitespace content followed the terminal sentinel. |
+| `NONCE_MISMATCH` | Payload nonce did not match the expected contract nonce. |
+| `PAYLOAD_JSON_INVALID` | Payload body was not valid JSON. |
+| `PAYLOAD_SCHEMA_INVALID` | Payload JSON shape was invalid. |
+| `DECISION_INVALID` | `decision` was missing or outside the allowed enum. |
+| `PAYLOAD_PERSIST_FAILED` | `payload.json` write failed after validation. |
+
+### `judge.verdict`
+
+| Value | Meaning |
+|---|---|
+| `accept` | Accept the run result. |
+| `reroute` | Route elsewhere but do not retry the same run. |
+| `retry` | Retry is appropriate. |
+| `block` | Do not continue. |
+
+### `judge.reasonCode` (frozen)
+
+| Code | Meaning |
+|---|---|
+| `FINISH_UNREADABLE` | The provided finish file could not be read or parsed. |
+| `FINISH_INVALID` | The provided finish file failed V2 validation. |
+| `UNKNOWN_POLICY` | Unsupported policy name. |
+| `FINISH_NOT_FOUND` | The finish file does not exist at the provided path. |
+| `PAYLOAD_DIGEST_MISMATCH` | `payload.json` digest does not match `finish.json`. |
+| `EXECUTION_COMPLETED` | Execution-only policy accepted a completed run. |
+| `EXECUTION_FAILED` | Execution failed. |
+| `EXECUTION_TIMED_OUT` | Execution timed out. |
+| `EXECUTION_INTERNAL_ERROR` | Adapter reported an internal error. |
+| `EXECUTION_CANCELLED` | Execution was cancelled. |
+| `EXECUTION_UNKNOWN` | Unknown execution state. |
+| `OUTPUT_NOT_MACHINE` | Policy required machine output but run used text mode. |
+| `PAYLOAD_MISSING` | Policy blocked/retried because payload was missing. |
+| `PAYLOAD_MALFORMED` | Policy blocked/retried because payload was malformed. |
+| `PAYLOAD_AMBIGUOUS` | Policy blocked/retried because payload was ambiguous. |
+| `PAYLOAD_PERSIST_FAILED` | Policy blocked/retried because canonical payload write failed. |
+| `DECISION_GO_NO_DELTA` | Validated decision accepted. |
+| `DECISION_MANDATORY_DELTA` | Validated mandatory-delta decision. |
+| `DECISION_UNDETERMINED` | Validated payload abstained. |
+| `DECISION_UNAVAILABLE` | No usable decision available. |
+
+## Operations
+
+### Requirements
+
+- Python 3.10+.
+- OpenCode installed and reachable in `PATH`, or pass `--opencode <path>`.
+- `git` is optional but recommended if you want `workspace.changedFiles`, `workspace.untrackedFiles`, and `changes.patch`.
+- Windows users can call the wrapper at `scripts/opencode-subtask.cmd`; other platforms can call `python scripts/opencode_subtask.py`.
+
+### Boundary
+
+This skill is an executor plus policy judge, not a planner.
+
+- Use it to run one well-scoped subtask and record stable artifacts.
+- Use `judge` to turn a finished run into `accept|reroute|retry|block`.
+- Do not use it to decompose goals, assign expert roles, or invent acceptance criteria for a large project. Feed it a single prepared prompt instead.
+
+### Command selection
+
+| Need | Command |
+|---|---|
+| Foreground subtask with immediate terminal result | `run` |
+| Long-running review or refactor you want to poll | `start` + `status`/`wait` |
+| Stop a running job and force a terminal record | `cancel` |
+| Apply a routing policy to an existing finish artifact | `judge` |
+| Pre-warm or explicitly manage a per-project HTTP server | `ensure-server` / `stop-server` |
+| Clean old run artifacts | `prune-cache` |
+
+### Minimal commands
+
+```bash
+python scripts/opencode_subtask.py run \
+  --workdir . \
+  --engine auto \
+  --execution-profile hybrid \
+  --output-mode machine \
+  --diagnostics on-failure \
+  --permission-mode allow \
+  -- "Act as a senior software engineer. Review src/foo.py and return a machine payload."
+```
+
+```bash
+python scripts/opencode_subtask.py start --workdir . --engine auto --execution-profile checkpoint --output-mode machine -- "Act as a senior software engineer. Review the diff."
+python scripts/opencode_subtask.py status --run-id <runId>
+python scripts/opencode_subtask.py wait --run-id <runId>
+python scripts/opencode_subtask.py cancel --run-id <runId>
+python scripts/opencode_subtask.py judge --finish <artifacts-dir>/finish.json --policy require-determinate
+```
+
+### Quick start
+
+Windows wrapper from any directory:
+
+```bat
+%USERPROFILE%\.claude\skills\opencode-subtask\scripts\opencode-subtask.cmd run ^
+  --workdir C:\path\to\project ^
+  --engine auto ^
+  --execution-profile hybrid ^
+  --output-mode machine ^
+  --permission-mode allow ^
+  -- "Act as a senior software engineer. Review the diff and return a machine payload."
+```
+
+Background review with explicit wait window:
+
+```bash
+python scripts/opencode_subtask.py start --workdir . --engine auto --execution-profile checkpoint --output-mode machine --run-timeout 1800 -- \
+  "Act as a senior software engineer. Review the current patch and return GO_NO_DELTA or MANDATORY_DELTA."
+
+python scripts/opencode_subtask.py wait --run-id <runId> --wait-timeout 300
+python scripts/opencode_subtask.py judge --finish <artifacts-dir>/finish.json --policy require-go-no-delta
+```
+
+Notes:
+
+- `run` blocks until terminal state.
+- `wait` returns `opencode-subtask-finish` if the job completes inside the wait window; otherwise it returns `opencode-subtask-status` with `waitExpired=true`.
+- `judge` is the only public policy surface. Do not infer routing policy from raw `finish` fields alone.
+
+### Key flags
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--workdir` | `.` | Project root to execute in. |
+| `--engine` | `auto` | `auto` prefers HTTP when available and falls back to CLI on non-timeout failures. |
+| `--attach` | unset | Explicit server URL. |
+| `--attach-server` | `true` | Attach to or ensure a per-project server where applicable. |
+| `--model` / `--variant` | provider default | Passed through to OpenCode. |
+| `--permission-mode` | `inherit` | Use `allow` for unattended reviews; `noninteractive` auto-responds with a conservative policy. |
+| `--persona-mode` | `require` | Prompt hygiene policy. `require` rejects prompts whose literal first line is not `Act as ...` (no leading blank lines); use `prepend`, `warn`, or `off` to relax it. |
+| `--persona-line` | `Act as a senior software engineer.` | Persona line used by `--persona-mode prepend`, and a good default first line when writing prompts manually. |
+| `--execution-profile` | `hybrid` | `hybrid`: short tasks prefer HTTP; `latency`: prefer HTTP + lighter artifacts; `checkpoint`: prefer CLI + full artifacts. |
+| `--output-mode` | `machine` | `machine` expects authoritative sentinel JSON; `text` disables payload/decision extraction. |
+| `--diagnostics` | `on-failure` | `never|on-failure|always` for `diagnostics.json`. |
+| `--run-timeout` | `600` | Worker runtime timeout in seconds. |
+| `--wait-timeout` | `600` | Wait window for `wait` in seconds. |
+| `--max-artifact-bytes` | `20000000` | Hard cap across watched artifacts; breach becomes `OutputTooLarge`. |
+| `--retry-empty-output` | `true` | Retries one empty successful run when no tracked changes were made. |
+| `--continue` / `--session` | unset | CLI session reuse only; increases context bleed risk. |
+
+### Permission modes
+
+| Mode | Behavior |
+|---|---|
+| `inherit` | Leave permission handling to the surrounding OpenCode environment. |
+| `allow` | Maximize forward progress for unattended runs; HTTP auto-replies where possible and CLI uses permissive `OPENCODE_PERMISSION`. |
+| `noninteractive` | Avoid hangs on permission prompts with a conservative deterministic allow/deny preset. Prefer this over `allow` when you need unattended execution but still want some guardrails. |
+
+### Engine and profile guidance
+
+Engine selection:
+
+| Setting | Use when | Notes |
+|---|---|---|
+| `--engine auto` | Default choice for most callers | Prefers HTTP when a server is available and falls back to CLI on non-timeout HTTP failures. |
+| `--engine cli` | Isolation, session reuse, or full artifact trace matter most | No shared server state; best for long audits and reproducible transcripts. |
+| `--engine http` | You explicitly want server-backed execution | Requires a server via `--attach` or `ensure-server`; no CLI fallback on HTTP timeout. |
+
+Execution profiles:
+
+| Profile | Use when | Behavior |
+|---|---|---|
+| `hybrid` | Mixed workloads or unknown task shape | Short tasks prefer HTTP + lighter artifacts; longer/heavier tasks prefer CLI + fuller artifacts. |
+| `latency` | Quick probes, connectivity checks, or disposable asks | Bias toward HTTP and lighter artifact collection. |
+| `checkpoint` | Long-chain reviews, auditable runs, or anything you may need to resume/debug | Bias toward CLI and full artifact retention. |
+
+Guidance:
+
+- `auto` + `hybrid` is the general default.
+- `checkpoint` is the safer choice for long Opus review lanes or anything you may need to audit later.
+- `latency` is appropriate for tiny probes, not for evidence-heavy review work.
+- `auto` fallback does not occur on HTTP timeouts; if timeout sensitivity matters, set `--run-timeout` explicitly and choose `checkpoint`/`cli` when needed.
+
+### Runtime guidance
+
+- `run --run-timeout` and `start --run-timeout` are hard runtime caps for the worker.
+- `wait --wait-timeout` only caps how long the caller waits; it does not extend worker runtime.
+- The adapter does not auto-extend runtime based on heartbeats or artifact growth.
+- The empty-output guard is real: by default the adapter retries one “successful but empty” run when no tracked changes were produced.
+- Use `status.progress.idleForSeconds` together with artifact growth (`events.ndjson`, `assistant.txt`, `stderr.log`) before deciding a run is stuck.
+- `--max-artifact-bytes` is enforced by a supervisor across watched artifacts. If you see `OutputTooLarge`, either reduce output volume or raise the cap deliberately.
+
+### Session reuse
+
+Session reuse is CLI-only and trades isolation for continuity.
+
+Use it when:
+
+- You are doing a review -> fix -> verify chain on the same narrow task.
+- Later prompts need the model to remember earlier findings.
+- You want to avoid reloading the same code context repeatedly.
+
+Avoid it when:
+
+- The task should be isolated from prior model state.
+- You are running parallel subtasks.
+- You need the strongest auditability or reproducibility.
+
+Practical rules:
+
+- Prefer `--session <id>` when you want explicit control.
+- Use `--continue` only for short local chains where “last session” ambiguity is acceptable.
+- In V2 `sessionId` lives under `finish.execution.sessionId`, not at the top level.
+
+### Utility commands
+
+```bash
+python scripts/opencode_subtask.py ensure-server --workdir .
+python scripts/opencode_subtask.py stop-server --workdir .
+python scripts/opencode_subtask.py prune-cache --keep-last 200
+python scripts/opencode_subtask.py prune-cache --keep-last 200 --apply
+```
+
+Use these when:
+
+- `ensure-server`: you want a per-project HTTP server running before a batch of HTTP or `auto` tasks.
+- `stop-server`: you want to explicitly tear down the per-project server and clear its in-memory session state.
+- `prune-cache`: you want to inspect or reclaim old artifacts. It is dry-run by default; add `--apply` to delete.
+
+### `judge` policies
+
+| Policy | Accepts | Other outcomes |
+|---|---|---|
+| `execution-only` | `outcome=completed` | `retry` on `failed/timed_out/internal_error`; `block` on `cancelled` |
+| `require-determinate` | validated `GO_NO_DELTA` | `reroute` on `MANDATORY_DELTA` or `UNDETERMINED`; `retry` on invalid payload/execution failure; `block` on text output or cancel |
+| `require-go-no-delta` | validated `GO_NO_DELTA` | `block` on `MANDATORY_DELTA`, `UNDETERMINED`, text output, or cancel; `retry` on invalid payload/execution failure |
+
+### Exit codes
+
+#### `run` and terminal `wait`
+
+| Outcome | Exit code |
+|---|---|
+| `completed` | `0` |
+| `failed` | `3` |
+| `timed_out` | `124` |
+| `cancelled` | `130` |
+| `internal_error` | `1` |
+
+If `finish.json` cannot be written, stdout is `opencode-subtask-error` with `error.name="FinishWriteFailed"` and the process exits `1`.
+
+#### `judge`
+
+| Verdict | Exit code |
+|---|---|
+| `accept` | `0` |
+| `reroute` | `10` |
+| `retry` | `11` |
+| `block` | `12` |
+
+## Practical Notes
+
+- Prompt hygiene is enforced by default. `--persona-mode require` rejects prompts unless the literal first line is a persona such as `Act as a senior software engineer.` Leading blank lines are not tolerated. Use `--persona-mode off` only if you explicitly want to disable that guard.
+- `start` always creates `wrapper.log` as an internal background-worker log artifact. It is not a public policy input.
+- `status`, `wait`, `cancel`, and `judge` only trust strict V2 `finish.json`. Invalid finish files are quarantined and ignored by lifecycle commands.
+- `auto` engine fallback does not occur on HTTP timeouts.
+- Provider/runtime failures should surface as classified execution errors, not protocol redesign. Treat Gemini instability as an operations risk unless the adapter is misclassifying it.
+- `--env KEY=VALUE` values are visible in process arguments. Use `--env-file KEY=PATH` for secrets.
+- If you attach WIP files or diffs for review, attach them explicitly; do not assume a clean review worktree can see uncommitted local files.
+
+### Troubleshooting
 
 | Symptom | Check |
-|---------|-------|
-| `ok=false`, `error.name=ServerUnhealthy` | Server not running/healthy. If you want HTTP, run `ensure-server` (or pass `--attach`). Otherwise use CLI (`--engine cli`). |
-| `ok=false`, `error.name=OpencodeNotFound` | OpenCode not installed or not in PATH. Install OpenCode or use `--opencode <path>` to specify the executable path. |
-| `ok=false`, `error.name=MissingPrompt` | No prompt provided. Pass prompt after `--` or use `--prompt` / `--prompt-file`. Exit code 2. |
-| `ok=false`, `error.name=PromptConflict` | Multiple prompt sources were provided. Use exactly one of: positional args after `--`, `--prompt`, or `--prompt-file`. Exit code 2. |
-| `ok=false`, `error.name=BadRunId` | The `--run-id` value contains invalid characters (path separators, `..`, spaces, semicolons, etc.) or resolves outside the runs directory. Fix the run-id string. Exit code 2. |
-| `ok=false`, `error.name=BadArgs` | A CLI argument is malformed (e.g. `--env` value missing `=` separator). Fix the argument syntax. Exit code 2. |
-| `ok=false`, `error.name=PromptFileReadError` | The file specified by `--prompt-file` could not be read (missing, permission denied, etc.). Check the path and permissions. Exit code 2. |
-| `ok=false`, `error.name=PersonaMissing` | `--persona-mode require` is active but the prompt does not start with a persona line (`Act as a ...`). Add a persona line as the first line, or use `--persona-mode prepend` / `off`. Exit code 2. |
-| `ok=false`, `error.name=BadPersonaMode` | An unrecognized `--persona-mode` value was provided. Valid values: `off`, `require`, `prepend`, `warn`. Exit code 2. |
-| `ok=false`, `error.name=BadConfig` | An environment-variable configuration value has an invalid format (e.g. a non-numeric string where a float/int is expected). Fix the env var value. Exit code 2. |
-| `ok=false`, `error.name=MissingRunId` | `status`/`wait`/`cancel` requires `--run-id` or `--artifacts-dir`. Exit code 2. |
-| `ok=false`, `error.name=JobNotFound` | The specified run-id/artifacts-dir doesn't have a `job.json`. The job may not have started. |
-| `ok=false`, `error.name=WorkerNotRunning` | Background worker process not running and `finish.json` missing. The job may have crashed. Check `wrapper.log` and `stderr.log`. |
-| A `opencode serve` / Node console window pops up | You are starting/ensuring a server (`ensure-server` or `--engine http`). Use CLI-only mode (`--engine cli` or `--engine auto --no-attach-server`) to avoid starting a server. |
-| `ok=false`, `error.name=SseUnavailable` | SSE endpoint blocked; try `--engine cli` |
-| `ok=false`, `error.name=Timeout` or `WaitTimeout` | Increase `--run-timeout` / `--wait-timeout` (or legacy `--timeout`); check model complexity |
-| `opus-4.6` reviews often timeout before completion | This adapter uses hard runtime timeout; increase `run/start --run-timeout` (commonly 1200-1800s). `wait --wait-timeout` does not extend worker runtime. |
-| `ok=false`, `error.name=EmptyModelOutput` | Model returned an empty successful response. Retry manually, or tune `--retry-empty-output` / `--empty-output-retries`. |
-| `ok=false`, `error.name=OutputTooLarge` | Reduce output or increase `--max-artifact-bytes` |
-| `ok=false`, `error.name=FinishWriteFailed` | `finish.json` could not be written to disk (permissions, disk full, etc.). The stdout JSON is degraded to `ok=false`. Check disk space and directory permissions for the artifacts dir. |
-| `ok=false`, `error.name=CancelFinishWriteFailed` | `cancel` attempted to terminate the subtask but could not persist `finish.json` to disk (the process may or may not have been killed — e.g. `pid<=0` takes a no-signal path). Subsequent `wait`/`status` may not see a terminal state. Check disk space and artifacts dir permissions. |
-| `cancel` returns `alreadyFinished=true` | The job already has a valid `finish.json`. Cancel is a no-op — no PID kill, no state overwrite. This is normal for finally-cleanup patterns. |
-| `progress.idleForSeconds` keeps growing | Model stuck; check `stderr.log` for retry loops |
+|---|---|
+| `opencode-subtask-error` with `MissingPrompt` / `PromptConflict` / `PromptFileReadError` | Fix prompt input shape: use exactly one of positional prompt, `--prompt`, or `--prompt-file`. |
+| `PersonaMissing` | The literal first line was not `Act as ...`. Remove leading blank lines or switch to `--persona-mode prepend` / `off`. |
+| `wait` returns status instead of finish | The wait window expired. Inspect `waitExpired`, then keep polling with `status`/`wait` or `cancel` if the run is no longer making progress. |
+| `payload.status` is `missing`, `malformed`, or `ambiguous` | Check `diagnostics.json`, `assistant.txt`, and the contract prompt; the run did not produce a usable authoritative machine payload. |
+| `judge` returns `FINISH_INVALID` / `FINISH_UNREADABLE` | The provided `finish.json` is not a valid V2 terminal envelope. Use the lifecycle commands to regenerate or quarantine it instead of hand-editing. |
+| `execution.error.name=OutputTooLarge` | Lower output volume or increase `--max-artifact-bytes`. |
+| `status.progress.idleForSeconds` keeps growing and artifacts stop changing | Treat it as a stuck run candidate. Confirm lack of growth in `assistant.txt`, `events.ndjson`, and `stderr.log`, then `cancel`. |
+| HTTP runs keep failing before useful work starts | Try `--engine cli` or `--execution-profile checkpoint`, or pre-warm with `ensure-server` and inspect server health separately. |
