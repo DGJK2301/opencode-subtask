@@ -618,6 +618,29 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         self.assertFalse((artifacts_dir / "payload.json").exists())
         self.assertFalse((artifacts_dir / "diagnostics.json").exists())
 
+    def test_run_text_mode_failure_emits_diagnostics(self) -> None:
+        timeout_outcome = self._mod.RunOutcome(
+            ok=False,
+            exit_code=124,
+            timed_out=True,
+            engine="cli",
+            fallback_from=None,
+            session_id=None,
+            full_text="",
+            metrics=None,
+            error={"name": "Timeout", "message": "timed out"},
+        )
+        rc, out, artifacts_dir = self._mocked_run(
+            text="",
+            output_mode="text",
+            nonce=None,
+            run_outcome=timeout_outcome,
+        )
+        self.assertEqual(rc, 124)
+        self.assertEqual(out["outputMode"], "text")
+        self.assertEqual(out["outcome"], "timed_out")
+        self.assertTrue((artifacts_dir / "diagnostics.json").exists())
+
     def test_run_timeout_maps_exit_code_from_execution_outcome(self) -> None:
         timeout_outcome = self._mod.RunOutcome(
             ok=False,

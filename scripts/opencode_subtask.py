@@ -3252,6 +3252,7 @@ def _maybe_write_diagnostics(
     diagnostics_path: Path,
     run_id: str,
     output_mode: str,
+    execution_failed: bool,
     extraction: MachinePayloadExtraction,
 ) -> Path | None:
     mode_n = _normalize_diagnostics_mode(mode)
@@ -3262,7 +3263,7 @@ def _maybe_write_diagnostics(
         else extraction.payload_status != "validated"
     )
     should_write = mode_n == "always" or (
-        mode_n == "on-failure" and extraction_failed
+        mode_n == "on-failure" and (execution_failed or extraction_failed)
     )
     if not should_write:
         return None
@@ -4618,12 +4619,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
 
     diagnostics_written_path: Path | None = None
+    execution_error = outcome.error
+    outcome_name = _execution_outcome_from_error(
+        exit_code=outcome.exit_code,
+        timed_out=outcome.timed_out,
+        error=execution_error,
+    )
     try:
         diagnostics_written_path = _maybe_write_diagnostics(
             mode=diagnostics_mode,
             diagnostics_path=diagnostics_path,
             run_id=run_id,
             output_mode=output_mode_n,
+            execution_failed=(outcome_name != "completed"),
             extraction=extraction,
         )
     except Exception:
@@ -4653,13 +4661,6 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "model completed without assistant output or workspace changes",
             )
         )
-
-    execution_error = outcome.error
-    outcome_name = _execution_outcome_from_error(
-        exit_code=outcome.exit_code,
-        timed_out=outcome.timed_out,
-        error=execution_error,
-    )
 
     out = _finish_obj(
         run_id=run_id,
