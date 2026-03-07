@@ -4741,12 +4741,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
     )
     if (not finish_written) and isinstance(existing_finish, dict):
-        err = _error_obj(
-            error_name="FinishAlreadyPresent",
-            message=_finish_already_present_message(finish_path),
-        )
-        sys.stdout.write(_json_line(err) + "\n")
-        return 1
+        out = existing_finish
     elif (not finish_written) and existing_finish is None:
         err = _error_obj(
             error_name="FinishWriteFailed",
