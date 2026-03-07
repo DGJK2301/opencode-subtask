@@ -177,11 +177,24 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         fake_dir = self._mktempdir("ocsubtask_fake_opencode_")
         script_path = fake_dir / "fake_opencode_impl.py"
         script_path.write_text(script_body, encoding="utf-8")
-        wrapper_path = fake_dir / "fake-opencode.cmd"
-        wrapper_path.write_text(
-            '@echo off\r\n"%s" "%%~dp0fake_opencode_impl.py" %%*\r\n' % sys.executable,
-            encoding="utf-8",
-        )
+        if os.name == "nt":
+            wrapper_path = fake_dir / "fake-opencode.cmd"
+            wrapper_path.write_text(
+                '@echo off\r\n"%s" "%%~dp0fake_opencode_impl.py" %%*\r\n'
+                % sys.executable,
+                encoding="utf-8",
+            )
+        else:
+            wrapper_path = fake_dir / "fake-opencode"
+            wrapper_path.write_text(
+                "#!/bin/sh\n"
+                'exec "%s" "$0.impl.py" "$@"\n' % sys.executable,
+                encoding="utf-8",
+            )
+            impl_link = fake_dir / "fake-opencode.impl.py"
+            impl_link.write_text(script_body, encoding="utf-8")
+            wrapper_path.chmod(0o755)
+            return wrapper_path
         return wrapper_path
 
     def _mocked_run(
@@ -912,6 +925,36 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         }
         (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
         (artifacts_dir / "finish.json").write_text("{}", encoding="utf-8")
+        proc = self._run_cli_command("status", "--artifacts-dir", str(artifacts_dir))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["type"], "opencode-subtask-status")
+        self.assertEqual(out["status"], "running")
+        warning_names = {item["name"] for item in out["warnings"]}
+        self.assertIn("FinishInvalidQuarantined", warning_names)
+        self.assertFalse((artifacts_dir / "finish.json").exists())
+        self.assertTrue(list(artifacts_dir.glob("finish.invalid.*.json")))
+
+    def test_status_quarantines_legacy_v1_finish_and_continues(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_status_legacy_")
+        now_ms = self._mod._now_ms()
+        job = {
+            "runId": "status-legacy",
+            "workdir": str(REPO_ROOT),
+            "state": "running",
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
+        }
+        legacy_finish = {
+            "type": "opencode-subtask-finish",
+            "schemaVersion": 1,
+            "ok": True,
+            "runId": "status-legacy",
+        }
+        (artifacts_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+        (artifacts_dir / "finish.json").write_text(
+            json.dumps(legacy_finish), encoding="utf-8"
+        )
         proc = self._run_cli_command("status", "--artifacts-dir", str(artifacts_dir))
         self.assertEqual(proc.returncode, 0, proc.stdout)
         out = json.loads(proc.stdout)

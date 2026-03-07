@@ -1999,6 +1999,8 @@ def _validate_finish_envelope(obj: Any) -> str | None:
         return "root must be an object"
     if obj.get("type") != "opencode-subtask-finish":
         return "type must be opencode-subtask-finish"
+    # V2 is a deliberate schema break. Lifecycle commands only trust strict V2
+    # finish envelopes and quarantine anything older or malformed.
     if obj.get("schemaVersion") != ADAPTER_SCHEMA_VERSION:
         return f"schemaVersion must be {ADAPTER_SCHEMA_VERSION}"
 
