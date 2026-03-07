@@ -3634,8 +3634,19 @@ def _run_cli(
         assistant_fp.close()
     stderr_fp.close()
 
+    breached_after_exit = supervisor.breached_path or _first_breached_artifact_path(
+        watched_artifact_paths, max_artifact_bytes
+    )
+    if breached_after_exit is not None:
+        killed_for_size = True
+        killed_file = breached_after_exit.name
+
     exit_code = proc.returncode if proc.returncode is not None else 1
     full_text = tail.get()
+    if killed_for_size:
+        # Oversized artifacts are an execution failure; do not let a retained
+        # text tail produce an authoritative payload on the CLI path only.
+        full_text = ""
 
     ok = (
         (not timed_out)
@@ -4626,8 +4637,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             outcome.ok = False
         break
 
+    full_text_for_extraction = outcome.full_text
+    if isinstance(outcome.error, dict) and outcome.error.get("name") == "OutputTooLarge":
+        full_text_for_extraction = ""
+
     extraction = _extract_machine_payload(
-        text=outcome.full_text,
+        text=full_text_for_extraction,
         nonce=contract_nonce,
         output_mode=output_mode_n,
     )

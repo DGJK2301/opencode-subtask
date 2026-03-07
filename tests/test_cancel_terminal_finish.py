@@ -1294,6 +1294,85 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         self.assertEqual(outcome.error["name"], "OutputTooLarge")
         self.assertIn("stderr.log", outcome.error["message"])
 
+    def test_run_cli_stderr_burst_exit_still_hits_artifact_cap(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_cli_cap_stderr_burst_")
+        fake_opencode = self._make_fake_opencode(
+            "import sys\n"
+            "sys.stderr.write('x' * 8192)\n"
+            "sys.stderr.flush()\n"
+        )
+        prompt_path = artifacts_dir / "prompt.txt"
+        prompt_path.write_text("prompt", encoding="utf-8")
+        outcome = self._mod._run_cli(
+            opencode_bin=str(fake_opencode),
+            workdir=artifacts_dir,
+            env=os.environ.copy(),
+            attach_url=None,
+            prompt_path=prompt_path,
+            continue_last=False,
+            session_id=None,
+            title=None,
+            agent=None,
+            model=None,
+            variant=None,
+            files=[],
+            timeout_s=10.0,
+            quiet=True,
+            save_events=True,
+            save_text=True,
+            max_artifact_bytes=1024,
+            events_path=artifacts_dir / "events.ndjson",
+            stderr_path=artifacts_dir / "stderr.log",
+            assistant_path=artifacts_dir / "assistant.txt",
+            on_session_id=None,
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(outcome.error["name"], "OutputTooLarge")
+        self.assertIn("stderr.log", outcome.error["message"])
+
+    def test_run_cli_output_too_large_clears_full_text(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_cli_cap_payload_clear_")
+        nonce = "nonce-cli-too-large"
+        payload_text = self._build_payload_text(nonce=nonce, decision="GO_NO_DELTA")
+        fake_opencode = self._make_fake_opencode(
+            "import json, sys, time\n"
+            f"payload = {payload_text!r}\n"
+            "sys.stdout.write(json.dumps({'type': 'message', 'text': payload}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(0.05)\n"
+            "sys.stderr.write('x' * 8192)\n"
+            "sys.stderr.flush()\n"
+        )
+        prompt_path = artifacts_dir / "prompt.txt"
+        prompt_path.write_text("prompt", encoding="utf-8")
+        outcome = self._mod._run_cli(
+            opencode_bin=str(fake_opencode),
+            workdir=artifacts_dir,
+            env=os.environ.copy(),
+            attach_url=None,
+            prompt_path=prompt_path,
+            continue_last=False,
+            session_id=None,
+            title=None,
+            agent=None,
+            model=None,
+            variant=None,
+            files=[],
+            timeout_s=10.0,
+            quiet=True,
+            save_events=True,
+            save_text=True,
+            max_artifact_bytes=1024,
+            events_path=artifacts_dir / "events.ndjson",
+            stderr_path=artifacts_dir / "stderr.log",
+            assistant_path=artifacts_dir / "assistant.txt",
+            on_session_id=None,
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error["name"], "OutputTooLarge")
+        self.assertEqual(outcome.full_text, "")
+
     def test_run_cli_event_output_hits_artifact_cap(self) -> None:
         artifacts_dir = self._mktempdir("ocsubtask_v2_cli_cap_events_")
         fake_opencode = self._make_fake_opencode(
@@ -1581,6 +1660,58 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         out = json.loads(buf.getvalue().strip())
         self.assertEqual(out["type"], "opencode-subtask-error")
         self.assertEqual(out["error"]["name"], "FinishWriteFailed")
+
+    def test_run_output_too_large_does_not_extract_machine_payload(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_run_output_too_large_")
+        args = self._build_run_args(
+            artifacts_dir=artifacts_dir,
+            run_id="run-output-too-large",
+            output_mode="machine",
+            nonce="nonce-output-too-large",
+        )
+        outcome = self._mod.RunOutcome(
+            ok=False,
+            exit_code=0,
+            timed_out=False,
+            engine="cli",
+            fallback_from=None,
+            session_id="ses_output_too_large",
+            full_text=self._build_payload_text(
+                nonce="nonce-output-too-large",
+                decision="GO_NO_DELTA",
+            ),
+            metrics=None,
+            error={
+                "name": "OutputTooLarge",
+                "message": "artifact assistant.txt exceeded max-artifact-bytes=1024",
+            },
+        )
+        buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(
+                self._mod,
+                "_resolve_executable_for_workdir",
+                return_value="__dummy_opencode__",
+            ),
+            unittest.mock.patch.object(
+                self._mod,
+                "_apply_execution_profile",
+                side_effect=lambda args, prompt, env: {"profile": args.execution_profile},
+            ),
+            unittest.mock.patch.object(self._mod, "_run_cli", return_value=outcome),
+            unittest.mock.patch.object(self._mod, "_git_status", return_value=([], [])),
+            unittest.mock.patch.object(self._mod, "_git_patch", return_value=None),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = self._mod.cmd_run(args)
+        self.assertEqual(rc, 3)
+        out = json.loads(buf.getvalue().strip())
+        self.assertEqual(out["type"], "opencode-subtask-finish")
+        self.assertEqual(out["outcome"], "failed")
+        self.assertEqual(out["execution"]["error"]["name"], "OutputTooLarge")
+        self.assertEqual(out["payload"]["status"], "missing")
+        self.assertIsNone(out["payload"]["artifact"]["path"])
+        self.assertEqual(out["decision"]["status"], "unavailable")
 
     def test_run_rejects_preexisting_valid_finish(self) -> None:
         artifacts_dir = self._mktempdir("ocsubtask_v2_run_existing_finish_")
