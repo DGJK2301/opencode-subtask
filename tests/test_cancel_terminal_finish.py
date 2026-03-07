@@ -1410,6 +1410,58 @@ class TestOpencodeSubtaskV2(unittest.TestCase):
         self.assertEqual(outcome.error["name"], "OutputTooLarge")
         self.assertIn("events.ndjson", outcome.error["message"])
 
+    def test_run_http_assistant_output_hits_artifact_cap_after_sync_response(self) -> None:
+        artifacts_dir = self._mktempdir("ocsubtask_v2_http_cap_assistant_")
+
+        class _FakeHttpClient:
+            def __init__(self, server_url, auth=None, timeout_s=10.0) -> None:
+                return None
+
+            def health(self) -> dict:
+                return {"healthy": True}
+
+            def create_session(self) -> dict:
+                return {"id": "ses_http_text"}
+
+            def open_sse(self, path, timeout_s=2.0):
+                raise RuntimeError("SSE intentionally unavailable for direct-response path")
+
+            def abort(self, session_id: str) -> None:
+                return None
+
+            def reply_permission(
+                self, session_id: str, permission_id: str, response: str, remember: bool
+            ) -> None:
+                return None
+
+            def send_message_sync(
+                self, session_id: str, prompt: str, model, variant, agent, timeout_s: float
+            ) -> dict:
+                return {"parts": [{"type": "text", "text": "q" * 2048}]}
+
+        with unittest.mock.patch.object(self._mod, "OpencodeHttpClient", _FakeHttpClient):
+            outcome = self._mod._run_http(
+                server_url="http://127.0.0.1:8765",
+                workdir=artifacts_dir,
+                env=os.environ.copy(),
+                prompt="Act as a senior software engineer.",
+                agent=None,
+                model=None,
+                variant=None,
+                timeout_s=10.0,
+                save_events=False,
+                save_text=True,
+                max_artifact_bytes=1024,
+                events_path=None,
+                stderr_path=artifacts_dir / "stderr.log",
+                assistant_path=artifacts_dir / "assistant.txt",
+                permission_mode="inherit",
+                on_session_id=None,
+            )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error["name"], "OutputTooLarge")
+        self.assertIn("assistant.txt", outcome.error["message"])
+
     def test_run_http_preexisting_artifact_breach_aborts_created_session(self) -> None:
         artifacts_dir = self._mktempdir("ocsubtask_v2_http_cap_race_")
         stderr_path = artifacts_dir / "stderr.log"
