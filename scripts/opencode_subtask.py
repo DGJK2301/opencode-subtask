@@ -3,9 +3,10 @@
 opencode_subtask.py
 
 A Codex-friendly adapter around OpenCode that provides:
-- Stable one-line JSON output (ASCII-only) with schemaVersion.
-- Artifacts-first logging (events/stderr/assistant/payload/patch) to avoid caller context bloat.
-- Job semantics: start -> wait (background) and run (foreground).
+- A natural child-agent call: ask -> final assistant text on stdout.
+- Control-plane JSON for local lifecycle commands.
+- Artifacts-first logging (events/stderr/assistant/patch) to avoid caller context bloat.
+- Job semantics: start -> wait (background) and run (foreground lifecycle record).
 - Engine abstraction: HTTP server API preferred; CLI fallback.
 
 Python: 3.10+
@@ -16,11 +17,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
-import secrets
 import shlex
 import signal
 import socket
@@ -29,6 +31,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,8 +42,8 @@ from typing import Any, Final, Iterable, NoReturn
 # Constants / schema
 # ============================
 
-ADAPTER_SCHEMA_VERSION: Final[int] = 2
-ADAPTER_VERSION: Final[str] = "0.6.0"
+ADAPTER_SCHEMA_VERSION: Final[int] = 3
+ADAPTER_VERSION: Final[str] = "0.11.0"
 
 DEFAULT_TIMEOUT_S: Final[float] = 600.0
 DEFAULT_GIT_TIMEOUT_S: Final[float] = 20.0
@@ -63,15 +66,81 @@ ORPHAN_REAPER_SCAN_LIMIT: Final[int] = 0
 # 0 means "no hard cap"
 DEFAULT_MAX_ARTIFACT_BYTES: Final[int] = 20_000_000
 
+# Parent-agent hygiene: keep child final reports useful but compact.
+# The full assistant text remains in assistant.txt; ask stdout can be capped to
+# protect the caller's context window from accidental log/diff dumps.
+DEFAULT_FINAL_ANSWER_BUDGET_CHARS: Final[int] = 1600
+DEFAULT_ASK_STDOUT_MAX_CHARS: Final[int] = 12_000
+DEFAULT_CLI_PROMPT_TRANSPORT: Final[str] = "stdin"
+
+# External task runtime: stable caller-facing task ids, compact continuation
+# memory, and progress notification files.  These are adapter-side equivalents
+# of OpenCode Task tool handles/background notifications, not model contracts.
+DEFAULT_TASK_MEMORY_MAX_CHARS: Final[int] = 2400
+DEFAULT_WATCH_PROGRESS_INTERVAL_S: Final[float] = 5.0
+
+# Adapter-level child-agent roles.  These mirror OpenCode Task-tool ergonomics
+# (subagent_type + focused permission envelope) while still launching the
+# OpenCode main agent as an external child process/session for Codex/Claude.
+DEFAULT_SUBTASK_TYPE: Final[str] = "general"
+SUBTASK_TYPES: Final[set[str]] = {
+    "general",
+    "worker",
+    "fast-worker",
+    "thinker",
+    "explore",
+    "scout",
+}
+SUBTASK_TYPE_ALIASES: Final[dict[str, str]] = {
+    "fast_worker": "fast-worker",
+    "fastworker": "fast-worker",
+    "fast": "fast-worker",
+    "research": "explore",
+    "review": "thinker",
+}
+SUBTASK_TYPE_PRESETS: Final[dict[str, dict[str, Any]]] = {
+    "general": {
+        "agent": None,
+        "executionProfile": None,
+        "brief": "general-purpose external child agent",
+        "readOnly": False,
+    },
+    "worker": {
+        "agent": "build",
+        "executionProfile": "checkpoint",
+        "brief": "workspace-changing implementation child",
+        "readOnly": False,
+    },
+    "fast-worker": {
+        "agent": "build",
+        "executionProfile": "latency",
+        "brief": "small low-latency implementation child",
+        "readOnly": False,
+    },
+    "thinker": {
+        "agent": "plan",
+        "executionProfile": "checkpoint",
+        "brief": "read-only analysis/planning child",
+        "readOnly": True,
+    },
+    "explore": {
+        "agent": "plan",
+        "executionProfile": "latency",
+        "brief": "fast read-only codebase exploration child",
+        "readOnly": True,
+    },
+    "scout": {
+        "agent": "plan",
+        "executionProfile": "latency",
+        "brief": "read-only docs/dependency research child",
+        "readOnly": True,
+    },
+}
+
 DEFAULT_SERVER_HOSTNAME: Final[str] = "127.0.0.1"
 DEFAULT_SERVER_PORT: Final[int] = 0  # 0 => pick a free port
 DEFAULT_SERVER_WAIT_S: Final[float] = 10.0
 
-SENTINEL_BEGIN: Final[str] = "BEGIN_OC_SUBTASK_JSON"
-SENTINEL_END: Final[str] = "END_OC_SUBTASK_JSON"
-PAYLOAD_PROTOCOL: Final[str] = "opencode-subtask-payload-v2"
-OUTPUT_MODES: Final[set[str]] = {"machine", "text"}
-DIAGNOSTICS_MODES: Final[set[str]] = {"never", "on-failure", "always"}
 FINISH_OUTCOMES: Final[set[str]] = {
     "completed",
     "failed",
@@ -79,21 +148,6 @@ FINISH_OUTCOMES: Final[set[str]] = {
     "cancelled",
     "internal_error",
 }
-PAYLOAD_STATUSES: Final[set[str]] = {
-    "validated",
-    "not_requested",
-    "missing",
-    "malformed",
-    "ambiguous",
-    "persist_failed",
-}
-DECISION_STATUSES: Final[set[str]] = {
-    "determinate",
-    "abstained",
-    "unavailable",
-    "not_requested",
-}
-DECISION_ROUTES: Final[set[str]] = {"GO_NO_DELTA", "MANDATORY_DELTA"}
 EXECUTION_PROFILES: Final[set[str]] = {"hybrid", "latency", "checkpoint"}
 EXECUTION_ENGINE_SELECTED_VALUES: Final[set[str]] = {
     "cli",
@@ -103,67 +157,6 @@ EXECUTION_ENGINE_SELECTED_VALUES: Final[set[str]] = {
     "cancel",
 }
 EXECUTION_ENGINE_FALLBACK_VALUES: Final[set[str]] = {"http"}
-PAYLOAD_DECISIONS: Final[set[str]] = DECISION_ROUTES | {"UNDETERMINED"}
-PAYLOAD_ERROR_CODES: Final[set[str]] = {
-    "PAYLOAD_MISSING",
-    "SENTINEL_MULTIPLE",
-    "SENTINEL_TRAILING_TEXT",
-    "NONCE_MISMATCH",
-    "PAYLOAD_JSON_INVALID",
-    "PAYLOAD_SCHEMA_INVALID",
-    "DECISION_INVALID",
-    "PAYLOAD_PERSIST_FAILED",
-}
-JUDGE_POLICIES: Final[set[str]] = {
-    "execution-only",
-    "require-determinate",
-    "require-go-no-delta",
-}
-JUDGE_REASON: Final[dict[str, str]] = {
-    "finish_not_found": "FINISH_NOT_FOUND",
-    "finish_unreadable": "FINISH_UNREADABLE",
-    "finish_invalid": "FINISH_INVALID",
-    "unknown_policy": "UNKNOWN_POLICY",
-    "payload_digest_mismatch": "PAYLOAD_DIGEST_MISMATCH",
-    "execution_completed": "EXECUTION_COMPLETED",
-    "execution_failed": "EXECUTION_FAILED",
-    "execution_timed_out": "EXECUTION_TIMED_OUT",
-    "execution_internal_error": "EXECUTION_INTERNAL_ERROR",
-    "execution_cancelled": "EXECUTION_CANCELLED",
-    "execution_unknown": "EXECUTION_UNKNOWN",
-    "output_not_machine": "OUTPUT_NOT_MACHINE",
-    "payload_missing": "PAYLOAD_MISSING",
-    "payload_malformed": "PAYLOAD_MALFORMED",
-    "payload_ambiguous": "PAYLOAD_AMBIGUOUS",
-    "payload_persist_failed": "PAYLOAD_PERSIST_FAILED",
-    "decision_go_no_delta": "DECISION_GO_NO_DELTA",
-    "decision_mandatory_delta": "DECISION_MANDATORY_DELTA",
-    "decision_undetermined": "DECISION_UNDETERMINED",
-    "decision_unavailable": "DECISION_UNAVAILABLE",
-}
-JUDGE_EXECUTION_REASON_BY_OUTCOME: Final[dict[str, str]] = {
-    "completed": JUDGE_REASON["execution_completed"],
-    "failed": JUDGE_REASON["execution_failed"],
-    "timed_out": JUDGE_REASON["execution_timed_out"],
-    "internal_error": JUDGE_REASON["execution_internal_error"],
-    "cancelled": JUDGE_REASON["execution_cancelled"],
-}
-JUDGE_PAYLOAD_REASON_BY_STATUS: Final[dict[str, str]] = {
-    "missing": JUDGE_REASON["payload_missing"],
-    "malformed": JUDGE_REASON["payload_malformed"],
-    "ambiguous": JUDGE_REASON["payload_ambiguous"],
-    "persist_failed": JUDGE_REASON["payload_persist_failed"],
-}
-GENERIC_SENTINEL_BEGIN_RE: Final[re.Pattern[str]] = re.compile(
-    rf"{re.escape(SENTINEL_BEGIN)}_([A-Za-z0-9._-]+)"
-)
-GENERIC_SENTINEL_END_RE: Final[re.Pattern[str]] = re.compile(
-    rf"{re.escape(SENTINEL_END)}_([A-Za-z0-9._-]+)"
-)
-
-JSON_FENCE_RE: Final[re.Pattern[str]] = re.compile(
-    r"```(?:json)?\s*({[\s\S]*?})\s*```", re.IGNORECASE
-)
 
 # ============================
 # Small utilities
@@ -179,17 +172,8 @@ def _json_line(obj: dict[str, Any]) -> str:
     return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
 
 
-def _normalize_observed_sentinel_nonce(value: str) -> str:
-    # Review models sometimes echo marker instructions inline and attach sentence
-    # punctuation to the nonce token. Treat that punctuation as non-semantic when
-    # diagnosing marker collisions.
-    normalized = str(value).rstrip("`'\".,:;!?)]}")
-    # Markdown separators like END...--- should not be treated as a distinct nonce.
-    return re.sub(r"-{3,}$", "", normalized)
-
-
 def _exit_with_error(error_name: str, message: str, exit_code: int = 1) -> NoReturn:
-    """Print a JSON error to stdout and exit. Maintains stdout contract."""
+    """Print a control-plane JSON error to stdout and exit."""
     obj = _error_obj(error_name=error_name, message=message)
     sys.stdout.write(_json_line(obj) + "\n")
     sys.exit(exit_code)
@@ -218,7 +202,7 @@ def _finish_already_present_message(finish_path: Path) -> str:
 
 class _JsonArgumentParser(argparse.ArgumentParser):
     """
-    ArgumentParser that preserves adapter stdout JSON contract on CLI parse errors.
+    ArgumentParser that preserves lifecycle stdout JSON on CLI parse errors.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -319,6 +303,326 @@ def _apply_persona_policy(prompt: str, persona_mode: str, persona_line: str) -> 
     )
     return prompt  # unreachable
 
+
+
+def _apply_subagent_briefing(
+    prompt: str,
+    *,
+    enabled: bool,
+    final_answer_budget_chars: int,
+) -> str:
+    """Append a small natural-language child-agent briefing.
+
+    This is deliberately NOT a model-output protocol.  It is a boundary hint:
+    do real work in the workspace, keep the parent-facing report compact, and
+    avoid dumping large diffs/logs into the parent context.  The caller can
+    disable it for tasks that truly require a long final answer.
+    """
+    if not enabled:
+        return prompt
+    if "Parent-agent boundary:" in (prompt or ""):
+        return prompt
+    try:
+        budget = int(final_answer_budget_chars)
+    except Exception:
+        budget = DEFAULT_FINAL_ANSWER_BUDGET_CHARS
+    if budget < 0:
+        budget = 0
+    budget_line = (
+        f" Keep the final answer under about {budget} characters unless the parent explicitly requested a longer artifact."
+        if budget > 0
+        else " Keep the final answer compact unless the parent explicitly requested a long artifact."
+    )
+    footer = (
+        "\n\nParent-agent boundary:\n"
+        "- Execute the task directly in the workspace when edits/tests are requested; do not turn implementation work into a planning-only reply.\n"
+        "- Do not ask clarification questions unless the task is impossible or unsafe; make a reasonable engineering assumption and state it briefly.\n"
+        "- Final answer: report outcome, changed files, verification commands/results, and blockers only."
+        + budget_line
+        + "\n- Do not paste full diffs, large logs, or long code blocks unless explicitly requested; those details belong in files/artifacts.\n"
+        "- No adapter JSON is required.\n"
+    )
+    return (prompt or "").rstrip() + footer
+
+
+
+def _normalize_subtask_type(raw: str | None) -> str:
+    value = str(raw or DEFAULT_SUBTASK_TYPE).strip().lower()
+    value = SUBTASK_TYPE_ALIASES.get(value, value)
+    if value not in SUBTASK_TYPES:
+        _exit_with_error(
+            "BadConfig",
+            "--subtask-type must be one of: " + ", ".join(sorted(SUBTASK_TYPES)),
+            exit_code=2,
+        )
+    return value
+
+
+def _subtask_default_permission_rules(
+    subtask_type: str,
+    *,
+    allow_nested_subtasks: bool = False,
+    allow_child_todos: bool = False,
+) -> list[dict[str, str]]:
+    """Return adapter-level child-session permission rules.
+
+    Implementation-capable external children should keep the full OpenCode
+    permission surface by default; they need it to complete edits/tests.  Only
+    read-only presets get adapter deny rules, matching their role contract.
+    """
+    t = _normalize_subtask_type(subtask_type)
+    rules: list[dict[str, str]] = []
+    if not bool(SUBTASK_TYPE_PRESETS[t].get("readOnly")):
+        return rules
+    if not allow_child_todos:
+        rules.append({"permission": "todowrite", "action": "deny", "pattern": "*"})
+    if not allow_nested_subtasks:
+        rules.append({"permission": "task", "action": "deny", "pattern": "*"})
+    rules.extend(
+        [
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "deny", "pattern": "*"},
+        ]
+    )
+    return rules
+
+
+def _dedupe_permission_rules(rules: Iterable[dict[str, str]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for rule in rules:
+        perm = str(rule.get("permission") or "").strip()
+        action = str(rule.get("action") or "").strip()
+        pattern = str(rule.get("pattern") or "*").strip() or "*"
+        if not perm or not action:
+            continue
+        key = (perm, pattern, action)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"permission": perm, "action": action, "pattern": pattern})
+    return out
+
+
+def _permission_rules_to_config(rules: Iterable[dict[str, str]]) -> dict[str, Any]:
+    cfg: dict[str, Any] = {}
+    for rule in rules:
+        perm = str(rule.get("permission") or "").strip()
+        action = str(rule.get("action") or "").strip()
+        pattern = str(rule.get("pattern") or "*").strip() or "*"
+        if not perm or action not in {"allow", "ask", "deny"}:
+            continue
+        if pattern == "*":
+            cfg[perm] = action
+            continue
+        cur = cfg.get(perm)
+        if isinstance(cur, dict):
+            cur[pattern] = action
+        elif isinstance(cur, str):
+            cfg[perm] = {"*": cur, pattern: action}
+        else:
+            cfg[perm] = {pattern: action}
+    return cfg
+
+
+def _merge_permission_rule_config(base: dict[str, Any], rules: Iterable[dict[str, str]]) -> dict[str, Any]:
+    merged = dict(base)
+    for perm, value in _permission_rules_to_config(rules).items():
+        if isinstance(value, dict) and isinstance(merged.get(perm), dict):
+            cur = dict(merged[perm])
+            cur.update(value)
+            merged[perm] = cur
+        else:
+            merged[perm] = value
+    return merged
+
+
+def _apply_subtask_permission_rules_to_env(env: dict[str, str], rules: list[dict[str, str]]) -> None:
+    if not rules:
+        return
+    raw = env.get("OPENCODE_PERMISSION")
+    base: dict[str, Any] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                base = parsed
+            elif isinstance(parsed, str) and parsed in {"allow", "ask", "deny"}:
+                base = {"*": parsed}
+        except Exception:
+            if raw.strip() in {"allow", "ask", "deny"}:
+                base = {"*": raw.strip()}
+    env["OPENCODE_PERMISSION"] = json.dumps(
+        _merge_permission_rule_config(base, rules), ensure_ascii=False
+    )
+
+
+def _apply_subtask_preset(args: argparse.Namespace) -> dict[str, Any]:
+    """Apply adapter-level role preset and return stable subtask metadata."""
+    subtask_type = _normalize_subtask_type(getattr(args, "subtask_type", None))
+    setattr(args, "subtask_type", subtask_type)
+    preset = SUBTASK_TYPE_PRESETS[subtask_type]
+
+    explicit_agent = bool(str(getattr(args, "agent", "") or "").strip())
+    preset_agent = preset.get("agent") if isinstance(preset.get("agent"), str) else None
+    if (not explicit_agent) and preset_agent:
+        setattr(args, "agent", preset_agent)
+
+    explicit_profile = str(
+        getattr(args, "execution_profile", DEFAULT_EXECUTION_PROFILE)
+        or DEFAULT_EXECUTION_PROFILE
+    ).strip().lower() != DEFAULT_EXECUTION_PROFILE
+    preset_profile = preset.get("executionProfile")
+    if (not explicit_profile) and isinstance(preset_profile, str) and preset_profile:
+        setattr(args, "execution_profile", preset_profile)
+
+    description = str(getattr(args, "description", "") or "").strip()
+    if description and not str(getattr(args, "title", "") or "").strip():
+        title = f"{description} (@opencode-subtask/{subtask_type})"
+        setattr(args, "title", title[:160])
+
+    rules = _subtask_default_permission_rules(
+        subtask_type,
+        allow_nested_subtasks=bool(getattr(args, "allow_nested_subtasks", False)),
+        allow_child_todos=bool(getattr(args, "allow_child_todos", False)),
+    )
+    acceptance = list(getattr(args, "acceptance", []) or [])
+    return {
+        "type": subtask_type,
+        "taskId": getattr(args, "_adapter_task_id", None),
+        "description": description or None,
+        "brief": str(preset.get("brief") or ""),
+        "agent": getattr(args, "agent", None),
+        "agentSource": "explicit" if explicit_agent else ("preset" if preset_agent else "default"),
+        "executionProfile": getattr(args, "execution_profile", None),
+        "readOnly": bool(preset.get("readOnly")),
+        "permissionRules": rules,
+        "acceptance": acceptance,
+        "allowNestedSubtasks": bool(getattr(args, "allow_nested_subtasks", False)),
+        "allowChildTodos": bool(getattr(args, "allow_child_todos", False)),
+    }
+
+
+def _effective_http_deny_interactive_tools(
+    args: argparse.Namespace, subtask_info: dict[str, Any]
+) -> bool:
+    raw = getattr(args, "http_deny_interactive_tools", None)
+    if raw is None:
+        return bool(subtask_info.get("readOnly"))
+    return bool(raw)
+
+
+def _apply_subtask_briefing(
+    prompt: str,
+    *,
+    subtask_info: dict[str, Any] | None,
+) -> str:
+    if not isinstance(subtask_info, dict):
+        return prompt
+    t = str(subtask_info.get("type") or DEFAULT_SUBTASK_TYPE)
+    if "OpenCode child role:" in (prompt or ""):
+        return prompt
+    read_only = bool(subtask_info.get("readOnly"))
+    task_id = str(subtask_info.get("taskId") or "").strip()
+    prefix = f"\n\nOpenCode external task_id: {task_id}." if task_id else "\n\n"
+    if read_only:
+        role_line = (
+            prefix
+            + f" OpenCode child role: {t}. This is a read-only delegated task; inspect and report, "
+            "but do not edit files or run mutating shell commands."
+        )
+    elif t in {"worker", "fast-worker"}:
+        role_line = (
+            prefix
+            + f" OpenCode child role: {t}. Implement directly when the task asks for changes, "
+            "run the most relevant verification, and return only the useful final report."
+        )
+    else:
+        role_line = (
+            prefix
+            + f" OpenCode child role: {t}. Treat this as one delegated child-agent task with fresh context; "
+            "do not re-delegate the same task to another agent."
+        )
+    acceptance = list(subtask_info.get("acceptance") or [])
+    if acceptance:
+        items = [str(x).strip() for x in acceptance if str(x).strip()]
+        if items:
+            role_line += "\nAcceptance criteria / stop condition:\n" + "\n".join(f"- {x}" for x in items)
+    return (prompt or "").rstrip() + role_line + "\n"
+
+def _ask_metadata_obj(finish_obj: dict[str, Any]) -> dict[str, Any]:
+    execution = finish_obj.get("execution") if isinstance(finish_obj.get("execution"), dict) else {}
+    artifacts = finish_obj.get("artifacts") if isinstance(finish_obj.get("artifacts"), dict) else {}
+    workspace = finish_obj.get("workspace") if isinstance(finish_obj.get("workspace"), dict) else {}
+    artifact_dir = artifacts.get("dir") if isinstance(artifacts, dict) else None
+
+    def artifact_abs(name_key: str) -> str | None:
+        if not isinstance(artifacts, dict) or not isinstance(artifact_dir, str):
+            return None
+        name = artifacts.get(name_key)
+        if not isinstance(name, str) or not name:
+            return None
+        return str(Path(artifact_dir).expanduser() / name)
+
+    def workspace_patch_abs() -> str | None:
+        if not isinstance(workspace, dict) or not isinstance(artifact_dir, str):
+            return None
+        patch_name = workspace.get("patchPath")
+        if not isinstance(patch_name, str) or not patch_name:
+            return None
+        patch_path = Path(patch_name).expanduser()
+        if patch_path.is_absolute():
+            return str(patch_path)
+        return str(Path(artifact_dir).expanduser() / patch_path)
+
+    session_id = execution.get("sessionId") if isinstance(execution, dict) else None
+    run_id = finish_obj.get("runId")
+    subtask = finish_obj.get("subtask") if isinstance(finish_obj.get("subtask"), dict) else {}
+    adapter_task_id = subtask.get("taskId") if isinstance(subtask, dict) else None
+    return {
+        "type": "opencode-subtask-ask-metadata",
+        "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "adapterVersion": ADAPTER_VERSION,
+        "timestamp": _now_ms(),
+        "ok": finish_obj.get("outcome") == "completed",
+        "runId": run_id,
+        "taskId": adapter_task_id or session_id or run_id,
+        "sessionId": session_id,
+        "outcome": finish_obj.get("outcome"),
+        "subtask": finish_obj.get("subtask"),
+        "engine": execution.get("engine") if isinstance(execution, dict) else None,
+        "changedFiles": workspace.get("changedFiles") if isinstance(workspace, dict) else None,
+        "artifacts": {
+            "dir": artifact_dir,
+            "finishPath": artifact_abs("finishPath"),
+            "assistantPath": artifact_abs("assistantPath"),
+            "patchPath": workspace_patch_abs(),
+            "taskStatePath": subtask.get("taskStatePath") if isinstance(subtask, dict) else None,
+            "taskProgressPath": subtask.get("taskProgressPath") if isinstance(subtask, dict) else None,
+        },
+    }
+
+
+def _truncate_for_ask_stdout(
+    text: str,
+    *,
+    max_chars: int,
+    assistant_path: Path | None,
+) -> tuple[str, bool]:
+    """Cap ask stdout while preserving the full answer in assistant.txt."""
+    try:
+        cap = int(max_chars)
+    except Exception:
+        cap = DEFAULT_ASK_STDOUT_MAX_CHARS
+    if cap <= 0 or len(text) <= cap:
+        return text, False
+    note = "\n\n[opencode-subtask: final answer truncated at " + str(cap) + " chars"
+    if assistant_path:
+        note += "; full assistant text is in " + str(assistant_path)
+    note += "]"
+    # Reserve room for the note when possible.
+    keep = max(0, cap - len(note))
+    return text[:keep].rstrip() + note, True
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -708,6 +1012,28 @@ def _servers_dir() -> Path:
     return _cache_root() / "servers"
 
 
+def _tasks_dir() -> Path:
+    return _cache_root() / "tasks"
+
+
+def _task_project_dir(workdir: Path) -> Path:
+    return _tasks_dir() / _project_key(workdir)
+
+
+def _task_state_path(workdir: Path, task_id: str) -> Path:
+    _validate_safe_id(task_id, label="task_id")
+    return _task_project_dir(workdir) / f"{task_id}.json"
+
+
+def _task_lock_path(workdir: Path, task_id: str) -> Path:
+    return _task_state_path(workdir, task_id).with_suffix(".lock")
+
+
+def _task_progress_path(workdir: Path, task_id: str) -> Path:
+    _validate_safe_id(task_id, label="task_id")
+    return _task_project_dir(workdir) / f"{task_id}.progress.md"
+
+
 def _prune_run_artifacts(*, keep_last: int, dry_run: bool) -> dict[str, Any]:
     """
     Prune local on-disk run artifacts under the cache root.
@@ -834,7 +1160,23 @@ def _make_run_id() -> str:
     return f"run_{_now_ms()}_{os.getpid()}"
 
 
+def _make_task_id() -> str:
+    return f"task_{_now_ms()}_{os.getpid()}"
+
+
 _RUN_ID_RE = re.compile(r"^[\w.\-]+$")  # alphanumeric, underscore, dot, hyphen
+
+
+def _validate_safe_id(value: str, *, label: str) -> None:
+    """Reject ids that could escape cache directories via path traversal."""
+    if value in (".", ".."):
+        raise ValueError(f"{label} must not be a relative directory alias: {value!r}")
+    if ".." in value.split("/") or ".." in value.split("\\"):
+        raise ValueError(f"{label} contains path traversal component: {value!r}")
+    if "/" in value or "\\" in value:
+        raise ValueError(f"{label} contains path separator: {value!r}")
+    if not _RUN_ID_RE.match(value):
+        raise ValueError(f"{label} contains disallowed characters: {value!r}")
 
 
 def _validate_run_id_for_path(rid: str) -> None:
@@ -843,14 +1185,7 @@ def _validate_run_id_for_path(rid: str) -> None:
     Raises ValueError if the run_id contains path separators, ``..``
     components, or characters outside the safe whitelist.
     """
-    if rid in (".", ".."):
-        raise ValueError(f"run_id must not be a relative directory alias: {rid!r}")
-    if ".." in rid.split("/") or ".." in rid.split("\\"):
-        raise ValueError(f"run_id contains path traversal component: {rid!r}")
-    if "/" in rid or "\\" in rid:
-        raise ValueError(f"run_id contains path separator: {rid!r}")
-    if not _RUN_ID_RE.match(rid):
-        raise ValueError(f"run_id contains disallowed characters: {rid!r}")
+    _validate_safe_id(rid, label="run_id")
 
 
 def _resolve_artifacts_dir(
@@ -881,6 +1216,283 @@ def _safe_resolve_artifacts_dir(
     except ValueError as exc:
         _exit_with_error("BadRunId", str(exc), exit_code=2)
 
+
+
+@dataclass
+class TaskResolution:
+    task_id: str
+    state_path: Path
+    progress_path: Path
+    prior_state: dict[str, Any] | None
+    created_new: bool
+    is_external: bool
+
+
+def _load_task_state(workdir: Path, task_id: str) -> dict[str, Any] | None:
+    try:
+        p = _task_state_path(workdir, task_id)
+    except ValueError:
+        return None
+    obj = _load_json(p)
+    return obj if isinstance(obj, dict) else None
+
+
+def _resolve_task_id_for_run(args: argparse.Namespace, workdir: Path) -> TaskResolution:
+    """Resolve adapter task identity and optionally hydrate OpenCode session continuation.
+
+    `--task-id` is now the caller-facing handle. If it maps to a known adapter
+    task, the latest OpenCode session id is reused unless --session explicitly
+    overrides it. Unknown safe ids create a new adapter task handle. Raw
+    OpenCode session continuation must use --session explicitly.
+    """
+    raw = str(getattr(args, "task_id", "") or "").strip()
+    prior: dict[str, Any] | None = None
+    is_external = False
+    created_new = False
+
+    if raw:
+        try:
+            _validate_safe_id(raw, label="task_id")
+        except ValueError as exc:
+            _exit_with_error("BadTaskId", str(exc), exit_code=2)
+        prior = _load_task_state(workdir, raw)
+        task_id = raw
+        is_external = True
+        if prior is None:
+            created_new = True
+    else:
+        task_id = _make_task_id()
+        created_new = True
+        is_external = True
+
+    state_path = _task_state_path(workdir, task_id)
+    progress_path = _task_progress_path(workdir, task_id)
+
+    if prior:
+        session_id = str(prior.get("sessionId") or "").strip()
+        if session_id and not str(getattr(args, "session", "") or "").strip():
+            setattr(args, "session", session_id)
+        sub = prior.get("subtask") if isinstance(prior.get("subtask"), dict) else {}
+        # Preserve prior role on continuation unless caller selected something non-default.
+        if (
+            str(getattr(args, "subtask_type", DEFAULT_SUBTASK_TYPE) or DEFAULT_SUBTASK_TYPE)
+            == DEFAULT_SUBTASK_TYPE
+            and isinstance(sub.get("type"), str)
+            and sub.get("type") in SUBTASK_TYPES
+        ):
+            setattr(args, "subtask_type", sub.get("type"))
+        for field in ("agent", "model", "variant"):
+            cur = str(getattr(args, field, "") or "").strip()
+            val = prior.get(field)
+            if not cur and isinstance(val, str) and val:
+                setattr(args, field, val)
+
+    return TaskResolution(
+        task_id=task_id,
+        state_path=state_path,
+        progress_path=progress_path,
+        prior_state=prior,
+        created_new=created_new,
+        is_external=is_external,
+    )
+
+
+def _task_is_running(state: dict[str, Any] | None) -> bool:
+    """Best-effort duplicate guard for a caller-facing adapter task id.
+
+    A task state can be left as ``running`` if the parent process is hard-killed.
+    Treat a task as actively running only when its latest job still has a live
+    worker pid or an HTTP session without a terminal finish.  This mirrors native
+    task handles: avoid double-starting live work, but do not permanently lock a
+    recoverable task id after a crash.
+    """
+    if not isinstance(state, dict):
+        return False
+    state_name = str(state.get("state") or "").lower()
+    artifacts = str(state.get("latestArtifactsDir") or "").strip()
+    if artifacts:
+        ad = Path(artifacts)
+        if (ad / "finish.json").exists():
+            return False
+        job = _load_json(ad / "job.json")
+        if isinstance(job, dict):
+            pid = _safe_int(job.get("pid")) or 0
+            job_state = str(job.get("state") or "").lower()
+            if pid > 0 and _pid_running(pid) and job_state in {"queued", "running", "cancel_requested"}:
+                return True
+            if job.get("sessionId") and job_state in {"queued", "running", "cancel_requested"}:
+                return True
+    return state_name in {"starting"} and not artifacts
+
+
+def _safe_int(v: Any) -> int | None:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+def _read_tail_text(path: Path, max_chars: int) -> str:
+    try:
+        if max_chars <= 0 or not path.exists():
+            return ""
+        with path.open("rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_chars), os.SEEK_SET)
+            except Exception:
+                pass
+            data = f.read(max_chars + 1024)
+        text = data.decode("utf-8", errors="replace")
+        if len(text) > max_chars:
+            text = text[-max_chars:]
+        return text.strip()
+    except Exception:
+        return ""
+
+
+def _task_memory_block(res: TaskResolution, *, max_chars: int) -> str:
+    """Build a compact MiMo-style continuation memory block for task resumption."""
+    st = res.prior_state
+    if not isinstance(st, dict):
+        return ""
+    try:
+        cap = max(0, int(max_chars))
+    except Exception:
+        cap = DEFAULT_TASK_MEMORY_MAX_CHARS
+    if cap <= 0:
+        return ""
+    pieces: list[str] = []
+    pieces.append(f"task_id: {res.task_id}")
+    for key in ("state", "outcome", "sessionId", "latestRunId"):
+        val = st.get(key)
+        if val:
+            pieces.append(f"{key}: {val}")
+    changed = st.get("changedFiles")
+    if isinstance(changed, list) and changed:
+        pieces.append("changedFiles: " + ", ".join(str(x) for x in changed[:20]))
+    last_progress = _read_tail_text(res.progress_path, max(800, min(cap, 4000)))
+    if last_progress:
+        pieces.append("recent progress:\n" + last_progress)
+    block = "\n".join(pieces).strip()
+    if len(block) > cap:
+        block = block[-cap:].lstrip()
+        block = "[truncated task memory]\n" + block
+    return (
+        "\n\nExternal task continuation memory (adapter-generated, bounded):\n"
+        "```text\n" + block + "\n```\n"
+        "Use this only to avoid re-discovering prior state; the current user task remains authoritative.\n"
+    )
+
+
+def _append_task_progress(path: Path, *, event: str, fields: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [f"\n## {time.strftime('%Y-%m-%d %H:%M:%S')} {event}"]
+        for k, v in fields.items():
+            if v is None or v == [] or v == {}:
+                continue
+            if isinstance(v, (dict, list)):
+                val = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+            else:
+                val = str(v)
+            if len(val) > 1200:
+                val = val[:1200].rstrip() + "..."
+            lines.append(f"- {k}: {val}")
+        with path.open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
+def _write_task_state_locked(
+    *,
+    workdir: Path,
+    task_id: str,
+    update: dict[str, Any],
+) -> dict[str, Any] | None:
+    try:
+        state_path = _task_state_path(workdir, task_id)
+        lock_path = _task_lock_path(workdir, task_id)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        with _FileLock(lock_path):
+            cur = _load_json(state_path)
+            if not isinstance(cur, dict):
+                cur = {
+                    "type": "opencode-subtask-task-state",
+                    "schemaVersion": ADAPTER_SCHEMA_VERSION,
+                    "adapterVersion": ADAPTER_VERSION,
+                    "taskId": task_id,
+                    "projectKey": _project_key(workdir),
+                    "workdir": str(workdir),
+                    "createdAt": _now_ms(),
+                }
+            cur.update(update)
+            cur["adapterVersion"] = ADAPTER_VERSION
+            cur["updatedAt"] = _now_ms()
+            _write_json(state_path, cur)
+            return cur
+    except Exception:
+        return None
+
+
+def _resolve_task_artifacts(
+    *,
+    workdir: Path,
+    task_id: str | None,
+    run_id: str | None,
+    artifacts_dir: str | None,
+) -> tuple[str, Path, dict[str, Any] | None]:
+    if task_id:
+        try:
+            _validate_safe_id(task_id, label="task_id")
+        except ValueError as exc:
+            _exit_with_error("BadTaskId", str(exc), exit_code=2)
+        st = _load_task_state(workdir, task_id)
+        if not isinstance(st, dict):
+            _exit_with_error("TaskNotFound", f"No adapter task state for task_id={task_id!r}", exit_code=2)
+        ad = st.get("latestArtifactsDir")
+        rid = st.get("latestRunId")
+        if not isinstance(ad, str) or not ad:
+            _exit_with_error("TaskNoRun", f"Task {task_id!r} has no recorded run artifacts", exit_code=2)
+        return str(rid or task_id), Path(ad).expanduser().resolve(), st
+    rid, ad = _safe_resolve_artifacts_dir(run_id, artifacts_dir)
+    return rid, ad, None
+
+
+def _write_notification(
+    *,
+    artifacts_dir: Path,
+    finish_obj: dict[str, Any],
+    task_state_path: Path | None,
+) -> Path | None:
+    try:
+        assistant_path = artifacts_dir / "assistant.txt"
+        preview = _read_tail_text(assistant_path, 4000) if assistant_path.exists() else ""
+        obj = {
+            "type": "opencode-subtask-notification",
+            "schemaVersion": ADAPTER_SCHEMA_VERSION,
+            "adapterVersion": ADAPTER_VERSION,
+            "timestamp": _now_ms(),
+            "taskId": (finish_obj.get("subtask") or {}).get("taskId") if isinstance(finish_obj.get("subtask"), dict) else None,
+            "runId": finish_obj.get("runId"),
+            "sessionId": (finish_obj.get("execution") or {}).get("sessionId") if isinstance(finish_obj.get("execution"), dict) else None,
+            "outcome": finish_obj.get("outcome"),
+            "workdir": finish_obj.get("workdir"),
+            "assistantPreview": preview,
+            "artifactsDir": str(artifacts_dir),
+            "finishPath": str(artifacts_dir / "finish.json"),
+            "assistantPath": str(assistant_path) if assistant_path.exists() else None,
+            "taskStatePath": str(task_state_path) if task_state_path else None,
+        }
+        p = artifacts_dir / "notification.json"
+        _write_json(p, obj)
+        return p
+    except Exception:
+        return None
 
 def _canonical_run_id(run_id: str, job: Any) -> str:
     """Return the authoritative run_id: prefer job.json's recorded runId.
@@ -1412,9 +2024,31 @@ class OpencodeHttpClient:
         except Exception:
             return None
 
-    def create_session(self) -> dict[str, Any]:
-        # Server docs: POST /session -> Session
-        _, js = self._request_json("POST", "/session", {}, timeout_s=self.timeout_s)
+    def create_session(
+        self,
+        *,
+        title: str | None = None,
+        parent_id: str | None = None,
+        agent: str | None = None,
+        model: dict[str, Any] | None = None,
+        permission: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        # Latest OpenCode clients create sessions with title plus optional
+        # execution defaults such as agent/model/permission rules.  Unknown
+        # omitted fields stay absent; no adapter-owned model-output protocol is
+        # involved.
+        body: dict[str, Any] = {}
+        if title:
+            body["title"] = title
+        if parent_id:
+            body["parentID"] = parent_id
+        if agent:
+            body["agent"] = agent
+        if model:
+            body["model"] = model
+        if permission:
+            body["permission"] = permission
+        _, js = self._request_json("POST", "/session", body, timeout_s=self.timeout_s)
         if not isinstance(js, dict):
             raise RuntimeError("Invalid /session response (expected JSON object)")
         return js
@@ -1430,42 +2064,33 @@ class OpencodeHttpClient:
         timeout_s: float,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"parts": [{"type": "text", "text": prompt}]}
-        if model:
-            body["model"] = model
+        msg_model = _model_arg_to_http_message_model(model)
+        if msg_model:
+            body["model"] = msg_model
         if variant:
             body["variant"] = variant
         if agent:
             body["agent"] = agent
 
-        def _post_message(payload: dict[str, Any]) -> dict[str, Any]:
-            # Server docs: POST /session/:id/message -> Message
-            _, js = self._request_json(
-                "POST", f"/session/{session_id}/message", payload, timeout_s=timeout_s
-            )
-            if not isinstance(js, dict):
-                raise RuntimeError("Invalid /message response (expected JSON object)")
-            return js
-
-        try:
-            return _post_message(body)
-        except RuntimeError as e:
-            # Back-compat: newer servers validate `model` as an object, older servers accept a string.
-            # Retry only when the server clearly rejects the string type for `model`.
-            if model and '"path":["model"]' in str(e) and "expected object" in str(e):
-                body2 = dict(body)
-                provider_id, sep, model_id = model.partition("/")
-                if sep:
-                    body2["model"] = {"providerID": provider_id, "modelID": model_id}
-                else:
-                    body2["model"] = {"providerID": "", "modelID": model}
-                return _post_message(body2)
-            raise
+        # Server docs: POST /session/:id/message -> { info, parts }
+        _, js = self._request_json(
+            "POST",
+            f"/session/{urllib.parse.quote(session_id, safe='')}/message",
+            body,
+            timeout_s=timeout_s,
+        )
+        if not isinstance(js, dict):
+            raise RuntimeError("Invalid /message response (expected JSON object)")
+        return js
 
     def abort(self, session_id: str) -> None:
         # Server docs: POST /session/:id/abort
         try:
             self._request_json(
-                "POST", f"/session/{session_id}/abort", {}, timeout_s=5.0
+                "POST",
+                f"/session/{urllib.parse.quote(session_id, safe='')}/abort",
+                {},
+                timeout_s=5.0,
             )
         except Exception:
             pass
@@ -1474,23 +2099,24 @@ class OpencodeHttpClient:
         # Same endpoint as abort(), but lets exceptions propagate for callers
         # that need a reliable success/failure signal.
         self._request_json(
-            "POST", f"/session/{session_id}/abort", {}, timeout_s=timeout_s
+            "POST",
+            f"/session/{urllib.parse.quote(session_id, safe='')}/abort",
+            {},
+            timeout_s=timeout_s,
         )
 
-    def reply_permission(
-        self,
-        session_id: str,
-        permission_id: str,
-        *,
-        response: str,
-        remember: bool = False,
-    ) -> None:
-        # Server docs: POST /session/:id/permissions/:permissionID
-        body = {"response": response, "remember": remember}
+    def reply_permission(self, request_id: str, *, reply: str) -> None:
+        # Latest server permission API: POST /permission/:requestID/reply
+        # with reply in {"once", "always", "reject"}.  This is deliberately
+        # not the session-scoped permissions endpoint.
+        if reply not in {"once", "always", "reject"}:
+            raise ValueError(f"invalid permission reply: {reply!r}")
+        request_id_q = urllib.parse.quote(request_id, safe="")
+        body = {"reply": reply}
         try:
             self._request_json(
                 "POST",
-                f"/session/{session_id}/permissions/{permission_id}",
+                f"/permission/{request_id_q}/reply",
                 body,
                 timeout_s=5.0,
             )
@@ -2004,47 +2630,64 @@ def _wait_for_pid_dead(pid: int, timeout_s: float, poll_s: float = 0.1) -> bool:
 def _validate_finish_envelope(obj: Any) -> str | None:
     if not isinstance(obj, dict):
         return "root must be an object"
+    allowed_top = {
+        "type",
+        "schemaVersion",
+        "adapterVersion",
+        "timestamp",
+        "runId",
+        "taskId",
+        "workdir",
+        "outcome",
+        "execution",
+        "workspace",
+        "artifacts",
+        "subtask",
+    }
+    extra_top = sorted(set(obj) - allowed_top)
+    if extra_top:
+        return "unexpected top-level field: " + extra_top[0]
     if obj.get("type") != "opencode-subtask-finish":
         return "type must be opencode-subtask-finish"
-    # V2 is a deliberate schema break. Lifecycle commands only trust strict V2
+    # V3 is a deliberate schema break. Lifecycle commands only trust strict V3
     # finish envelopes and quarantine anything older or malformed.
     if obj.get("schemaVersion") != ADAPTER_SCHEMA_VERSION:
         return f"schemaVersion must be {ADAPTER_SCHEMA_VERSION}"
-
-    output_mode = obj.get("outputMode")
-    if output_mode not in OUTPUT_MODES:
-        return "outputMode must be machine or text"
 
     outcome = obj.get("outcome")
     if outcome not in FINISH_OUTCOMES:
         return "outcome is invalid"
 
     execution = obj.get("execution")
-    payload = obj.get("payload")
-    decision = obj.get("decision")
     workspace = obj.get("workspace")
     artifacts = obj.get("artifacts")
     if not isinstance(execution, dict):
         return "execution must be an object"
-    if not isinstance(payload, dict):
-        return "payload must be an object"
-    if not isinstance(decision, dict):
-        return "decision must be an object"
     if not isinstance(workspace, dict):
         return "workspace must be an object"
     if not isinstance(artifacts, dict):
         return "artifacts must be an object"
+    allowed_artifacts = {
+        "dir",
+        "jobPath",
+        "finishPath",
+        "promptPath",
+        "eventsPath",
+        "stderrPath",
+        "assistantPath",
+        "wrapperLogPath",
+        "progressPath",
+        "notificationPath",
+    }
+    extra_artifacts = sorted(set(artifacts) - allowed_artifacts)
+    if extra_artifacts:
+        return "unexpected artifact field: " + extra_artifacts[0]
 
     execution_engine = execution.get("engine")
     if not isinstance(execution_engine, dict):
         return "execution.engine must be an object"
-    if not isinstance(payload.get("artifact"), dict):
-        return "payload.artifact must be an object"
     if execution.get("error") is not None and not isinstance(execution.get("error"), dict):
         return "execution.error must be an object or null"
-    payload_errors = payload.get("errors")
-    if not isinstance(payload_errors, list):
-        return "payload.errors must be a list"
 
     engine_selected = execution_engine.get("selected")
     if engine_selected not in EXECUTION_ENGINE_SELECTED_VALUES:
@@ -2055,64 +2698,8 @@ def _validate_finish_envelope(obj: Any) -> str | None:
     if engine_fallback is not None and engine_selected != "cli":
         return "execution.engine.fallbackFrom requires execution.engine.selected=cli"
 
-    if payload.get("status") not in PAYLOAD_STATUSES:
-        return "payload.status is invalid"
-    decision_status = decision.get("status")
-    if decision_status not in DECISION_STATUSES:
-        return "decision.status is invalid"
-    payload_status = payload.get("status")
-    payload_schema = payload.get("schema")
-    payload_artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {}
-    payload_path = payload_artifact.get("path")
-    payload_digest = payload_artifact.get("digest")
-    if payload_schema is not None and not isinstance(payload_schema, str):
-        return "payload.schema must be a string or null"
-    if payload_path is not None and not isinstance(payload_path, str):
-        return "payload.artifact.path must be a string or null"
-    if payload_digest is not None and not isinstance(payload_digest, str):
-        return "payload.artifact.digest must be a string or null"
-    for idx, entry in enumerate(payload_errors):
-        if not isinstance(entry, dict):
-            return f"payload.errors[{idx}] must be an object"
-        if entry.get("code") not in PAYLOAD_ERROR_CODES:
-            return f"payload.errors[{idx}].code is invalid"
-        if not isinstance(entry.get("message"), str):
-            return f"payload.errors[{idx}].message must be a string"
-
-    if output_mode == "text":
-        if payload_status != "not_requested":
-            return "text outputMode requires payload.status=not_requested"
-        if decision_status != "not_requested":
-            return "text outputMode requires decision.status=not_requested"
-        if payload_path is not None or payload_digest is not None:
-            return "text outputMode requires payload.artifact.path/digest=null"
-    elif payload_status == "not_requested":
-        return "machine outputMode forbids payload.status=not_requested"
-    elif payload_status != "validated" and decision_status != "unavailable":
-        return "decision.status is invalid for non-validated payloads"
-    elif payload_status == "validated":
-        if payload_schema != PAYLOAD_PROTOCOL:
-            return f"validated payload requires payload.schema={PAYLOAD_PROTOCOL}"
-        if not isinstance(payload_path, str) or not payload_path:
-            return "validated payload requires payload.artifact.path"
-        if not isinstance(payload_digest, str) or not payload_digest:
-            return "validated payload requires payload.artifact.digest"
-        if decision_status not in {"determinate", "abstained"}:
-            return "validated payload requires decision.status=determinate|abstained"
-
-    if payload_status != "validated":
-        if payload_path is not None or payload_digest is not None:
-            return "non-validated payload requires payload.artifact.path/digest=null"
-
     if outcome == "completed" and execution.get("error") is not None:
         return "completed outcome requires execution.error=null"
-
-    route = decision.get("route")
-    if decision_status == "determinate":
-        if route not in DECISION_ROUTES:
-            return "decision.route must be a known route when determinate"
-    elif route is not None:
-        return "decision.route must be null unless decision.status is determinate"
 
     return None
 
@@ -2158,7 +2745,7 @@ def _load_runtime_finish_envelope(
     reason_text = (
         "finish.json is not readable JSON"
         if reason_code == "FINISH_UNREADABLE"
-        else "finish.json failed strict V2 validation"
+        else "finish.json failed strict V3 validation"
     )
     if quarantined_path is not None:
         reason_text += f"; moved to {quarantined_path.name}"
@@ -2216,6 +2803,7 @@ def ensure_server(
     wait_s: float,
     env: dict[str, str],
     auth: HttpAuth | None,
+    cors_origins: list[str] | None = None,
 ) -> dict[str, Any]:
     st_path = _server_state_path(workdir)
     log_path = _server_log_path(workdir)
@@ -2251,6 +2839,9 @@ def ensure_server(
             port = _pick_free_port(hostname)
 
         cmd = [opencode_bin, "serve", "--hostname", hostname, "--port", str(port)]
+        for origin in cors_origins or []:
+            if origin:
+                cmd.extend(["--cors", origin])
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fp = open(log_path, "ab", buffering=0)
 
@@ -2302,6 +2893,7 @@ def ensure_server(
             "projectRoot": str(_find_git_root(workdir)),
             "logPath": str(log_path),
             "command": cmd,
+            "corsOrigins": list(cors_origins or []),
             "managedBy": "opencode-subtask",
         }
         _write_json(st_path, state)
@@ -2407,39 +2999,255 @@ class _TailText:
             return self._buf
 
 
-def _extract_text_from_event(evt: dict[str, Any]) -> str | None:
-    # Best-effort for OpenCode event shapes.
-    for k in ("text", "delta", "content"):
-        v = evt.get(k)
-        if isinstance(v, str) and v:
+def _event_payload(evt: dict[str, Any]) -> dict[str, Any]:
+    payload = evt.get("payload")
+    if isinstance(payload, dict) and isinstance(payload.get("type"), str):
+        return payload
+    return evt
+
+
+def _event_properties(evt: dict[str, Any]) -> dict[str, Any]:
+    props = evt.get("properties")
+    return props if isinstance(props, dict) else {}
+
+
+def _nested_event_dicts(evt: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return likely event sub-objects that may carry ids/roles.
+
+    OpenCode CLI JSON and server SSE can arrive either as the raw bus event or
+    as a GlobalEvent wrapper: { directory, payload: Event }.  Current message
+    events put useful fields under properties.info / properties.part, while
+    some older/raw event emitters use top-level fields.  This helper is a
+    shallow scanner, not a schema contract.
+    """
+    evt = _event_payload(evt)
+    props = _event_properties(evt)
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def add(obj: Any) -> None:
+        if isinstance(obj, dict) and id(obj) not in seen:
+            seen.add(id(obj))
+            out.append(obj)
+
+    add(evt)
+    add(props)
+    for base in list(out):
+        for key in (
+            "info",
+            "part",
+            "message",
+            "permission",
+            "request",
+            "data",
+            "session",
+            "properties",
+        ):
+            add(base.get(key))
+    return out
+
+
+def _event_session_id(evt: dict[str, Any]) -> str | None:
+    for src in _nested_event_dicts(evt):
+        sid = src.get("sessionID") or src.get("sessionId") or src.get("session")
+        if isinstance(sid, str) and sid:
+            return sid
+    return None
+
+
+def _event_message_id(evt: dict[str, Any]) -> str | None:
+    for src in _nested_event_dicts(evt):
+        mid = src.get("messageID") or src.get("messageId") or src.get("message")
+        if isinstance(mid, str) and mid:
+            return mid
+        mid = src.get("id")
+        if isinstance(mid, str) and mid and str(src.get("role") or "") in (
+            "assistant",
+            "user",
+        ):
+            return mid
+    return None
+
+
+def _event_role(evt: dict[str, Any]) -> str | None:
+    for src in _nested_event_dicts(evt):
+        role = src.get("role")
+        if isinstance(role, str) and role:
+            return role.lower()
+    return None
+
+
+def _first_nested_dict(evt: dict[str, Any], key: str) -> dict[str, Any] | None:
+    evt = _event_payload(evt)
+    props = _event_properties(evt)
+    for src in (props, evt):
+        v = src.get(key)
+        if isinstance(v, dict):
             return v
-    part = evt.get("part")
-    if isinstance(part, dict):
-        for k in ("text", "delta", "content"):
-            v = part.get(k)
-            if isinstance(v, str) and v:
-                return v
-    msg = evt.get("message")
-    if isinstance(msg, dict):
-        content = msg.get("content")
-        if isinstance(content, str) and content:
-            return content
-        if isinstance(content, list):
-            chunks: list[str] = []
-            for item in content:
-                if isinstance(item, str):
-                    chunks.append(item)
-                elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                    chunks.append(str(item["text"]))
-            out = "".join(chunks).strip()
-            return out or None
-    data = evt.get("data")
-    if isinstance(data, dict):
-        for k in ("text", "delta", "content"):
-            v = data.get(k)
+    for src in _nested_event_dicts(evt):
+        v = src.get(key)
+        if isinstance(v, dict):
+            return v
+    return None
+
+
+def _first_nested_str(evt: dict[str, Any], keys: Iterable[str]) -> str | None:
+    for src in _nested_event_dicts(evt):
+        for key in keys:
+            v = src.get(key)
             if isinstance(v, str) and v:
                 return v
     return None
+
+
+class _AssistantTextAccumulator:
+    """Accumulate assistant text from OpenCode events without custom JSON.
+
+    The important invariant is: assistant.txt should contain the model's final
+    natural-language output, not echoed user prompts, reasoning/tool metadata,
+    or duplicate cumulative part snapshots.
+    """
+
+    _TEXT_TYPES: Final[set[str]] = {"text", "assistant_text", "output_text"}
+    _NON_TEXT_TYPES: Final[set[str]] = {
+        "reasoning",
+        "tool",
+        "tool_call",
+        "tool_result",
+        "file",
+        "patch",
+        "step",
+        "snapshot",
+    }
+
+    def __init__(self) -> None:
+        self._assistant_message_ids: set[str] = set()
+        self._user_message_ids: set[str] = set()
+        self._part_full_text: dict[str, str] = {}
+
+    def _observe_message_info(self, evt: dict[str, Any]) -> None:
+        info = _first_nested_dict(evt, "info") or _first_nested_dict(evt, "message")
+        if not isinstance(info, dict):
+            return
+        role = info.get("role")
+        mid = info.get("id") or info.get("messageID") or info.get("messageId")
+        if isinstance(mid, str) and mid:
+            if role == "assistant":
+                self._assistant_message_ids.add(mid)
+            elif role == "user":
+                self._user_message_ids.add(mid)
+
+    def _part_id(self, part: dict[str, Any]) -> str:
+        for key in ("id", "partID", "partId"):
+            v = part.get(key)
+            if isinstance(v, str) and v:
+                return v
+        mid = part.get("messageID") or part.get("messageId")
+        if isinstance(mid, str) and mid:
+            return mid + ":text"
+        return "__single_text_part__"
+
+    def _is_assistant_part(self, part: dict[str, Any], evt: dict[str, Any]) -> bool:
+        mid = part.get("messageID") or part.get("messageId")
+        if isinstance(mid, str) and mid in self._user_message_ids:
+            return False
+        if isinstance(mid, str) and mid and self._assistant_message_ids:
+            return mid in self._assistant_message_ids
+        role = _event_role(evt)
+        if role and role != "assistant":
+            return False
+        # When OpenCode emits only a part event before the message info event,
+        # there is no role yet.  Accept text-only parts; reject known non-text
+        # types below.
+        return True
+
+    def _delta_from_full_text(self, part: dict[str, Any], text: str) -> str | None:
+        part_id = self._part_id(part)
+        prev = self._part_full_text.get(part_id, "")
+        self._part_full_text[part_id] = text
+        if not prev:
+            return text or None
+        if text == prev:
+            return None
+        if text.startswith(prev):
+            return text[len(prev) :] or None
+        # Snapshot reset or server-side compaction.  Prefer returning the new
+        # value over losing output; this rare path may duplicate but stays
+        # diagnosable through events.ndjson.
+        return text or None
+
+    def _consume_part(self, evt: dict[str, Any]) -> str | None:
+        part = _first_nested_dict(evt, "part")
+        if not isinstance(part, dict):
+            return None
+        part_type = str(part.get("type") or "").lower()
+        if part_type in self._NON_TEXT_TYPES:
+            return None
+        if part_type and part_type not in self._TEXT_TYPES:
+            return None
+        if not self._is_assistant_part(part, evt):
+            return None
+
+        props = _event_properties(evt)
+        delta = props.get("delta") or evt.get("delta")
+        if isinstance(delta, str) and delta:
+            part_id = self._part_id(part)
+            self._part_full_text[part_id] = self._part_full_text.get(part_id, "") + delta
+            return delta
+
+        for key in ("text", "content"):
+            v = part.get(key)
+            if isinstance(v, str) and v:
+                return self._delta_from_full_text(part, v)
+        return None
+
+    def _consume_direct_message_text(self, evt: dict[str, Any]) -> str | None:
+        evt = _event_payload(evt)
+        et = str(evt.get("type") or "").lower()
+        role = _event_role(evt)
+        if role and role != "assistant":
+            return None
+        if et and not (
+            et in {"message", "assistant", "response", "text", "message.text"}
+            or et.startswith("assistant")
+        ):
+            return None
+        for src in (evt, _event_properties(evt)):
+            for key in ("text", "delta", "content"):
+                v = src.get(key)
+                if isinstance(v, str) and v:
+                    return v
+        msg = _first_nested_dict(evt, "message")
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                return content
+            if isinstance(content, list):
+                chunks: list[str] = []
+                for item in content:
+                    if isinstance(item, str):
+                        chunks.append(item)
+                    elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                        chunks.append(str(item["text"]))
+                out = "".join(chunks)
+                return out or None
+        return None
+
+    def consume(self, raw_evt: dict[str, Any]) -> str | None:
+        evt = _event_payload(raw_evt)
+        if not isinstance(evt, dict):
+            return None
+        self._observe_message_info(evt)
+        text = self._consume_part(evt)
+        if text:
+            return text
+        return self._consume_direct_message_text(evt)
+
+
+def _extract_text_from_event(evt: dict[str, Any]) -> str | None:
+    # Backward-free, best-effort helper for tests/simple emitters.  Streaming
+    # paths should reuse a single _AssistantTextAccumulator instance.
+    return _AssistantTextAccumulator().consume(evt)
 
 
 @dataclass
@@ -2455,19 +3263,8 @@ class RunOutcome:
     error: dict[str, Any] | None
 
 
-@dataclass
-class MachinePayloadExtraction:
-    payload_status: str
-    payload_schema: str | None
-    decision_status: str
-    decision_route: str | None
-    payload_obj: dict[str, Any] | None
-    errors: list[dict[str, str]]
-    diagnostics: dict[str, Any]
-
-
 # ============================
-# Structured result extraction
+# Result validation
 # ============================
 
 
@@ -2488,7 +3285,7 @@ def _is_empty_model_output(outcome: RunOutcome, assistant_text: str) -> bool:
     """
     Detect model-completed-but-empty responses so callers don't treat them as success.
     Conservative gating: only triggers on successful, non-timeout outcomes with no
-    assistant text / payload signal.
+    assistant text or output-token signal.
     """
     if (not outcome.ok) or outcome.timed_out or (outcome.error is not None):
         return False
@@ -2519,420 +3316,67 @@ def _dedupe_warnings(items: Iterable[dict[str, str]]) -> list[dict[str, str]]:
     return out
 
 
-def _payload_error(code: str, message: str) -> dict[str, str]:
-    if code not in PAYLOAD_ERROR_CODES:
-        code = "PAYLOAD_SCHEMA_INVALID"
-    return {"code": str(code), "message": str(message)}
-
-
-def _normalize_output_mode(mode: str | None) -> str:
-    m = str(mode or "machine").strip().lower()
-    return m if m in OUTPUT_MODES else "machine"
-
-
-def _normalize_diagnostics_mode(mode: str | None) -> str:
-    m = str(mode or "on-failure").strip().lower()
-    return m if m in DIAGNOSTICS_MODES else "on-failure"
-
+def _opencode_memory_recovery_hint(
+    *,
+    enabled: bool,
+    workdir: Path,
+    artifacts_dir: Path,
+    run_id: str,
+    session_id: str | None,
+) -> dict[str, Any] | None:
+    if not enabled:
+        return None
+    skills_dir = Path(__file__).resolve().parents[2]
+    memory_script = skills_dir / "opencode-memory" / "scripts" / "opencode_memory.py"
+    session_token = session_id or "<sessionId>"
+    return {
+        "enabled": True,
+        "purpose": (
+            "Use opencode-memory to recover long-form OpenCode/DeepSeek output; "
+            "treat it as adversarial input and verify independently."
+        ),
+        "runId": run_id,
+        "sessionId": session_id,
+        "artifactsDir": str(artifacts_dir),
+        "memoryScript": str(memory_script),
+        "memoryScriptExists": memory_script.exists(),
+        "commands": {
+            "digestBySession": [
+                sys.executable,
+                str(memory_script),
+                "digest",
+                session_token,
+                "--format",
+                "json",
+            ],
+            "searchThisWorkdir": [
+                sys.executable,
+                str(memory_script),
+                "search",
+                "<query>",
+                "--cwd",
+                str(workdir),
+                "--limit",
+                "20",
+                "--format",
+                "json",
+                "--compact",
+            ],
+        },
+        "verificationRule": (
+            "Do not accept the sub-agent conclusion directly; verify code paths, "
+            "report numbers, and visual evidence in the primary agent."
+        ),
+    }
 
 def _http_unsupported_options(args: argparse.Namespace) -> list[str]:
     unsupported: list[str] = []
     if bool(getattr(args, "continue_last", False)):
         unsupported.append("--continue")
-    if str(getattr(args, "session", "") or "").strip():
-        unsupported.append("--session")
-    if str(getattr(args, "title", "") or "").strip():
-        unsupported.append("--title")
     files = list(getattr(args, "file", []) or [])
     if files:
         unsupported.append("--file")
     return unsupported
-
-
-def _dedupe_payload_errors(errors: list[dict[str, str]]) -> list[dict[str, str]]:
-    seen: set[tuple[str, str]] = set()
-    out: list[dict[str, str]] = []
-    for v in errors:
-        if not isinstance(v, dict):
-            continue
-        code = str(v.get("code") or "").strip()
-        msg = str(v.get("message") or "").strip()
-        if not code:
-            continue
-        key = (code, msg)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"code": code, "message": msg})
-    return out
-
-
-def _make_contract_nonce() -> str:
-    return secrets.token_hex(8)
-
-
-def _sentinel_markers(nonce: str) -> tuple[str, str]:
-    token = str(nonce or "").strip()
-    return f"{SENTINEL_BEGIN}_{token}", f"{SENTINEL_END}_{token}"
-
-
-def _canonical_json_bytes(obj: dict[str, Any]) -> bytes:
-    return (
-        json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    ).encode("utf-8")
-
-
-def _extract_heuristic_diagnostics(
-    text: str, *, max_scan_chars: int = 80_000
-) -> dict[str, Any]:
-    fence_obj: dict[str, Any] | None = None
-    blocks = JSON_FENCE_RE.findall(text or "")
-    for blk in reversed(blocks):
-        blk = blk.strip()
-        if not blk:
-            continue
-        try:
-            obj = json.loads(blk)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            fence_obj = obj
-            break
-
-    backscan_obj: dict[str, Any] | None = None
-    window = text[-max_scan_chars:] if len(text) > max_scan_chars else text
-    for i in range(len(window) - 1, -1, -1):
-        if window[i] != "{":
-            continue
-        candidate = window[i:].strip()
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            backscan_obj = obj
-            break
-
-    return {
-        "fence": fence_obj,
-        "backscan": backscan_obj,
-        "fenceCount": len(blocks),
-    }
-
-
-def _validate_payload_schema(obj: dict[str, Any] | None, nonce: str) -> list[dict[str, str]]:
-    if not isinstance(obj, dict):
-        return [_payload_error("PAYLOAD_JSON_INVALID", "payload must be a JSON object")]
-    errs: list[str] = []
-    if obj.get("protocol") != PAYLOAD_PROTOCOL:
-        errs.append(f"protocol must equal {PAYLOAD_PROTOCOL!r}")
-    if obj.get("nonce") != nonce:
-        return [_payload_error("NONCE_MISMATCH", f"payload nonce must equal {nonce!r}")]
-
-    raw_decision = obj.get("decision")
-    if not isinstance(raw_decision, str):
-        errs.append("decision must be string enum")
-    else:
-        d = raw_decision.strip().upper()
-        if d not in PAYLOAD_DECISIONS:
-            return [
-                _payload_error(
-                    "DECISION_INVALID",
-                    f"decision must be one of {sorted(PAYLOAD_DECISIONS)}; got {raw_decision!r}",
-                )
-            ]
-    if not isinstance(obj.get("summary"), str):
-        errs.append("summary must be string")
-    for key in ("evidence", "changes", "next_steps"):
-        v = obj.get(key)
-        if not isinstance(v, list):
-            errs.append(f"{key} must be string[]")
-            continue
-        if any((not isinstance(x, str)) for x in v):
-            errs.append(f"{key} must be string[]")
-    return [_payload_error("PAYLOAD_SCHEMA_INVALID", se) for se in errs]
-
-
-def _extract_machine_payload(
-    *,
-    text: str,
-    nonce: str | None,
-    output_mode: str,
-) -> MachinePayloadExtraction:
-    output_mode_n = _normalize_output_mode(output_mode)
-    nonce_n = str(nonce or "").strip()
-    diagnostics: dict[str, Any] = {
-        "expectedNonce": nonce_n or None,
-        "outputMode": output_mode_n,
-        "heuristics": _extract_heuristic_diagnostics(text),
-    }
-
-    if output_mode_n == "text":
-        diagnostics["machine"] = {"status": "not_requested"}
-        return MachinePayloadExtraction(
-            payload_status="not_requested",
-            payload_schema=None,
-            decision_status="not_requested",
-            decision_route=None,
-            payload_obj=None,
-            errors=[],
-            diagnostics=diagnostics,
-        )
-
-    if not nonce_n:
-        err = _payload_error("NONCE_MISMATCH", "missing contract nonce")
-        diagnostics["machine"] = {"status": "malformed"}
-        return MachinePayloadExtraction(
-            payload_status="malformed",
-            payload_schema=None,
-            decision_status="unavailable",
-            decision_route=None,
-            payload_obj=None,
-            errors=[err],
-            diagnostics=diagnostics,
-        )
-
-    begin_marker, end_marker = _sentinel_markers(nonce_n)
-    exact_begin_positions = [m.start() for m in re.finditer(re.escape(begin_marker), text)]
-    exact_end_positions = [m.start() for m in re.finditer(re.escape(end_marker), text)]
-    exact_begin_count = len(exact_begin_positions)
-    exact_end_count = len(exact_end_positions)
-    generic_begins = [
-        {"nonce": _normalize_observed_sentinel_nonce(m.group(1)), "index": m.start()}
-        for m in GENERIC_SENTINEL_BEGIN_RE.finditer(text or "")
-    ]
-    generic_ends = [
-        {"nonce": _normalize_observed_sentinel_nonce(m.group(1)), "index": m.start()}
-        for m in GENERIC_SENTINEL_END_RE.finditer(text or "")
-    ]
-    generic_nonces = sorted(
-        {
-            *(str(item["nonce"]) for item in generic_begins),
-            *(str(item["nonce"]) for item in generic_ends),
-        }
-    )
-    diagnostics["machine"] = {
-        "beginMarker": begin_marker,
-        "endMarker": end_marker,
-        "exactBeginCount": exact_begin_count,
-        "exactEndCount": exact_end_count,
-        "genericBeginCount": len(generic_begins),
-        "genericEndCount": len(generic_ends),
-        "genericNonces": generic_nonces,
-    }
-
-    if len(generic_nonces) > 1:
-        err = _payload_error(
-            "SENTINEL_MULTIPLE",
-            "multiple sentinel nonces found; nonce binding is ambiguous",
-        )
-        return MachinePayloadExtraction(
-            payload_status="ambiguous",
-            payload_schema=None,
-            decision_status="unavailable",
-            decision_route=None,
-            payload_obj=None,
-            errors=[err],
-            diagnostics=diagnostics,
-        )
-
-    if exact_begin_count == 0 and exact_end_count == 0:
-        if generic_nonces and nonce_n not in generic_nonces:
-            err = _payload_error(
-                "NONCE_MISMATCH",
-                f"found sentinel for nonce {generic_nonces[0]!r}, expected {nonce_n!r}",
-            )
-            return MachinePayloadExtraction(
-                payload_status="malformed",
-                payload_schema=None,
-                decision_status="unavailable",
-                decision_route=None,
-                payload_obj=None,
-                errors=[err],
-                diagnostics=diagnostics,
-            )
-        err = _payload_error(
-            "PAYLOAD_MISSING", "no authoritative payload sentinel found"
-        )
-        return MachinePayloadExtraction(
-            payload_status="missing",
-            payload_schema=None,
-            decision_status="unavailable",
-            decision_route=None,
-            payload_obj=None,
-            errors=[err],
-            diagnostics=diagnostics,
-        )
-
-    candidate_results: list[dict[str, Any]] = []
-    for begin_idx in exact_begin_positions:
-        end_idx = text.find(end_marker, begin_idx + len(begin_marker))
-        if end_idx == -1 or end_idx < begin_idx:
-            continue
-        payload_text = text[begin_idx + len(begin_marker) : end_idx].strip()
-        trailing = text[end_idx + len(end_marker) :]
-        candidate_errors: list[dict[str, str]] = []
-        if trailing.strip():
-            candidate_errors.append(
-                _payload_error(
-                    "SENTINEL_TRAILING_TEXT",
-                    "only whitespace is allowed after the END sentinel",
-                )
-            )
-
-        candidate_obj: dict[str, Any] | None = None
-        try:
-            parsed = json.loads(payload_text)
-            if isinstance(parsed, dict):
-                candidate_obj = parsed
-            else:
-                candidate_errors.append(
-                    _payload_error(
-                        "PAYLOAD_JSON_INVALID",
-                        "payload must decode to a JSON object",
-                    )
-                )
-        except Exception as ex:
-            candidate_errors.append(
-                _payload_error(
-                    "PAYLOAD_JSON_INVALID", f"{type(ex).__name__}: {ex}"
-                )
-            )
-
-        if isinstance(candidate_obj, dict):
-            candidate_errors.extend(_validate_payload_schema(candidate_obj, nonce_n))
-
-        candidate_results.append(
-            {
-                "begin": begin_idx,
-                "end": end_idx,
-                "payload_obj": candidate_obj,
-                "errors": _dedupe_payload_errors(candidate_errors),
-            }
-        )
-
-    diagnostics["machine"]["candidateCount"] = len(candidate_results)
-    valid_candidates = [
-        item
-        for item in candidate_results
-        if isinstance(item.get("payload_obj"), dict) and not item.get("errors")
-    ]
-    diagnostics["machine"]["validCandidateCount"] = len(valid_candidates)
-
-    if len(valid_candidates) > 1:
-        err = _payload_error(
-            "SENTINEL_MULTIPLE",
-            "multiple valid sentinel payloads found for the expected nonce",
-        )
-        return MachinePayloadExtraction(
-            payload_status="ambiguous",
-            payload_schema=None,
-            decision_status="unavailable",
-            decision_route=None,
-            payload_obj=None,
-            errors=[err],
-            diagnostics=diagnostics,
-        )
-
-    if len(valid_candidates) == 1:
-        obj = valid_candidates[0]["payload_obj"]
-        assert isinstance(obj, dict)
-        decision = str(obj["decision"]).strip().upper()
-        if decision == "UNDETERMINED":
-            decision_status = "abstained"
-            decision_route = None
-        else:
-            decision_status = "determinate"
-            decision_route = decision
-
-        return MachinePayloadExtraction(
-            payload_status="validated",
-            payload_schema=PAYLOAD_PROTOCOL,
-            decision_status=decision_status,
-            decision_route=decision_route,
-            payload_obj=obj,
-            errors=[],
-            diagnostics=diagnostics,
-        )
-
-    if not candidate_results:
-        err = _payload_error(
-            "PAYLOAD_MISSING",
-            "could not locate a matching payload region between sentinel markers",
-        )
-        return MachinePayloadExtraction(
-            payload_status="malformed",
-            payload_schema=None,
-            decision_status="unavailable",
-            decision_route=None,
-            payload_obj=None,
-            errors=[err],
-            diagnostics=diagnostics,
-        )
-
-    last_candidate = candidate_results[-1]
-    obj = (
-        last_candidate["payload_obj"]
-        if isinstance(last_candidate.get("payload_obj"), dict)
-        else None
-    )
-    deduped_errors = list(last_candidate["errors"])
-    if deduped_errors:
-        return MachinePayloadExtraction(
-            payload_status="malformed",
-            payload_schema=None,
-            decision_status="unavailable",
-            decision_route=None,
-            payload_obj=obj,
-            errors=deduped_errors,
-            diagnostics=diagnostics,
-        )
-
-    assert isinstance(obj, dict)
-    decision = str(obj["decision"]).strip().upper()
-    if decision == "UNDETERMINED":
-        decision_status = "abstained"
-        decision_route = None
-    else:
-        decision_status = "determinate"
-        decision_route = decision
-
-    return MachinePayloadExtraction(
-        payload_status="validated",
-        payload_schema=PAYLOAD_PROTOCOL,
-        decision_status=decision_status,
-        decision_route=decision_route,
-        payload_obj=obj,
-        errors=[],
-        diagnostics=diagnostics,
-    )
-
-
-def _default_contract_prompt(nonce: str) -> str:
-    begin_marker, end_marker = _sentinel_markers(nonce)
-    return (
-        "\n\n"
-        "SUBTASK OUTPUT CONTRACT (strict):\n"
-        f"At the very end, output exactly:\n"
-        f"{begin_marker}\n"
-        "{...one JSON object...}\n"
-        f"{end_marker}\n"
-        "No markdown, no code fences, no extra text after the END marker.\n"
-        "Do not quote or restate the BEGIN/END markers anywhere except the final block.\n"
-        "Schema:\n"
-        "{\n"
-        f'  "protocol": "{PAYLOAD_PROTOCOL}",\n'
-        f'  "nonce": "{nonce}",\n'
-        '  "decision": "GO_NO_DELTA" | "MANDATORY_DELTA" | "UNDETERMINED",\n'
-        '  "summary": string (<= 800 chars),\n'
-        '  "evidence": string[] (each: "path:line - fact", <= 10 items),\n'
-        '  "changes": string[] (<= 10 items),\n'
-        '  "next_steps": string[] (<= 10 items)\n'
-        "}\n"
-        'If you cannot safely determine the route, use "decision":"UNDETERMINED".\n'
-    )
-
 
 # ============================
 # Git diff / status
@@ -3051,8 +3495,6 @@ def _minimal_artifacts(
         "stderrPath": None,
         "assistantPath": None,
         "wrapperLogPath": None,
-        "payloadPath": None,
-        "diagnosticsPath": None,
     }
 
 
@@ -3066,9 +3508,9 @@ def _artifacts_obj(
     stderr_path: Path | None,
     assistant_path: Path | None,
     wrapper_log_path: Path | None,
+    progress_path: Path | None = None,
+    notification_path: Path | None = None,
     patch_path: str | None = None,
-    payload_path: Path | None = None,
-    diagnostics_path: Path | None = None,
 ) -> dict[str, Any]:
     def _name_if_exists(p: Path | None) -> str | None:
         return p.name if p and p.exists() else None
@@ -3082,8 +3524,8 @@ def _artifacts_obj(
         "stderrPath": _name_if_exists(stderr_path),
         "assistantPath": _name_if_exists(assistant_path),
         "wrapperLogPath": _name_if_exists(wrapper_log_path),
-        "payloadPath": _name_if_exists(payload_path),
-        "diagnosticsPath": _name_if_exists(diagnostics_path),
+        "progressPath": _name_if_exists(progress_path),
+        "notificationPath": (notification_path.name if notification_path else None),
     }
 
 
@@ -3091,7 +3533,6 @@ def _finish_obj(
     *,
     run_id: str,
     workdir: Path,
-    output_mode: str,
     outcome: str,
     exit_code: int,
     duration_ms: int,
@@ -3100,27 +3541,21 @@ def _finish_obj(
     session_id: str | None,
     execution_error: dict[str, Any] | None,
     execution_warnings: list[dict[str, str]] | None,
-    payload_status: str,
-    payload_schema: str | None,
-    payload_path: str | None,
-    payload_digest: str | None,
-    payload_errors: list[dict[str, str]] | None,
-    decision_status: str,
-    decision_route: str | None,
     changed_files: list[str],
     untracked_files: list[str],
     patch_path: str | None,
     artifacts: dict[str, Any],
+    subtask: dict[str, Any] | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
-    route_out = decision_route if decision_status == "determinate" else None
     obj: dict[str, Any] = {
         "type": "opencode-subtask-finish",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "runId": run_id,
+        "taskId": ((subtask or {}).get("taskId") if isinstance(subtask, dict) else None) or task_id,
         "workdir": str(workdir),
-        "outputMode": _normalize_output_mode(output_mode),
         "outcome": outcome,
         "execution": {
             "exitCode": int(exit_code),
@@ -3133,19 +3568,6 @@ def _finish_obj(
             "error": execution_error,
             "warnings": execution_warnings or [],
         },
-        "payload": {
-            "status": payload_status,
-            "schema": payload_schema,
-            "artifact": {
-                "path": payload_path,
-                "digest": payload_digest,
-            },
-            "errors": payload_errors or [],
-        },
-        "decision": {
-            "status": decision_status,
-            "route": route_out,
-        },
         "workspace": {
             "changedFiles": changed_files,
             "untrackedFiles": untracked_files,
@@ -3153,20 +3575,24 @@ def _finish_obj(
         },
         "artifacts": artifacts,
     }
+    if subtask is not None:
+        obj["subtask"] = subtask
     return obj
 
 
 def _start_obj(
     *,
     run_id: str,
+    task_id: str | None,
     pid: int,
     workdir: Path,
     artifacts_dir: Path,
     artifacts: dict[str, Any],
-    output_mode: str,
+    memory_recovery: dict[str, Any] | None = None,
     warnings: list[dict[str, str]] | None = None,
+    subtask: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    obj = {
         "type": "opencode-subtask-start",
         "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "adapterVersion": ADAPTER_VERSION,
@@ -3174,11 +3600,16 @@ def _start_obj(
         "ok": True,
         "warnings": warnings or [],
         "runId": run_id,
+        "taskId": task_id or run_id,
         "pid": pid,
         "workdir": str(workdir),
-        "outputMode": _normalize_output_mode(output_mode),
         "artifacts": artifacts,
     }
+    if memory_recovery is not None:
+        obj["memoryRecovery"] = memory_recovery
+    if subtask is not None:
+        obj["subtask"] = subtask
+    return obj
 
 
 def _status_obj(
@@ -3194,6 +3625,7 @@ def _status_obj(
     error: dict[str, Any] | None = None,
     warnings: list[dict[str, str]] | None = None,
     wait_expired: bool | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     warnings_out = warnings or []
     obj = {
@@ -3203,6 +3635,7 @@ def _status_obj(
         "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "runId": run_id,
+        "taskId": task_id,
         "status": status,
         "pid": pid,
         "workdir": workdir,
@@ -3254,43 +3687,6 @@ def _execution_outcome_from_error(
     return "failed"
 
 
-def _maybe_write_diagnostics(
-    *,
-    mode: str,
-    diagnostics_path: Path,
-    run_id: str,
-    output_mode: str,
-    execution_failed: bool,
-    extraction: MachinePayloadExtraction,
-) -> Path | None:
-    mode_n = _normalize_diagnostics_mode(mode)
-    output_mode_n = _normalize_output_mode(output_mode)
-    extraction_failed = (
-        extraction.payload_status != "not_requested"
-        if output_mode_n == "text"
-        else extraction.payload_status != "validated"
-    )
-    should_write = mode_n == "always" or (
-        mode_n == "on-failure" and (execution_failed or extraction_failed)
-    )
-    if not should_write:
-        return None
-    obj = {
-        "type": "opencode-subtask-diagnostics",
-        "schemaVersion": 1,
-        "adapterVersion": ADAPTER_VERSION,
-        "timestamp": _now_ms(),
-        "runId": run_id,
-        "outputMode": _normalize_output_mode(output_mode),
-        "payloadStatus": extraction.payload_status,
-        "decisionStatus": extraction.decision_status,
-        "errors": extraction.errors,
-        "diagnostics": extraction.diagnostics,
-    }
-    _write_json(diagnostics_path, obj)
-    return diagnostics_path
-
-
 # ============================
 # Permission mode
 # ============================
@@ -3337,6 +3733,52 @@ def _get_http_auth_from_env(env: dict[str, str]) -> HttpAuth | None:
         return HttpAuth(username=u, password=p)
     return None
 
+
+
+def _model_arg_to_http_message_model(model: str | None) -> dict[str, str] | None:
+    """Convert provider/model CLI syntax to the HTTP message body shape."""
+    if not model:
+        return None
+    provider_id, sep, model_id = str(model).partition("/")
+    if not sep or not provider_id or not model_id:
+        raise RuntimeError("HTTP model must use provider/model form")
+    return {"providerID": provider_id, "modelID": model_id}
+
+
+def _model_arg_to_http_session_model(
+    model: str | None, variant: str | None = None
+) -> dict[str, str] | None:
+    """Convert provider/model to the current session-create model shape.
+
+    OpenCode's own run client uses `{ providerID, id, variant? }` while the
+    message endpoint accepts `{ providerID, modelID }`.  We pass session model
+    only at creation time and keep the message body shape unchanged.
+    """
+    if not model:
+        return None
+    provider_id, sep, model_id = str(model).partition("/")
+    if not sep or not provider_id or not model_id:
+        raise RuntimeError("HTTP model must use provider/model form")
+    out = {"providerID": provider_id, "id": model_id}
+    if variant:
+        out["variant"] = variant
+    return out
+
+
+def _noninteractive_session_permission_rules(enabled: bool) -> list[dict[str, str]]:
+    """Rules borrowed from OpenCode's non-interactive run path.
+
+    These prevent a delegated child run from blocking on question/plan tools.
+    Tool/file permissions still remain under OpenCode's normal permission system
+    and this adapter's --permission-mode handling.
+    """
+    if not enabled:
+        return []
+    return [
+        {"permission": "question", "action": "deny", "pattern": "*"},
+        {"permission": "plan_enter", "action": "deny", "pattern": "*"},
+        {"permission": "plan_exit", "action": "deny", "pattern": "*"},
+    ]
 
 # ============================
 # Engines
@@ -3417,6 +3859,8 @@ def _run_cli(
     env: dict[str, str],
     attach_url: str | None,
     prompt_path: Path,
+    prompt_text: str,
+    cli_prompt_transport: str,
     continue_last: bool,
     session_id: str | None,
     title: str | None,
@@ -3451,10 +3895,19 @@ def _run_cli(
         cmd.extend(["--variant", variant])
     for f in files:
         cmd.extend(["--file", f])
-    # Always attach the prompt as a file; avoid shell quoting issues.
-    cmd.extend(["--file", str(prompt_path)])
-    cmd.append("--")
-    cmd.append("Follow the instructions in the attached prompt.txt.")
+
+    prompt_transport = (cli_prompt_transport or DEFAULT_CLI_PROMPT_TRANSPORT).strip().lower()
+    if prompt_transport not in {"stdin", "file"}:
+        prompt_transport = DEFAULT_CLI_PROMPT_TRANSPORT
+
+    # Latest `opencode run` resolves piped stdin as the message input.  Prefer
+    # stdin so prompt.txt remains an adapter artifact instead of a model-visible
+    # file attachment.  The file transport is kept as an explicit fallback.
+    use_stdin_prompt = prompt_transport == "stdin"
+    if not use_stdin_prompt:
+        cmd.extend(["--file", str(prompt_path)])
+        cmd.append("--")
+        cmd.append("Follow the instructions in the attached prompt.txt.")
 
     events_fp = (
         open(events_path, "ab", buffering=0) if (save_events and events_path) else None
@@ -3467,9 +3920,19 @@ def _run_cli(
     stderr_fp = open(stderr_path, "ab", buffering=0)
 
     tail = _TailText()
+    text_acc = _AssistantTextAccumulator()
     observed_session_id: str | None = session_id
     error_event: dict[str, Any] | None = None
     metrics: dict[str, Any] | None = None
+
+    stdin_source: Any = subprocess.DEVNULL
+    stdin_file: Any | None = None
+    if use_stdin_prompt:
+        # Feed the prompt through process stdin from the already-written
+        # prompt artifact. This keeps prompt.txt out of OpenCode's model-visible
+        # --file attachments while avoiding pipe-writer deadlocks on long prompts.
+        stdin_file = open(prompt_path, "rb")
+        stdin_source = stdin_file
 
     try:
         popen_kwargs: dict[str, Any] = {}
@@ -3483,13 +3946,18 @@ def _run_cli(
         proc = subprocess.Popen(
             cmd,
             cwd=str(workdir),
-            stdin=subprocess.DEVNULL,
+            stdin=stdin_source,
             stdout=subprocess.PIPE,
             stderr=stderr_fp,
             env=env,
             **popen_kwargs,
         )
     except Exception as e:
+        if stdin_file is not None:
+            try:
+                stdin_file.close()
+            except Exception:
+                pass
         if events_fp:
             events_fp.close()
         if assistant_fp:
@@ -3506,6 +3974,12 @@ def _run_cli(
             metrics=None,
             error={"name": type(e).__name__, "message": str(e)},
         )
+
+    if stdin_file is not None:
+        try:
+            stdin_file.close()
+        except Exception:
+            pass
 
     timed_out = False
     killed_for_size = False
@@ -3548,7 +4022,7 @@ def _run_cli(
                     pass
             if not quiet:
                 try:
-                    # Never write streaming events to stdout; stdout is reserved for the final one-line JSON.
+                    # Never write streaming events to stdout; stdout is reserved for the command result.
                     sys.stderr.buffer.write(raw)
                     sys.stderr.buffer.flush()
                 except Exception:
@@ -3560,7 +4034,8 @@ def _run_cli(
                 continue
             if not isinstance(evt, dict):
                 continue
-            sid = evt.get("sessionID") or evt.get("sessionId")
+            evt_payload = _event_payload(evt)
+            sid = _event_session_id(evt_payload)
             if isinstance(sid, str) and sid and sid != observed_session_id:
                 observed_session_id = sid
                 if on_session_id:
@@ -3568,11 +4043,12 @@ def _run_cli(
                         on_session_id(observed_session_id)
                     except Exception:
                         pass
-            if evt.get("type") == "error":
-                error_event = evt
+            et = evt_payload.get("type")
+            if et == "error" or (isinstance(et, str) and et.endswith(".error")):
+                error_event = evt_payload
             # Metrics from step-finish-ish events (best-effort)
-            if evt.get("type") in ("step-finish", "step_finish", "step-finished"):
-                part = evt.get("part") if isinstance(evt.get("part"), dict) else evt
+            if et in ("step-finish", "step_finish", "step-finished", "message.finish", "message.finished"):
+                part = _first_nested_dict(evt_payload, "part") or evt_payload
                 if isinstance(part, dict):
                     tok = (
                         part.get("tokens")
@@ -3580,12 +4056,13 @@ def _run_cli(
                         else None
                     )
                     metrics = {
-                        "reason": part.get("reason"),
+                        "reason": part.get("reason") or part.get("finish"),
                         "cost": part.get("cost"),
                         "tokens": tok,
                     }
-            # Collect assistant-ish text
-            t = _extract_text_from_event(evt)
+            # Collect final assistant text only; avoid user echoes, reasoning/tool
+            # metadata, and duplicate cumulative snapshots.
+            t = text_acc.consume(evt_payload)
             if isinstance(t, str) and t:
                 tail.append(t)
                 if assistant_fp:
@@ -3625,7 +4102,16 @@ def _run_cli(
             except Exception:
                 pass
 
+    # Let the reader drain buffered JSON events after process exit. Closing the
+    # pipe first can race and truncate final message.part.updated events.
     th.join(timeout=5)
+    if th.is_alive():
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+        th.join(timeout=1)
     supervisor.stop()
 
     if events_fp:
@@ -3645,7 +4131,7 @@ def _run_cli(
     full_text = tail.get()
     if killed_for_size:
         # Oversized artifacts are an execution failure; do not let a retained
-        # text tail produce an authoritative payload on the CLI path only.
+        # text tail make the run look successful.
         full_text = ""
 
     ok = (
@@ -3689,26 +4175,50 @@ def _run_cli(
 
 
 def _extract_text_from_message_obj(msg: dict[str, Any]) -> str:
-    # /message response is documented as Message, typically has parts[]
+    # /message response is documented as { info: Message, parts: Part[] }.
+    # Only text-like assistant parts are user-visible child-agent output.  Do
+    # not dump the full JSON response as text; that turns transport metadata
+    # into false success.
     parts = msg.get("parts")
     if isinstance(parts, list):
         out: list[str] = []
         for p in parts:
             if isinstance(p, dict):
-                if p.get("type") == "text" and isinstance(p.get("text"), str):
-                    out.append(p["text"])
-                # tolerate other shapes
-                elif isinstance(p.get("text"), str):
+                p_type = str(p.get("type") or "").lower()
+                if p_type and p_type not in {"text", "assistant_text", "output_text"}:
+                    continue
+                if isinstance(p.get("text"), str):
                     out.append(p["text"])
                 elif isinstance(p.get("content"), str):
                     out.append(p["content"])
             elif isinstance(p, str):
                 out.append(p)
         return "".join(out)
-    # fallback
-    if isinstance(msg.get("text"), str):
-        return str(msg["text"])
-    return json.dumps(msg, ensure_ascii=False)
+
+    for src in (msg, msg.get("info") if isinstance(msg.get("info"), dict) else None):
+        if not isinstance(src, dict):
+            continue
+        for key in ("text", "content", "output"):
+            v = src.get(key)
+            if isinstance(v, str):
+                return v
+        v = src.get("structured_output") or src.get("structuredOutput")
+        if isinstance(v, (dict, list)):
+            return json.dumps(v, ensure_ascii=False)
+    return ""
+
+
+def _extract_error_from_message_obj(msg: dict[str, Any]) -> dict[str, Any] | None:
+    for src in (msg, msg.get("info") if isinstance(msg.get("info"), dict) else None):
+        if not isinstance(src, dict):
+            continue
+        err = src.get("error")
+        if isinstance(err, dict):
+            return {"name": str(err.get("name") or "OpencodeMessageError"), "message": json.dumps(err, ensure_ascii=False)[:5000]}
+        if isinstance(err, str) and err:
+            return {"name": "OpencodeMessageError", "message": err[:5000]}
+    return None
+
 
 
 def _run_http(
@@ -3720,6 +4230,8 @@ def _run_http(
     agent: str | None,
     model: str | None,
     variant: str | None,
+    session_id_seed: str | None,
+    title: str | None,
     timeout_s: float,
     save_events: bool,
     save_text: bool,
@@ -3728,6 +4240,9 @@ def _run_http(
     stderr_path: Path,
     assistant_path: Path | None,
     permission_mode: str,
+    permission_approval: str,
+    http_deny_interactive_tools: bool,
+    subtask_permission_rules: list[dict[str, str]] | None,
     on_session_id: Any | None,
 ) -> RunOutcome:
     auth = _get_http_auth_from_env(env)
@@ -3765,6 +4280,9 @@ def _run_http(
     stop_evt = threading.Event()
     sse_connected = threading.Event()
     sse_open_error: list[str] = []
+    sse_tail = _TailText()
+    sse_text_acc = _AssistantTextAccumulator()
+    sse_error_event: list[dict[str, Any]] = []
     session_box: dict[str, str | None] = {"id": None}
 
     def _output_too_large_error(path: Path) -> dict[str, str]:
@@ -3793,23 +4311,32 @@ def _run_http(
     )
     supervisor.start()
 
-    def _noninteractive_permission_response(evt: dict[str, Any]) -> str:
-        """
-        Best-effort: align HTTP permission handling with the CLI "noninteractive" preset.
+    def _permission_object(evt: dict[str, Any]) -> dict[str, Any] | None:
+        evt = _event_payload(evt)
+        props = _event_properties(evt)
+        for src in (props, evt):
+            for key in ("permission", "request", "data"):
+                v = src.get(key)
+                if isinstance(v, dict):
+                    # Current permission.asked events often place the request
+                    # directly in properties; data/permission may wrap it.
+                    if key == "data":
+                        for nested_key in ("permission", "request"):
+                            nested = v.get(nested_key)
+                            if isinstance(nested, dict):
+                                return nested
+                    return v
+        return props if props else None
 
-        Goal: avoid hangs (no prompts) while denying a few high-risk classes when we can identify them
-        from SSE payloads. If we cannot classify the request, default to "allow" to keep unattended
-        runs moving (callers can always choose --permission-mode inherit for interactive safety).
+    def _noninteractive_permission_reply(evt: dict[str, Any]) -> str:
         """
-        perm_obj: dict[str, Any] | None = None
-        perm = evt.get("permission")
-        if isinstance(perm, dict):
-            perm_obj = perm
-        data = evt.get("data")
-        if perm_obj is None and isinstance(data, dict):
-            perm2 = data.get("permission")
-            if isinstance(perm2, dict):
-                perm_obj = perm2
+        Best-effort unattended policy for latest permission replies.
+
+        reply values are OpenCode's server-side contract: once / always / reject.
+        Unknown low-risk requests default to once so HTTP runs do not hang, while
+        broad delegation and .env-style secret reads are rejected when detected.
+        """
+        perm_obj = _permission_object(evt) or {}
 
         def _strings_from(obj: Any) -> list[str]:
             out: list[str] = []
@@ -3824,51 +4351,39 @@ def _run_http(
             return out
 
         kind = None
-        if perm_obj:
-            for k in ("permission", "type", "name", "tool", "category", "action"):
-                v = perm_obj.get(k)
-                if isinstance(v, str) and v:
-                    kind = v
-                    break
-        if not kind and isinstance(perm, str) and perm:
-            kind = perm
-
+        for k in ("permission", "type", "name", "tool", "category", "action"):
+            v = perm_obj.get(k)
+            if isinstance(v, str) and v:
+                kind = v
+                break
         kind_l = kind.lower() if isinstance(kind, str) else ""
         if kind_l in ("task", "skill", "external_directory", "doom_loop"):
-            return "deny"
+            return "reject"
 
         # Deny reads of .env-style secrets when we can detect them.
-        # (The CLI preset denies *.env and *.env.* but allows *.env.example.)
+        # (The config-level preset handles most cases; this protects HTTP auto-reply.)
         if kind_l.startswith("read") or kind_l == "read":
-            texts = [s.lower() for s in _strings_from(perm_obj or {})]
+            texts = [s.lower() for s in _strings_from(perm_obj)]
             for s in texts:
                 if s.endswith(".env.example"):
                     continue
                 if s.endswith(".env") or ".env." in s:
-                    return "deny"
+                    return "reject"
 
-        return "allow"
+        return "once"
 
-    def maybe_permission_id(evt: dict[str, Any]) -> str | None:
-        # Heuristic extraction: permissionID / permissionId / permission.id / data.permission.id
-        for k in ("permissionID", "permissionId"):
-            v = evt.get(k)
-            if isinstance(v, str) and v:
-                return v
-        perm = evt.get("permission")
-        if isinstance(perm, dict):
-            v = perm.get("id") or perm.get("permissionID") or perm.get("permissionId")
-            if isinstance(v, str) and v:
-                return v
-        data = evt.get("data")
-        if isinstance(data, dict):
-            perm2 = data.get("permission")
-            if isinstance(perm2, dict):
-                v = (
-                    perm2.get("id")
-                    or perm2.get("permissionID")
-                    or perm2.get("permissionId")
-                )
+    def _permission_reply_for_event(evt: dict[str, Any]) -> str:
+        if permission_mode == "allow":
+            return permission_approval
+        return _noninteractive_permission_reply(evt)
+
+    def maybe_permission_request_id(evt: dict[str, Any]) -> str | None:
+        # Latest shape: requestID.  Be liberal inside the latest contract because
+        # SSE may wrap the request under properties/data/permission.
+        evt = _event_payload(evt)
+        for src in _nested_event_dicts(evt):
+            for key in ("requestID", "requestId", "id"):
+                v = src.get(key)
                 if isinstance(v, str) and v:
                     return v
         return None
@@ -3932,8 +4447,12 @@ def _run_http(
                     if not isinstance(evt, dict):
                         continue
 
+                    evt = _event_payload(evt)
+                    if not isinstance(evt, dict):
+                        continue
+
                     # Filter by sessionID when present; keep server.connected even without sessionID.
-                    sid = evt.get("sessionID") or evt.get("sessionId")
+                    sid = _event_session_id(evt)
                     if isinstance(sid, str) and sid and sid != session_id:
                         continue
                     if not sid and evt.get("type") not in (
@@ -3953,22 +4472,28 @@ def _run_http(
                         except Exception:
                             pass
 
-                    # Auto permission replies (best-effort)
+                    et = evt.get("type")
+                    if et == "session.error" or (isinstance(et, str) and et.endswith(".error")):
+                        sse_error_event.append(evt)
+
+                    # Keep a text fallback from the same event stream used by
+                    # official clients.  We do not write it to assistant.txt
+                    # here to avoid duplicating the synchronous /message
+                    # response; it is used only if the response object has no
+                    # extractable text.
+                    t = sse_text_acc.consume(evt)
+                    if isinstance(t, str) and t:
+                        sse_tail.append(t)
+
+                    # Auto permission replies (best-effort, latest server contract).
                     if permission_mode in ("allow", "noninteractive"):
-                        et = evt.get("type")
                         if isinstance(et, str) and "permission" in et:
-                            pid = maybe_permission_id(evt)
-                            if pid and pid not in responded_permissions:
-                                responded_permissions.add(pid)
+                            request_id = maybe_permission_request_id(evt)
+                            if request_id and request_id not in responded_permissions:
+                                responded_permissions.add(request_id)
                                 client.reply_permission(
-                                    session_id,
-                                    pid,
-                                    response=(
-                                        "allow"
-                                        if permission_mode == "allow"
-                                        else _noninteractive_permission_response(evt)
-                                    ),
-                                    remember=False,
+                                    request_id,
+                                    reply=_permission_reply_for_event(evt),
                                 )
 
                     continue  # done processing one event
@@ -3987,11 +4512,26 @@ def _run_http(
     session: dict[str, Any] | None = None
     session_id: str | None = None
     try:
-        session = client.create_session()
-        sid = session.get("id") if isinstance(session.get("id"), str) else None
-        if not sid:
-            raise RuntimeError("Session created but missing id")
-        session_id = sid
+        if session_id_seed:
+            session_id = session_id_seed
+        else:
+            session = client.create_session(
+                title=title,
+                agent=agent,
+                model=_model_arg_to_http_session_model(model, variant),
+                permission=_dedupe_permission_rules(
+                    [
+                        *_noninteractive_session_permission_rules(
+                            bool(http_deny_interactive_tools)
+                        ),
+                        *(subtask_permission_rules or []),
+                    ]
+                ),
+            )
+            sid = session.get("id") if isinstance(session.get("id"), str) else None
+            if not sid:
+                raise RuntimeError("Session created but missing id")
+            session_id = sid
         session_box["id"] = session_id
         if on_session_id:
             try:
@@ -4113,20 +4653,37 @@ def _run_http(
         supervisor.stop()
 
     if err is None and isinstance(msg_obj, dict):
-        text = _extract_text_from_message_obj(msg_obj)
-        if assistant_fp:
-            try:
-                assistant_fp.write(text.encode("utf-8", errors="replace"))
-            except Exception:
-                pass
-        breached_after_write = supervisor.breached_path or _first_breached_artifact_path(
-            watched_artifact_paths, max_artifact_bytes
-        )
-        if breached_after_write is not None:
-            err = _output_too_large_error(breached_after_write)
+        msg_error = _extract_error_from_message_obj(msg_obj)
+        if msg_error is not None:
+            err = msg_error
             full_text = ""
         else:
-            full_text = text
+            text = _extract_text_from_message_obj(msg_obj)
+            if not text:
+                # Some server/client combinations surface the complete text in
+                # events but return an empty message body.  Fall back to the
+                # subscribed event stream rather than forcing a duplicate CLI run.
+                text = sse_tail.get()
+            if (not text) and sse_error_event:
+                err = {
+                    "name": "OpencodeSseErrorEvent",
+                    "message": json.dumps(sse_error_event[-1], ensure_ascii=False)[:5000],
+                }
+                full_text = ""
+            else:
+                if assistant_fp:
+                    try:
+                        assistant_fp.write(text.encode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+                breached_after_write = supervisor.breached_path or _first_breached_artifact_path(
+                    watched_artifact_paths, max_artifact_bytes
+                )
+                if breached_after_write is not None:
+                    err = _output_too_large_error(breached_after_write)
+                    full_text = ""
+                else:
+                    full_text = text
     else:
         full_text = ""
 
@@ -4160,17 +4717,162 @@ def _run_http(
 # ============================
 
 
+def _assistant_text_from_finish_for_ask(
+    finish_obj: dict[str, Any],
+) -> tuple[str, Path | None]:
+    """Return assistant final text for the direct `ask` command."""
+    artifacts = finish_obj.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return "", None
+    raw_dir = artifacts.get("dir")
+    raw_assistant = artifacts.get("assistantPath")
+    if not isinstance(raw_dir, str) or not raw_dir:
+        return "", None
+    if not isinstance(raw_assistant, str) or not raw_assistant:
+        return "", None
+    assistant_path = Path(raw_dir).expanduser() / raw_assistant
+    try:
+        return _read_text(assistant_path), assistant_path
+    except Exception:
+        return "", assistant_path
+
+
+def _finish_path_from_finish_for_ask(finish_obj: dict[str, Any]) -> Path | None:
+    artifacts = finish_obj.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return None
+    raw_dir = artifacts.get("dir")
+    raw_finish = artifacts.get("finishPath")
+    if not isinstance(raw_dir, str) or not raw_dir:
+        return None
+    if not isinstance(raw_finish, str) or not raw_finish:
+        return None
+    return Path(raw_dir).expanduser() / raw_finish
+
+
+def _ask_error_message(obj: dict[str, Any] | None, raw_stdout: str) -> str:
+    if isinstance(obj, dict) and obj.get("type") == "opencode-subtask-finish":
+        outcome = str(obj.get("outcome") or "unknown")
+        execution = obj.get("execution") if isinstance(obj.get("execution"), dict) else {}
+        err = execution.get("error") if isinstance(execution, dict) else None
+        if isinstance(err, dict):
+            name = str(err.get("name") or "ExecutionError")
+            msg = str(err.get("message") or "")
+        else:
+            name = "ExecutionError"
+            msg = f"opencode finished with outcome={outcome}"
+        finish_path = _finish_path_from_finish_for_ask(obj)
+        suffix = f"; finish={finish_path}" if finish_path else ""
+        return f"opencode-subtask ask failed: outcome={outcome}; {name}: {msg}{suffix}"
+
+    if isinstance(obj, dict) and obj.get("type") == "opencode-subtask-error":
+        err = obj.get("error") if isinstance(obj.get("error"), dict) else {}
+        name = str(err.get("name") or "AdapterError") if isinstance(err, dict) else "AdapterError"
+        msg = str(err.get("message") or "") if isinstance(err, dict) else ""
+        return f"opencode-subtask ask failed before execution: {name}: {msg}"
+
+    raw = " ".join((raw_stdout or "").split())
+    if len(raw) > 1000:
+        raw = raw[:997] + "..."
+    return (
+        "opencode-subtask ask failed: adapter produced no parseable finish envelope; "
+        f"raw_stdout={raw!r}"
+    )
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Run a subtask and print only the assistant's final text to stdout."""
+    # `ask` is the natural-language subagent surface. Always preserve assistant.txt;
+    # stdout from cmd_run stays internal and is translated into final assistant text.
+    args.save_text = True
+    args.quiet = True
+    args._force_save_text = True
+
+    buf = io.StringIO()
+    rc = 1
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = int(cmd_run(args))
+    except SystemExit as exc:
+        try:
+            rc = int(exc.code) if exc.code is not None else 1
+        except Exception:
+            rc = 1
+
+    raw_stdout = buf.getvalue().strip()
+    obj: dict[str, Any] | None = None
+    if raw_stdout:
+        first_line = raw_stdout.splitlines()[0]
+        try:
+            parsed = json.loads(first_line)
+            if isinstance(parsed, dict):
+                obj = parsed
+        except Exception:
+            obj = None
+
+    if rc == 0 and isinstance(obj, dict) and obj.get("type") == "opencode-subtask-finish":
+        if bool(getattr(args, "ask_metadata_to_stderr", False)):
+            sys.stderr.write(
+                "OPENCODE_SUBTASK_META " + _json_line(_ask_metadata_obj(obj)) + "\n"
+            )
+        text, assistant_path = _assistant_text_from_finish_for_ask(obj)
+        if text:
+            out_text, truncated = _truncate_for_ask_stdout(
+                text,
+                max_chars=int(
+                    getattr(args, "ask_stdout_max_chars", DEFAULT_ASK_STDOUT_MAX_CHARS)
+                ),
+                assistant_path=assistant_path,
+            )
+            sys.stdout.write(out_text)
+            if truncated:
+                sys.stderr.write(
+                    "[opencode-subtask] NOTE: ask stdout was truncated; full assistant text is in "
+                    + (str(assistant_path) if assistant_path else "assistant.txt")
+                    + "\n"
+                )
+            return 0
+        finish_path = _finish_path_from_finish_for_ask(obj)
+        suffix = f"; finish={finish_path}" if finish_path else ""
+        if assistant_path:
+            suffix += f"; assistant={assistant_path}"
+        sys.stderr.write(
+            "opencode-subtask ask failed: completed run had no assistant text"
+            + suffix
+            + "\n"
+        )
+        return 1
+
+    if bool(getattr(args, "ask_error_json_to_stderr", False)) and isinstance(obj, dict):
+        sys.stderr.write("OPENCODE_SUBTASK_ERROR_JSON " + _json_line(obj) + "\n")
+    sys.stderr.write(_ask_error_message(obj, raw_stdout) + "\n")
+    return rc if rc != 0 else 1
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    """OpenCode Task-like entrypoint for external parent agents."""
+    if bool(getattr(args, "background", False)):
+        return cmd_start(args)
+    return cmd_ask(args)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
-    output_mode_n = _normalize_output_mode(getattr(args, "output_mode", "machine"))
-    diagnostics_mode = _normalize_diagnostics_mode(getattr(args, "diagnostics", None))
-    contract_nonce = (
-        None
-        if output_mode_n == "text"
-        else str(getattr(args, "contract_nonce", None) or _make_contract_nonce())
-    )
     run_timeout_s = float(args.run_timeout)
     run_started_ms = _now_ms()
+    task_res = _resolve_task_id_for_run(args, workdir)
+    setattr(args, "_adapter_task_id", task_res.task_id)
+    if _task_is_running(task_res.prior_state) and str(getattr(args, "on_running_task", "fail")) != "start-new":
+        obj = _error_obj(
+            error_name="TaskAlreadyRunning",
+            message=(
+                f"task_id {task_res.task_id!r} already has a running OpenCode child. "
+                "Use status/wait/watch with --task-id, or pass --on-running-task start-new to override."
+            ),
+        )
+        obj["task"] = task_res.prior_state
+        sys.stdout.write(_json_line(obj) + "\n")
+        return 2
 
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -4191,17 +4893,36 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Prompt
     prompt = _resolve_prompt_input(args)
+    if bool(getattr(args, "task_memory", True)):
+        prompt = prompt.rstrip() + _task_memory_block(
+            task_res,
+            max_chars=int(getattr(args, "task_memory_max_chars", DEFAULT_TASK_MEMORY_MAX_CHARS)),
+        )
 
     # Merge env early so profile thresholds can honor --env / --env-file overrides.
     env = _safe_merge_env(os.environ, set_vars=args.env, set_from_files=args.env_file)
+    subtask_info = _apply_subtask_preset(args)
+    subtask_info["taskStatePath"] = str(task_res.state_path)
+    subtask_info["taskProgressPath"] = str(task_res.progress_path)
+    subtask_info["continued"] = bool(task_res.prior_state)
+    http_deny_interactive_tools = _effective_http_deny_interactive_tools(
+        args, subtask_info
+    )
     requested_engine = str(getattr(args, "engine", "auto"))
     profile_info = _apply_execution_profile(args, prompt, env)
+    subtask_info["executionProfile"] = getattr(args, "execution_profile", None)
+    if bool(getattr(args, "_force_save_text", False)):
+        args.save_text = True
 
     prompt = _apply_persona_policy(prompt, args.persona_mode, args.persona_line)
-
-    if output_mode_n == "machine":
-        assert contract_nonce is not None
-        prompt = prompt + _default_contract_prompt(contract_nonce)
+    prompt = _apply_subagent_briefing(
+        prompt,
+        enabled=bool(getattr(args, "subagent_briefing", False)),
+        final_answer_budget_chars=int(
+            getattr(args, "final_answer_budget_chars", DEFAULT_FINAL_ANSWER_BUDGET_CHARS)
+        ),
+    )
+    prompt = _apply_subtask_briefing(prompt, subtask_info=subtask_info)
 
     prompt_path = artifacts_dir / "prompt.txt"
     _write_text(prompt_path, prompt)
@@ -4211,8 +4932,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     events_path = artifacts_dir / "events.ndjson" if args.save_events else None
     assistant_path = artifacts_dir / "assistant.txt" if args.save_text else None
     stderr_path = artifacts_dir / "stderr.log"
-    payload_path = artifacts_dir / "payload.json"
-    diagnostics_path = artifacts_dir / "diagnostics.json"
     # wrapper.log is only meaningful in start (background) mode;
     # in foreground run mode the file won't exist, so _artifacts_obj
     # will return null for wrapperLogPath.  But we point to the
@@ -4221,8 +4940,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     wrapper_log_path = artifacts_dir / "wrapper.log"
 
     # Job init
+    seed_session_id = str(getattr(args, "session", "") or "").strip() or None
+    memory_recovery = _opencode_memory_recovery_hint(
+        enabled=bool(getattr(args, "memory_friendly", False)),
+        workdir=workdir,
+        artifacts_dir=artifacts_dir,
+        run_id=run_id,
+        session_id=seed_session_id,
+    )
     job_obj = {
         "runId": run_id,
+        "taskId": task_res.task_id,
         "adapterVersion": ADAPTER_VERSION,
         "workdir": str(workdir),
         "state": "running",
@@ -4230,20 +4958,53 @@ def cmd_run(args: argparse.Namespace) -> int:
         "updatedAt": _now_ms(),
         "pid": os.getpid(),
         "engine": args.engine,
-        "outputMode": output_mode_n,
-        "diagnosticsMode": diagnostics_mode,
-        "contractNonce": contract_nonce,
         "stopServerAfterRunMode": str(
             getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
         ),
         "serverStartedNew": False,
         "httpAttempted": False,
         "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
+        "sessionId": seed_session_id,
+        "memoryFriendly": bool(getattr(args, "memory_friendly", False)),
+        "memoryRecovery": memory_recovery,
+        "subtask": subtask_info,
     }
     _write_job_locked(job_path, artifacts_dir, job_obj)
+    _write_task_state_locked(
+        workdir=workdir,
+        task_id=task_res.task_id,
+        update={
+            "state": "running",
+            "latestRunId": run_id,
+            "latestArtifactsDir": str(artifacts_dir),
+            "sessionId": seed_session_id,
+            "subtask": subtask_info,
+            "agent": getattr(args, "agent", None),
+            "model": getattr(args, "model", None),
+            "variant": getattr(args, "variant", None),
+            "title": getattr(args, "title", None),
+        },
+    )
+    _append_task_progress(
+        task_res.progress_path,
+        event="started",
+        fields={
+            "runId": run_id,
+            "sessionId": seed_session_id,
+            "subtaskType": subtask_info.get("type"),
+            "agent": getattr(args, "agent", None),
+            "engine": getattr(args, "engine", None),
+            "artifactsDir": str(artifacts_dir),
+        },
+    )
 
     def _update_job(fields: dict[str, Any]) -> None:
         _update_job_fields_locked(job_path, artifacts_dir, fields)
+        task_update = {"latestRunId": run_id, "latestArtifactsDir": str(artifacts_dir)}
+        if "sessionId" in fields:
+            task_update["sessionId"] = fields.get("sessionId")
+            _append_task_progress(task_res.progress_path, event="session", fields={"sessionId": fields.get("sessionId")})
+        _write_task_state_locked(workdir=workdir, task_id=task_res.task_id, update=task_update)
 
     # Env
     # Defensive defaults (no-op if ignored by OpenCode)
@@ -4251,6 +5012,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.disable_claude_code:
         env.setdefault("OPENCODE_DISABLE_CLAUDE_CODE", "1")
     _apply_permission_mode(env, args.permission_mode)
+    _apply_subtask_permission_rules_to_env(
+        env, list(subtask_info.get("permissionRules") or [])
+    )
 
     auth = _get_http_auth_from_env(env)
     reaper_info: dict[str, Any] | None = None
@@ -4308,7 +5072,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             out = _finish_obj(
                 run_id=run_id,
                 workdir=workdir,
-                output_mode=output_mode_n,
                 outcome="internal_error",
                 exit_code=127,
                 duration_ms=max(0, _now_ms() - run_started_ms),
@@ -4320,24 +5083,6 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "message": f"Could not find opencode executable: {default_cmd}",
                 },
                 execution_warnings=[],
-                payload_status="not_requested" if output_mode_n == "text" else "missing",
-                payload_schema=None,
-                payload_path=None,
-                payload_digest=None,
-                payload_errors=(
-                    []
-                    if output_mode_n == "text"
-                    else [
-                        _payload_error(
-                            "PAYLOAD_MISSING",
-                            "execution failed before any authoritative payload was produced",
-                        )
-                    ]
-                ),
-                decision_status="not_requested"
-                if output_mode_n == "text"
-                else "unavailable",
-                decision_route=None,
                 changed_files=[],
                 untracked_files=[],
                 patch_path=None,
@@ -4350,9 +5095,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                     stderr_path=stderr_path,
                     assistant_path=assistant_path,
                     wrapper_log_path=wrapper_log_path,
-                    payload_path=None,
-                    diagnostics_path=None,
+                    progress_path=task_res.progress_path,
+                    notification_path=artifacts_dir / "notification.json",
                 ),
+                subtask=subtask_info,
             )
             finish_written, _, existing_finish = _write_finish_once(
                 artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
@@ -4390,6 +5136,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         wait_s=args.server_wait,
                         env=env,
                         auth=auth,
+                        cors_origins=list(getattr(args, "server_cors", []) or []),
                     )
                     server_started_new = (
                         bool(server_state.get("startedNew"))
@@ -4486,6 +5233,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             env=env,
             attach_url=cli_attach_url,
             prompt_path=prompt_path,
+            prompt_text=prompt,
+            cli_prompt_transport=str(
+                getattr(args, "cli_prompt_transport", DEFAULT_CLI_PROMPT_TRANSPORT)
+            ),
             continue_last=bool(getattr(args, "continue_last", False)),
             session_id=getattr(args, "session", None),
             title=getattr(args, "title", None),
@@ -4544,6 +5295,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             agent=args.agent,
             model=args.model,
             variant=getattr(args, "variant", None),
+            session_id_seed=getattr(args, "session", None),
+            title=getattr(args, "title", None),
             timeout_s=run_timeout_s,
             save_events=args.save_events,
             save_text=args.save_text,
@@ -4552,17 +5305,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             stderr_path=stderr_path,
             assistant_path=assistant_path,
             permission_mode=args.permission_mode,
+            permission_approval=args.permission_approval,
+            http_deny_interactive_tools=http_deny_interactive_tools,
+            subtask_permission_rules=list(subtask_info.get("permissionRules") or []),
             on_session_id=lambda sid: _update_job({"sessionId": sid}),
         )
 
     changed_files: list[str] = []
     untracked_files: list[str] = []
     patch_name: str | None = None
-    extraction = _extract_machine_payload(
-        text="",
-        nonce=contract_nonce,
-        output_mode=output_mode_n,
-    )
     baseline_untracked = set(_git_status(workdir)[1])
     while True:
         http_was_attempted = False
@@ -4637,60 +5388,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             outcome.ok = False
         break
 
-    full_text_for_extraction = outcome.full_text
-    if isinstance(outcome.error, dict) and outcome.error.get("name") == "OutputTooLarge":
-        full_text_for_extraction = ""
-
-    extraction = _extract_machine_payload(
-        text=full_text_for_extraction,
-        nonce=contract_nonce,
-        output_mode=output_mode_n,
-    )
-    payload_file_for_finish: str | None = None
-    payload_digest: str | None = None
-    if extraction.payload_status == "validated" and isinstance(extraction.payload_obj, dict):
-        try:
-            _atomic_write_bytes(payload_path, _canonical_json_bytes(extraction.payload_obj))
-            payload_digest = _sha256_file(payload_path)
-            payload_file_for_finish = payload_path.name
-        except Exception as ex:
-            extraction = MachinePayloadExtraction(
-                payload_status="persist_failed",
-                payload_schema=None,
-                decision_status="unavailable",
-                decision_route=None,
-                payload_obj=extraction.payload_obj,
-                errors=_dedupe_payload_errors(
-                    [
-                        *extraction.errors,
-                        _payload_error(
-                            "PAYLOAD_PERSIST_FAILED",
-                            f"{type(ex).__name__}: {ex}",
-                        ),
-                    ]
-                ),
-                diagnostics=extraction.diagnostics,
-            )
-
-    diagnostics_written_path: Path | None = None
     execution_error = outcome.error
     outcome_name = _execution_outcome_from_error(
         exit_code=outcome.exit_code,
         timed_out=outcome.timed_out,
         error=execution_error,
     )
-    try:
-        diagnostics_written_path = _maybe_write_diagnostics(
-            mode=diagnostics_mode,
-            diagnostics_path=diagnostics_path,
-            run_id=run_id,
-            output_mode=output_mode_n,
-            execution_failed=(outcome_name != "completed"),
-            extraction=extraction,
-        )
-    except Exception:
-        diagnostics_written_path = None
-
     execution_warnings: list[dict[str, str]] = list(runtime_preflight_warnings)
     if auto_http_skip_warning:
         execution_warnings.append(auto_http_skip_warning)
@@ -4719,7 +5422,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     out = _finish_obj(
         run_id=run_id,
         workdir=workdir,
-        output_mode=output_mode_n,
         outcome=outcome_name,
         exit_code=outcome.exit_code,
         duration_ms=max(0, _now_ms() - run_started_ms),
@@ -4728,13 +5430,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         session_id=outcome.session_id,
         execution_error=execution_error,
         execution_warnings=execution_warnings,
-        payload_status=extraction.payload_status,
-        payload_schema=extraction.payload_schema,
-        payload_path=payload_file_for_finish,
-        payload_digest=payload_digest,
-        payload_errors=extraction.errors,
-        decision_status=extraction.decision_status,
-        decision_route=extraction.decision_route,
         changed_files=changed_files,
         untracked_files=untracked_files,
         patch_path=patch_name,
@@ -4747,9 +5442,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             stderr_path=stderr_path,
             assistant_path=assistant_path,
             wrapper_log_path=wrapper_log_path,
-            payload_path=(payload_path if payload_file_for_finish else None),
-            diagnostics_path=diagnostics_written_path,
+            progress_path=task_res.progress_path,
+            notification_path=artifacts_dir / "notification.json",
         ),
+        subtask=subtask_info,
     )
 
     finish_written, finish_reason, existing_finish = _write_finish_once(
@@ -4769,21 +5465,55 @@ def cmd_run(args: argparse.Namespace) -> int:
         fields: dict[str, Any] = {
             "state": "finished",
             "outcome": outcome_name,
-            "outputMode": output_mode_n,
             "serverStartedNew": server_started_new,
             "httpAttempted": http_was_attempted,
             "stopServerAfterRunMode": stop_server_mode,
             "emptyOutputDetected": empty_output_detected,
             "emptyOutputRetried": empty_output_retried,
             "emptyOutputRecovered": empty_output_recovered,
-            "payloadStatus": extraction.payload_status,
-            "decisionStatus": extraction.decision_status,
         }
         if outcome.session_id:
             fields["sessionId"] = outcome.session_id
         if attach_url:
             fields["serverUrl"] = attach_url
         _update_job_fields_locked(job_path, artifacts_dir, fields)
+
+    notification_path = _write_notification(
+        artifacts_dir=artifacts_dir,
+        finish_obj=out,
+        task_state_path=task_res.state_path,
+    )
+    _append_task_progress(
+        task_res.progress_path,
+        event="finished",
+        fields={
+            "runId": run_id,
+            "sessionId": outcome.session_id,
+            "outcome": outcome_name,
+            "changedFiles": changed_files,
+            "untrackedFiles": untracked_files,
+            "patchPath": patch_name,
+            "notificationPath": str(notification_path) if notification_path else None,
+        },
+    )
+    _write_task_state_locked(
+        workdir=workdir,
+        task_id=task_res.task_id,
+        update={
+            "state": "finished",
+            "outcome": outcome_name,
+            "latestRunId": run_id,
+            "latestArtifactsDir": str(artifacts_dir),
+            "sessionId": outcome.session_id or seed_session_id,
+            "changedFiles": changed_files,
+            "untrackedFiles": untracked_files,
+            "patchPath": patch_name,
+            "notificationPath": str(notification_path) if notification_path else None,
+            "finishPath": str(finish_path),
+            "assistantPath": str(assistant_path) if assistant_path else None,
+            "subtask": subtask_info,
+        },
+    )
 
     # Optional: stop the per-project server after completion.
     should_stop_server = False
@@ -4837,14 +5567,19 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_start(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
-    output_mode_n = _normalize_output_mode(getattr(args, "output_mode", "machine"))
-    diagnostics_mode = _normalize_diagnostics_mode(getattr(args, "diagnostics", None))
-    contract_nonce = (
-        None
-        if output_mode_n == "text"
-        else str(getattr(args, "contract_nonce", None) or _make_contract_nonce())
-    )
-
+    task_res = _resolve_task_id_for_run(args, workdir)
+    setattr(args, "_adapter_task_id", task_res.task_id)
+    if _task_is_running(task_res.prior_state) and str(getattr(args, "on_running_task", "fail")) != "start-new":
+        obj = _error_obj(
+            error_name="TaskAlreadyRunning",
+            message=(
+                f"task_id {task_res.task_id!r} already has a running OpenCode child. "
+                "Use status/wait/watch with --task-id, or pass --on-running-task start-new to override."
+            ),
+        )
+        obj["task"] = task_res.prior_state
+        sys.stdout.write(_json_line(obj) + "\n")
+        return 2
     run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     finish_path = artifacts_dir / "finish.json"
@@ -4864,34 +5599,87 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     # Prompt
     prompt = _resolve_prompt_input(args)
+    if bool(getattr(args, "task_memory", True)):
+        prompt = prompt.rstrip() + _task_memory_block(
+            task_res,
+            max_chars=int(getattr(args, "task_memory_max_chars", DEFAULT_TASK_MEMORY_MAX_CHARS)),
+        )
+    subtask_info = _apply_subtask_preset(args)
+    subtask_info["taskStatePath"] = str(task_res.state_path)
+    subtask_info["taskProgressPath"] = str(task_res.progress_path)
+    subtask_info["continued"] = bool(task_res.prior_state)
 
     prompt = _apply_persona_policy(prompt, args.persona_mode, args.persona_line)
-    # Note: the worker (`run`) appends the output contract when outputMode=machine.
+    prompt = _apply_subagent_briefing(
+        prompt,
+        enabled=bool(getattr(args, "subagent_briefing", False)),
+        final_answer_budget_chars=int(
+            getattr(args, "final_answer_budget_chars", DEFAULT_FINAL_ANSWER_BUDGET_CHARS)
+        ),
+    )
+    prompt = _apply_subtask_briefing(prompt, subtask_info=subtask_info)
 
     prompt_path = artifacts_dir / "prompt.txt"
     _write_text(prompt_path, prompt)
 
     job_path = artifacts_dir / "job.json"
     wrapper_log_path = artifacts_dir / "wrapper.log"
+    seed_session_id = str(getattr(args, "session", "") or "").strip() or None
+    memory_recovery = _opencode_memory_recovery_hint(
+        enabled=bool(getattr(args, "memory_friendly", False)),
+        workdir=workdir,
+        artifacts_dir=artifacts_dir,
+        run_id=run_id,
+        session_id=seed_session_id,
+    )
 
     _write_job_locked(
         job_path,
         artifacts_dir,
         {
             "runId": run_id,
+            "taskId": task_res.task_id,
             "adapterVersion": ADAPTER_VERSION,
             "workdir": str(workdir),
             "state": "queued",
-            "outputMode": output_mode_n,
-            "diagnosticsMode": diagnostics_mode,
-            "contractNonce": contract_nonce,
             "stopServerAfterRunMode": str(
                 getattr(args, "stop_server_after_run", DEFAULT_STOP_SERVER_AFTER_RUN)
             ),
             "serverStartedNew": False,
             "orphanReaperEnabled": bool(getattr(args, "orphan_reaper", True)),
+            "sessionId": seed_session_id,
+            "memoryFriendly": bool(getattr(args, "memory_friendly", False)),
+            "memoryRecovery": memory_recovery,
+            "subtask": subtask_info,
             "createdAt": _now_ms(),
             "updatedAt": _now_ms(),
+        },
+    )
+    _write_task_state_locked(
+        workdir=workdir,
+        task_id=task_res.task_id,
+        update={
+            "state": "running",
+            "latestRunId": run_id,
+            "latestArtifactsDir": str(artifacts_dir),
+            "sessionId": seed_session_id,
+            "subtask": subtask_info,
+            "agent": getattr(args, "agent", None),
+            "model": getattr(args, "model", None),
+            "variant": getattr(args, "variant", None),
+            "title": getattr(args, "title", None),
+        },
+    )
+    _append_task_progress(
+        task_res.progress_path,
+        event="started-background",
+        fields={
+            "runId": run_id,
+            "sessionId": seed_session_id,
+            "subtaskType": subtask_info.get("type"),
+            "agent": getattr(args, "agent", None),
+            "engine": getattr(args, "engine", None),
+            "artifactsDir": str(artifacts_dir),
         },
     )
     _write_text(wrapper_log_path, "")
@@ -4908,6 +5696,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     # harmless.
     env = _safe_merge_env(dict(os.environ), args.env, args.env_file)
     _apply_execution_profile(args, prompt, env)
+    subtask_info["executionProfile"] = getattr(args, "execution_profile", None)
 
     # Build worker command (explicitly pass run_id/artifacts_dir/opencode path and flags).
     py = sys.executable
@@ -4931,12 +5720,21 @@ def cmd_start(args: argparse.Namespace) -> int:
         str(args.max_artifact_bytes),
         "--permission-mode",
         args.permission_mode,
+        "--permission-approval",
+        args.permission_approval,
         "--execution-profile",
         str(args.execution_profile),
-        "--output-mode",
-        output_mode_n,
-        "--diagnostics",
-        diagnostics_mode,
+        "--subtask-type",
+        str(getattr(args, "subtask_type", DEFAULT_SUBTASK_TYPE)),
+        "--task-id",
+        task_res.task_id,
+        "--on-running-task",
+        "start-new",
+        "--no-task-memory",
+        "--final-answer-budget-chars",
+        str(getattr(args, "final_answer_budget_chars", DEFAULT_FINAL_ANSWER_BUDGET_CHARS)),
+        "--cli-prompt-transport",
+        str(getattr(args, "cli_prompt_transport", DEFAULT_CLI_PROMPT_TRANSPORT)),
         "--stop-server-after-run",
         str(args.stop_server_after_run),
         "--orphan-reaper-idle-s",
@@ -4947,14 +5745,37 @@ def cmd_start(args: argparse.Namespace) -> int:
     worker_cmd.append("--quiet" if args.quiet else "--no-quiet")
     worker_cmd.append("--save-events" if args.save_events else "--no-save-events")
     worker_cmd.append("--save-text" if args.save_text else "--no-save-text")
+    worker_cmd.append(
+        "--memory-friendly" if args.memory_friendly else "--no-memory-friendly"
+    )
     worker_cmd.append("--orphan-reaper" if args.orphan_reaper else "--no-orphan-reaper")
     worker_cmd.append(
         "--disable-claude-code"
         if args.disable_claude_code
         else "--no-disable-claude-code"
     )
-    if contract_nonce:
-        worker_cmd.extend(["--contract-nonce", contract_nonce])
+    worker_cmd.append(
+        "--subagent-briefing"
+        if getattr(args, "subagent_briefing", False)
+        else "--no-subagent-briefing"
+    )
+    http_deny_interactive_arg = getattr(args, "http_deny_interactive_tools", None)
+    if http_deny_interactive_arg is not None:
+        worker_cmd.append(
+            "--http-deny-interactive-tools"
+            if http_deny_interactive_arg
+            else "--no-http-deny-interactive-tools"
+        )
+    worker_cmd.append(
+        "--allow-nested-subtasks"
+        if getattr(args, "allow_nested_subtasks", False)
+        else "--no-allow-nested-subtasks"
+    )
+    worker_cmd.append(
+        "--allow-child-todos"
+        if getattr(args, "allow_child_todos", False)
+        else "--no-allow-child-todos"
+    )
 
     # prompt persona policy (keep worker behavior consistent with start/run)
     worker_cmd.extend(
@@ -5002,6 +5823,8 @@ def cmd_start(args: argparse.Namespace) -> int:
             str(args.server_wait),
         ]
     )
+    for origin in getattr(args, "server_cors", []) or []:
+        worker_cmd.extend(["--server-cors", str(origin)])
 
     # passthrough
     if getattr(args, "continue_last", False):
@@ -5010,6 +5833,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         worker_cmd.extend(["--session", str(getattr(args, "session"))])
     if getattr(args, "title", None):
         worker_cmd.extend(["--title", str(getattr(args, "title"))])
+    if getattr(args, "description", None):
+        worker_cmd.extend(["--description", str(getattr(args, "description"))])
     if args.agent:
         worker_cmd.extend(["--agent", args.agent])
     if args.model:
@@ -5022,6 +5847,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         worker_cmd.extend(["--env", ev])
     for evf in args.env_file:
         worker_cmd.extend(["--env-file", evf])
+    for item in getattr(args, "acceptance", []) or []:
+        worker_cmd.extend(["--acceptance", str(item)])
 
     # prompt
     worker_cmd.extend(["--prompt-file", str(prompt_path)])
@@ -5051,14 +5878,21 @@ def cmd_start(args: argparse.Namespace) -> int:
             "pid": proc.pid,
         },
     )
+    _write_task_state_locked(
+        workdir=workdir,
+        task_id=task_res.task_id,
+        update={"state": "running", "pid": proc.pid, "latestRunId": run_id, "latestArtifactsDir": str(artifacts_dir)},
+    )
 
     out = _start_obj(
         run_id=run_id,
         pid=proc.pid,
         workdir=workdir,
         artifacts_dir=artifacts_dir,
-        output_mode=output_mode_n,
+        memory_recovery=memory_recovery,
         warnings=runtime_preflight_warnings,
+        subtask=subtask_info,
+        task_id=task_res.task_id,
         artifacts=_artifacts_obj(
             dir_path=artifacts_dir,
             job_path=job_path,
@@ -5070,12 +5904,139 @@ def cmd_start(args: argparse.Namespace) -> int:
             if args.save_text
             else None,
             wrapper_log_path=wrapper_log_path,
-            payload_path=(artifacts_dir / "payload.json"),
-            diagnostics_path=(artifacts_dir / "diagnostics.json"),
+            progress_path=task_res.progress_path,
         ),
     )
     sys.stdout.write(_json_line(out) + "\n")
     return 0
+
+
+def _tail_text_lines(path: Path, *, max_bytes: int = 65536) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fp:
+            if size > max_bytes:
+                fp.seek(max(0, size - max_bytes))
+                # discard partial first line
+                fp.readline()
+            data = fp.read()
+        return data.decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+
+
+def _progress_summary_from_events(
+    *, events_path: Path, assistant_path: Path, finish_path: Path
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "phase": "completed_like" if finish_path.exists() else "initializing",
+        "lastEventType": None,
+        "lastTool": None,
+        "lastToolStatus": None,
+        "source": None,
+    }
+
+    test_markers = (
+        "pytest", "unittest", "npm test", "pnpm test", "yarn test",
+        "cargo test", "go test", "mvn test", "gradle test", "ctest",
+        "jest", "vitest", "ruff", "mypy", "tsc",
+    )
+    edit_markers = ("edit", "write", "patch", "apply_patch", "multiedit")
+
+    def set_phase(phase: str, *, source: str) -> None:
+        if summary.get("phase") != "completed_like":
+            summary["phase"] = phase
+            summary["source"] = source
+
+    def str_from_part(part: dict[str, Any], keys: tuple[str, ...]) -> str:
+        for k in keys:
+            v = part.get(k)
+            if isinstance(v, str) and v:
+                return v
+        return ""
+
+    for ln in _tail_text_lines(events_path):
+        try:
+            raw = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        evt = _event_payload(raw)
+        if not isinstance(evt, dict):
+            continue
+        et = evt.get("type")
+        if isinstance(et, str):
+            summary["lastEventType"] = et
+        props = _event_properties(evt)
+
+        if et == "permission.asked":
+            set_phase("waiting_permission", source="event")
+            continue
+        if isinstance(et, str) and et.endswith(".error"):
+            set_phase("error", source="event")
+            continue
+        if et == "session.status":
+            status = props.get("status") or evt.get("status")
+            if isinstance(status, dict):
+                status = status.get("type") or status.get("status")
+            if isinstance(status, str):
+                st = status.lower()
+                if st in {"idle", "ready"}:
+                    set_phase("completed_like", source="session.status")
+                elif st in {"running", "busy"}:
+                    set_phase("thinking", source="session.status")
+            continue
+
+        part = _first_nested_dict(evt, "part")
+        if not isinstance(part, dict):
+            # Some events expose tool-ish information directly under properties.
+            part = props if isinstance(props, dict) else {}
+        part_type = str(part.get("type") or "").lower()
+        if et == "message.updated":
+            set_phase("thinking", source="message.updated")
+        if et == "message.part.updated" or part_type:
+            if part_type in {"reasoning", "reasoning_text", "thinking"}:
+                set_phase("thinking", source="part")
+                continue
+            if part_type in {"text", "assistant_text", "output_text"}:
+                set_phase("answering", source="part")
+                continue
+            tool = str_from_part(part, ("tool", "name", "toolName", "id"))
+            if tool:
+                summary["lastTool"] = tool
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            status = state.get("status") if isinstance(state, dict) else part.get("status")
+            if isinstance(status, str):
+                summary["lastToolStatus"] = status
+            haystack = " ".join(
+                str(v).lower()
+                for v in [
+                    tool,
+                    part.get("command"),
+                    part.get("title"),
+                    part.get("description"),
+                    state.get("command") if isinstance(state, dict) else None,
+                ]
+                if v is not None
+            )
+            if any(m in haystack for m in test_markers):
+                set_phase("testing", source="tool")
+            elif any(m in haystack for m in edit_markers):
+                set_phase("editing", source="tool")
+            elif tool or part_type in {"tool", "tool_call"}:
+                set_phase("tooling", source="tool")
+
+    if summary.get("phase") == "initializing" and assistant_path.exists():
+        try:
+            if assistant_path.stat().st_size > 0:
+                summary["phase"] = "answering"
+                summary["source"] = "assistant"
+        except Exception:
+            pass
+    return summary
 
 
 def _progress_snapshot(artifacts_dir: Path) -> dict[str, Any]:
@@ -5100,6 +6061,11 @@ def _progress_snapshot(artifacts_dir: Path) -> dict[str, Any]:
             continue
     if last_mtime > 0:
         prog["idleForSeconds"] = max(0.0, now - last_mtime)
+    prog["summary"] = _progress_summary_from_events(
+        events_path=files["events"],
+        assistant_path=files["assistant"],
+        finish_path=files["finish"],
+    )
     return prog
 
 
@@ -5128,11 +6094,6 @@ def _emit_synthesized_missing_finish(
         if isinstance(job, dict) and job.get("workdir")
         else Path.cwd()
     )
-    output_mode = (
-        _normalize_output_mode(str(job.get("outputMode")))
-        if isinstance(job, dict) and job.get("outputMode")
-        else "machine"
-    )
     created_ms = _job_ms(job, "createdAt") if isinstance(job, dict) else 0
     duration_ms = (
         max(0, _now_ms() - created_ms) if created_ms > 0 else 0
@@ -5140,7 +6101,6 @@ def _emit_synthesized_missing_finish(
     out = _finish_obj(
         run_id=run_id,
         workdir=wd,
-        output_mode=output_mode,
         outcome="internal_error",
         exit_code=1,
         duration_ms=duration_ms,
@@ -5153,17 +6113,6 @@ def _emit_synthesized_missing_finish(
         ),
         execution_error={"name": error_name, "message": error_message},
         execution_warnings=[],
-        payload_status="not_requested" if output_mode == "text" else "missing",
-        payload_schema=None,
-        payload_path=None,
-        payload_digest=None,
-        payload_errors=(
-            []
-            if output_mode == "text"
-            else [_payload_error("PAYLOAD_MISSING", error_message)]
-        ),
-        decision_status="not_requested" if output_mode == "text" else "unavailable",
-        decision_route=None,
         changed_files=[],
         untracked_files=[],
         patch_path=None,
@@ -5172,12 +6121,38 @@ def _emit_synthesized_missing_finish(
             job_path=job_path,
             finish_path=finish_path,
         ),
+        subtask=job.get("subtask") if isinstance(job.get("subtask"), dict) else None,
     )
     finish_written, finish_reason, existing_finish = _write_finish_once(
         artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
     )
     if (not finish_written) and isinstance(existing_finish, dict):
         out = existing_finish
+    task_id = str(job.get("taskId") or "").strip() if isinstance(job, dict) else ""
+    if task_id and (finish_written or isinstance(existing_finish, dict)):
+        note_path = _write_notification(
+            artifacts_dir=artifacts_dir,
+            finish_obj=out,
+            task_state_path=_task_state_path(wd, task_id),
+        )
+        _append_task_progress(
+            _task_progress_path(wd, task_id),
+            event="watchdog-finished",
+            fields={"runId": run_id, "outcome": "internal_error", "error": error_name},
+        )
+        _write_task_state_locked(
+            workdir=wd,
+            task_id=task_id,
+            update={
+                "state": "error",
+                "outcome": "internal_error",
+                "latestRunId": run_id,
+                "latestArtifactsDir": str(artifacts_dir),
+                "finishPath": str(finish_path),
+                "notificationPath": str(note_path) if note_path else None,
+                "lastError": {"name": error_name, "message": error_message},
+            },
+        )
     # Only update job state when we successfully persisted a terminal finish
     # (or an existing finish already covers it).
     if finish_written or isinstance(existing_finish, dict):
@@ -5292,12 +6267,19 @@ def _maybe_finalize_stale_running_job(
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
+    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None) and not getattr(args, "task_id", None):
         _exit_with_error(
-            "MissingRunId", "Provide --run-id or --artifacts-dir", exit_code=2
+            "MissingRunId", "Provide --run-id, --artifacts-dir, or --task-id", exit_code=2
         )
 
-    run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    workdir = Path(getattr(args, "workdir", ".") or ".").expanduser().resolve()
+    run_id, artifacts_dir, task_state = _resolve_task_artifacts(
+        workdir=workdir,
+        task_id=getattr(args, "task_id", None),
+        run_id=getattr(args, "run_id", None),
+        artifacts_dir=getattr(args, "artifacts_dir", None),
+    )
+    task_id = str(task_state.get("taskId")) if isinstance(task_state, dict) and task_state.get("taskId") else None
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
     prompt_path = artifacts_dir / "prompt.txt"
@@ -5332,17 +6314,18 @@ def cmd_status(args: argparse.Namespace) -> int:
                 stderr_path=artifacts_dir / "stderr.log",
                 assistant_path=artifacts_dir / "assistant.txt",
                 wrapper_log_path=artifacts_dir / "wrapper.log",
-                payload_path=artifacts_dir / "payload.json",
-                diagnostics_path=artifacts_dir / "diagnostics.json",
             ),
             progress=_progress_snapshot(artifacts_dir),
             warnings=runtime_warnings or None,
             error={"name": "JobNotFound", "message": "job.json not found"},
+            task_id=task_id,
         )
         sys.stdout.write(_json_line(out) + "\n")
         return 1
 
     job = _load_json(job_path) or {}
+    if (not task_id) and isinstance(job, dict) and job.get("taskId"):
+        task_id = str(job.get("taskId"))
     pid = int(job.get("pid") or 0) if isinstance(job, dict) else 0
     status = str(job.get("state") or "running") if isinstance(job, dict) else "running"
     progress = _progress_snapshot(artifacts_dir)
@@ -5387,8 +6370,6 @@ def cmd_status(args: argparse.Namespace) -> int:
             stderr_path=artifacts_dir / "stderr.log",
             assistant_path=artifacts_dir / "assistant.txt",
             wrapper_log_path=artifacts_dir / "wrapper.log",
-            payload_path=artifacts_dir / "payload.json",
-            diagnostics_path=artifacts_dir / "diagnostics.json",
         ),
         progress=progress,
         warnings=(
@@ -5405,18 +6386,26 @@ def cmd_status(args: argparse.Namespace) -> int:
             )
         )
         or None,
+        task_id=task_id,
     )
     sys.stdout.write(_json_line(out) + "\n")
     return 0
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
-    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
+    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None) and not getattr(args, "task_id", None):
         _exit_with_error(
-            "MissingRunId", "Provide --run-id or --artifacts-dir", exit_code=2
+            "MissingRunId", "Provide --run-id, --artifacts-dir, or --task-id", exit_code=2
         )
 
-    run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    workdir = Path(getattr(args, "workdir", ".") or ".").expanduser().resolve()
+    run_id, artifacts_dir, task_state = _resolve_task_artifacts(
+        workdir=workdir,
+        task_id=getattr(args, "task_id", None),
+        run_id=getattr(args, "run_id", None),
+        artifacts_dir=getattr(args, "artifacts_dir", None),
+    )
+    task_id = str(task_state.get("taskId")) if isinstance(task_state, dict) and task_state.get("taskId") else None
 
     poll_interval = float(args.poll_interval)
     if poll_interval <= 0:
@@ -5458,6 +6447,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 "name": "JobNotFound",
                 "message": "job.json and finish.json not found",
             },
+            task_id=task_id,
         )
         sys.stdout.write(_json_line(out) + "\n")
         return 1
@@ -5473,6 +6463,8 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
         pid = None
         job = _load_json(job_path) or {}
+        if (not task_id) and isinstance(job, dict) and job.get("taskId"):
+            task_id = str(job.get("taskId"))
         if job_path.exists():
             if isinstance(job, dict) and job.get("pid"):
                 try:
@@ -5515,6 +6507,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 progress=progress,
                 warnings=runtime_warnings or None,
                 wait_expired=True,
+                task_id=task_id,
             )
             sys.stdout.write(_json_line(out) + "\n")
             return 0
@@ -5523,16 +6516,25 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
-    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None):
+    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None) and not getattr(args, "task_id", None):
         _exit_with_error(
-            "MissingRunId", "Provide --run-id or --artifacts-dir", exit_code=2
+            "MissingRunId", "Provide --run-id, --artifacts-dir, or --task-id", exit_code=2
         )
 
-    run_id, artifacts_dir = _safe_resolve_artifacts_dir(args.run_id, args.artifacts_dir)
+    workdir = Path(getattr(args, "workdir", ".") or ".").expanduser().resolve()
+    run_id, artifacts_dir, task_state = _resolve_task_artifacts(
+        workdir=workdir,
+        task_id=getattr(args, "task_id", None),
+        run_id=getattr(args, "run_id", None),
+        artifacts_dir=getattr(args, "artifacts_dir", None),
+    )
+    task_id = str(task_state.get("taskId")) if isinstance(task_state, dict) and task_state.get("taskId") else None
     job_path = artifacts_dir / "job.json"
     finish_path = artifacts_dir / "finish.json"
 
     job = _load_json(job_path) or {}
+    if (not task_id) and isinstance(job, dict) and job.get("taskId"):
+        task_id = str(job.get("taskId"))
     run_id = _canonical_run_id(run_id, job)
     runtime_warnings: list[dict[str, str]] = []
 
@@ -5552,6 +6554,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             "adapterVersion": ADAPTER_VERSION,
             "timestamp": _now_ms(),
             "runId": run_id,
+            "taskId": task_id,
             "ok": True,
             "warnings": runtime_warnings,
             "alreadyFinished": True,
@@ -5585,11 +6588,6 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     )
     stop_attempted = False
     stop_ok: bool | None = None
-    output_mode = (
-        _normalize_output_mode(str(job.get("outputMode")))
-        if isinstance(job, dict) and job.get("outputMode")
-        else "machine"
-    )
     # run_id is already canonical (set via _canonical_run_id above).
     job_run_id = run_id
 
@@ -5778,7 +6776,6 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             workdir=Path(str(job.get("workdir")))
             if isinstance(job, dict) and job.get("workdir")
             else Path.cwd(),
-            output_mode=output_mode,
             outcome="cancelled" if ok else "internal_error",
             exit_code=130 if ok else 1,
             duration_ms=(
@@ -5791,17 +6788,6 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             session_id=session_id,
             execution_error=task_error,
             execution_warnings=[],
-            payload_status="not_requested" if output_mode == "text" else "missing",
-            payload_schema=None,
-            payload_path=None,
-            payload_digest=None,
-            payload_errors=(
-                []
-                if output_mode == "text"
-                else [_payload_error("PAYLOAD_MISSING", task_error["message"])]
-            ),
-            decision_status="not_requested" if output_mode == "text" else "unavailable",
-            decision_route=None,
             changed_files=[],
             untracked_files=[],
             patch_path=None,
@@ -5810,10 +6796,45 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 job_path=job_path,
                 finish_path=finish_path,
             ),
+            subtask=job.get("subtask") if isinstance(job.get("subtask"), dict) else None,
         )
         cancel_fin_written, cancel_fin_reason, _ = _write_finish_once(
             artifacts_dir=artifacts_dir, finish_path=finish_path, finish_obj=out
         )
+        if task_id:
+            notification_path = None
+            if cancel_fin_written:
+                notification_path = _write_notification(
+                    artifacts_dir=artifacts_dir,
+                    finish_obj=out,
+                    task_state_path=_task_state_path(wd, task_id),
+                )
+            _append_task_progress(
+                _task_progress_path(wd, task_id),
+                event="cancelled" if ok else "cancel-failed",
+                fields={
+                    "runId": run_id,
+                    "sessionId": session_id,
+                    "outcome": "cancelled" if ok else "internal_error",
+                    "terminationEvidence": termination_evidence,
+                    "workerOwnership": worker_ownership,
+                    "finishWritten": cancel_fin_written,
+                },
+            )
+            _write_task_state_locked(
+                workdir=wd,
+                task_id=task_id,
+                update={
+                    "state": "cancelled" if ok else "error",
+                    "outcome": "cancelled" if ok else "internal_error",
+                    "latestRunId": run_id,
+                    "sessionId": session_id,
+                    "latestArtifactsDir": str(artifacts_dir),
+                    "finishPath": str(finish_path) if cancel_fin_written else None,
+                    "notificationPath": str(notification_path) if notification_path else None,
+                    "cancelledAt": _now_ms(),
+                },
+            )
         # If finish.json could not be persisted AND no prior finish exists,
         # downstream wait/status will never see a terminal state.  Degrade
         # the cancel result so the caller knows the kill may have worked but
@@ -5834,7 +6855,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
         # For failed cancels where no explicit command-error was set,
         # promote the task_error to cancel_error so stdout ``error``
-        # stays populated on ok=false (backward-compatible).
+        # stays populated on ok=false.
         if not ok and cancel_error is None and task_error is not None:
             cancel_error = task_error
 
@@ -5911,6 +6932,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
         "runId": run_id,
+        "taskId": task_id,
         "ok": ok,
         "warnings": runtime_warnings,
         "pid": pid or None,
@@ -5936,206 +6958,163 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def _judgment_obj(
-    *,
-    policy: str,
-    verdict: str,
-    reason_code: str,
-    route: str | None,
-    retryable: bool,
-) -> dict[str, Any]:
+
+def _progress_event_line(*, task_id: str | None, run_id: str, progress: dict[str, Any], artifacts_dir: Path) -> dict[str, Any]:
+    summary = progress.get("summary") if isinstance(progress, dict) else None
+    if not isinstance(summary, dict):
+        summary = {}
     return {
-        "type": "opencode-subtask-judgment",
-        "schemaVersion": 1,
+        "type": "opencode-subtask-progress",
+        "schemaVersion": ADAPTER_SCHEMA_VERSION,
         "adapterVersion": ADAPTER_VERSION,
         "timestamp": _now_ms(),
-        "policy": policy,
-        "verdict": verdict,
-        "reasonCode": reason_code,
-        "route": route if route in DECISION_ROUTES else None,
-        "retryable": bool(retryable),
+        "taskId": task_id,
+        "runId": run_id,
+        "phase": summary.get("phase"),
+        "lastEvent": summary.get("lastEvent"),
+        "lastTool": summary.get("lastTool"),
+        "idleForSeconds": progress.get("idleForSeconds") if isinstance(progress, dict) else None,
+        "artifactsDir": str(artifacts_dir),
     }
 
 
-def _judge_exit_code(verdict: str) -> int:
-    return {
-        "accept": 0,
-        "reroute": 10,
-        "retry": 11,
-        "block": 12,
-    }.get(str(verdict), 1)
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Wait with stderr progress notifications and a single JSON terminal stdout.
 
-
-def _judge_reason(name: str) -> str:
-    code = JUDGE_REASON.get(name)
-    if code is None:
-        raise ValueError(f"unknown judge reason key: {name}")
-    return code
-
-
-def _payload_digest_matches(finish: dict[str, Any], finish_path: Path) -> bool:
-    payload = finish.get("payload") if isinstance(finish.get("payload"), dict) else {}
-    artifact = payload.get("artifact") if isinstance(payload, dict) else {}
-    rel_path = artifact.get("path") if isinstance(artifact, dict) else None
-    digest = artifact.get("digest") if isinstance(artifact, dict) else None
-    if not isinstance(rel_path, str) or not rel_path or not isinstance(digest, str) or not digest:
-        return False
-    artifacts = finish.get("artifacts") if isinstance(finish.get("artifacts"), dict) else {}
-    base_dir = Path(str(artifacts.get("dir"))) if artifacts and artifacts.get("dir") else finish_path.parent
-    candidate = Path(rel_path)
-    payload_path = candidate if candidate.is_absolute() else (base_dir / rel_path)
-    if not payload_path.exists():
-        return False
-    try:
-        return _sha256_file(payload_path) == digest
-    except Exception:
-        return False
-
-
-def cmd_judge(args: argparse.Namespace) -> int:
-    finish_path = Path(args.finish).expanduser().resolve()
-    policy = str(args.policy).strip()
-    if not finish_path.exists():
-        out = _judgment_obj(
-            policy=policy,
-            verdict="retry",
-            reason_code=_judge_reason("finish_not_found"),
-            route=None,
-            retryable=True,
+    This is the adapter-side analogue of host task notifications: stdout remains
+    one control-plane object, while stderr emits compact OPENCODE_SUBTASK_PROGRESS
+    lines that callers may stream without reading events.ndjson.
+    """
+    if not getattr(args, "run_id", None) and not getattr(args, "artifacts_dir", None) and not getattr(args, "task_id", None):
+        _exit_with_error(
+            "MissingRunId", "Provide --run-id, --artifacts-dir, or --task-id", exit_code=2
         )
-        sys.stdout.write(_json_line(out) + "\n")
-        return _judge_exit_code(out["verdict"])
+    workdir = Path(getattr(args, "workdir", ".") or ".").expanduser().resolve()
+    run_id, artifacts_dir, task_state = _resolve_task_artifacts(
+        workdir=workdir,
+        task_id=getattr(args, "task_id", None),
+        run_id=getattr(args, "run_id", None),
+        artifacts_dir=getattr(args, "artifacts_dir", None),
+    )
+    task_id = str(task_state.get("taskId")) if isinstance(task_state, dict) and task_state.get("taskId") else None
+    job_path = artifacts_dir / "job.json"
+    finish_path = artifacts_dir / "finish.json"
+    job = _load_json(job_path) or {}
+    if (not task_id) and isinstance(job, dict) and job.get("taskId"):
+        task_id = str(job.get("taskId"))
+    run_id = _canonical_run_id(run_id, job)
 
-    finish, finish_error = _read_finish_envelope(finish_path)
-    if finish_error == "FINISH_UNREADABLE":
-        out = _judgment_obj(
-            policy=policy,
-            verdict="retry",
-            reason_code=_judge_reason("finish_unreadable"),
-            route=None,
-            retryable=True,
-        )
-        sys.stdout.write(_json_line(out) + "\n")
-        return _judge_exit_code(out["verdict"])
-    if finish_error == "FINISH_INVALID" or not isinstance(finish, dict):
-        out = _judgment_obj(
-            policy=policy,
-            verdict="retry",
-            reason_code=_judge_reason("finish_invalid"),
-            route=None,
-            retryable=True,
-        )
-        sys.stdout.write(_json_line(out) + "\n")
-        return _judge_exit_code(out["verdict"])
+    poll_interval = float(getattr(args, "poll_interval", 0.5) or 0.5)
+    progress_interval = float(getattr(args, "progress_interval", DEFAULT_WATCH_PROGRESS_INTERVAL_S) or DEFAULT_WATCH_PROGRESS_INTERVAL_S)
+    if poll_interval <= 0 or progress_interval <= 0:
+        _exit_with_error("BadConfig", "--poll-interval and --progress-interval must be > 0", exit_code=2)
+    timeout_s = float(getattr(args, "wait_timeout", DEFAULT_TIMEOUT_S) or DEFAULT_TIMEOUT_S)
+    deadline = time.monotonic() + timeout_s
+    last_emit = 0.0
+    last_signature = None
+    runtime_warnings: list[dict[str, str]] = []
 
-    outcome = str(finish.get("outcome") or "")
-    output_mode = str(finish.get("outputMode") or "machine")
-    payload = finish.get("payload") if isinstance(finish.get("payload"), dict) else {}
-    decision = finish.get("decision") if isinstance(finish.get("decision"), dict) else {}
-    payload_status = str(payload.get("status") or "")
-    decision_status = str(decision.get("status") or "")
-    route = decision.get("route") if isinstance(decision.get("route"), str) else None
+    while True:
+        fin, finish_warnings = _load_runtime_finish_envelope(finish_path)
+        runtime_warnings = _dedupe_warnings([*runtime_warnings, *finish_warnings])
+        if isinstance(fin, dict):
+            sys.stdout.write(_json_line(_with_execution_warnings(fin, runtime_warnings)) + "\n")
+            return _outcome_exit_code(str(fin.get("outcome") or "internal_error"))
 
-    if policy not in JUDGE_POLICIES:
-        out = _judgment_obj(
-            policy=policy,
-            verdict="retry",
-            reason_code=_judge_reason("unknown_policy"),
-            route=route,
-            retryable=True,
-        )
-        sys.stdout.write(_json_line(out) + "\n")
-        return _judge_exit_code(out["verdict"])
+        job = _load_json(job_path) or {}
+        if (not task_id) and isinstance(job, dict) and job.get("taskId"):
+            task_id = str(job.get("taskId"))
+        pid = _safe_int(job.get("pid")) if isinstance(job, dict) else None
+        progress = _progress_snapshot(artifacts_dir)
+        if isinstance(job, dict):
+            synthesized = _maybe_finalize_stale_running_job(
+                run_id=run_id,
+                artifacts_dir=artifacts_dir,
+                finish_path=finish_path,
+                job_path=job_path,
+                job=job,
+                pid=pid,
+                progress=progress,
+                stale_idle_s=DEFAULT_STALE_IDLE_S,
+                dead_worker_grace_s=DEFAULT_DEAD_WORKER_GRACE_S,
+                cancel_stuck_grace_s=DEFAULT_CANCEL_STUCK_GRACE_S,
+            )
+            if isinstance(synthesized, dict):
+                sys.stdout.write(_json_line(synthesized) + "\n")
+                return _outcome_exit_code(str(synthesized.get("outcome") or "internal_error"))
 
-    if policy != "execution-only" and payload_status == "validated":
-        if not _payload_digest_matches(finish, finish_path):
-            out = _judgment_obj(
-                policy=policy,
-                verdict="retry",
-                reason_code=_judge_reason("payload_digest_mismatch"),
-                route=route,
-                retryable=True,
+        now = time.monotonic()
+        summary = progress.get("summary") if isinstance(progress, dict) else {}
+        sig = None
+        if isinstance(summary, dict):
+            sig = (summary.get("phase"), summary.get("lastEvent"), summary.get("lastTool"))
+        if now - last_emit >= progress_interval or sig != last_signature:
+            sys.stderr.write("OPENCODE_SUBTASK_PROGRESS " + _json_line(_progress_event_line(task_id=task_id, run_id=run_id, progress=progress, artifacts_dir=artifacts_dir)) + "\n")
+            sys.stderr.flush()
+            last_emit = now
+            last_signature = sig
+
+        if now >= deadline:
+            out = _status_obj(
+                ok=True,
+                run_id=run_id,
+                task_id=task_id,
+                status="running",
+                pid=pid,
+                workdir=str(job.get("workdir")) if isinstance(job, dict) and job.get("workdir") else None,
+                artifacts_dir=artifacts_dir,
+                artifacts=_minimal_artifacts(dir_path=artifacts_dir, job_path=job_path, finish_path=finish_path),
+                progress=progress,
+                warnings=runtime_warnings or None,
+                wait_expired=True,
             )
             sys.stdout.write(_json_line(out) + "\n")
-            return _judge_exit_code(out["verdict"])
+            return 0
+        time.sleep(poll_interval)
 
-    if policy == "execution-only":
-        if outcome == "completed":
-            verdict, reason_code = "accept", _judge_reason("execution_completed")
-        elif outcome in {"failed", "timed_out", "internal_error"}:
-            verdict, reason_code = "retry", JUDGE_EXECUTION_REASON_BY_OUTCOME[outcome]
-        elif outcome == "cancelled":
-            verdict, reason_code = "block", _judge_reason("execution_cancelled")
-        else:
-            verdict, reason_code = "retry", _judge_reason("execution_unknown")
-        out = _judgment_obj(
-            policy=policy,
-            verdict=verdict,
-            reason_code=reason_code,
-            route=route,
-            retryable=(verdict == "retry"),
-        )
-        sys.stdout.write(_json_line(out) + "\n")
-        return _judge_exit_code(out["verdict"])
 
-    if outcome in {"failed", "timed_out", "internal_error"}:
-        out = _judgment_obj(
-            policy=policy,
-            verdict="retry",
-            reason_code=JUDGE_EXECUTION_REASON_BY_OUTCOME[outcome],
-            route=route,
-            retryable=True,
-        )
-        sys.stdout.write(_json_line(out) + "\n")
-        return _judge_exit_code(out["verdict"])
-    if outcome == "cancelled":
-        out = _judgment_obj(
-            policy=policy,
-            verdict="block",
-            reason_code=_judge_reason("execution_cancelled"),
-            route=route,
-            retryable=False,
-        )
-        sys.stdout.write(_json_line(out) + "\n")
-        return _judge_exit_code(out["verdict"])
-
-    if policy == "require-determinate":
-        if output_mode == "text" or payload_status == "not_requested":
-            verdict, reason_code = "block", _judge_reason("output_not_machine")
-        elif payload_status in {"missing", "malformed", "ambiguous", "persist_failed"}:
-            verdict, reason_code = "retry", JUDGE_PAYLOAD_REASON_BY_STATUS[payload_status]
-        elif payload_status == "validated" and decision_status == "determinate" and route == "GO_NO_DELTA":
-            verdict, reason_code = "accept", _judge_reason("decision_go_no_delta")
-        elif payload_status == "validated" and decision_status == "determinate" and route == "MANDATORY_DELTA":
-            verdict, reason_code = "reroute", _judge_reason("decision_mandatory_delta")
-        elif payload_status == "validated" and decision_status == "abstained":
-            verdict, reason_code = "reroute", _judge_reason("decision_undetermined")
-        else:
-            verdict, reason_code = "retry", _judge_reason("decision_unavailable")
-    else:
-        if output_mode == "text" or payload_status == "not_requested":
-            verdict, reason_code = "block", _judge_reason("output_not_machine")
-        elif payload_status in {"missing", "malformed", "ambiguous", "persist_failed"}:
-            verdict, reason_code = "retry", JUDGE_PAYLOAD_REASON_BY_STATUS[payload_status]
-        elif payload_status == "validated" and decision_status == "determinate" and route == "GO_NO_DELTA":
-            verdict, reason_code = "accept", _judge_reason("decision_go_no_delta")
-        elif payload_status == "validated" and decision_status == "determinate" and route == "MANDATORY_DELTA":
-            verdict, reason_code = "block", _judge_reason("decision_mandatory_delta")
-        elif decision_status == "abstained":
-            verdict, reason_code = "block", _judge_reason("decision_undetermined")
-        else:
-            verdict, reason_code = "retry", _judge_reason("decision_unavailable")
-
-    out = _judgment_obj(
-        policy=policy,
-        verdict=verdict,
-        reason_code=reason_code,
-        route=route,
-        retryable=(verdict == "retry"),
-    )
+def cmd_list_tasks(args: argparse.Namespace) -> int:
+    workdir = Path(getattr(args, "workdir", ".") or ".").expanduser().resolve()
+    limit = int(getattr(args, "limit", 50) or 50)
+    if limit <= 0:
+        limit = 50
+    task_dir = _task_project_dir(workdir)
+    items: list[dict[str, Any]] = []
+    if task_dir.exists():
+        for path in task_dir.glob("*.json"):
+            if path.name.endswith(".lock.json"):
+                continue
+            st = _load_json(path)
+            if not isinstance(st, dict) or not st.get("taskId"):
+                continue
+            items.append({
+                "taskId": st.get("taskId"),
+                "state": st.get("state"),
+                "outcome": st.get("outcome"),
+                "sessionId": st.get("sessionId"),
+                "latestRunId": st.get("latestRunId"),
+                "latestArtifactsDir": st.get("latestArtifactsDir"),
+                "description": st.get("description"),
+                "subtask": st.get("subtask"),
+                "updatedAt": st.get("updatedAt"),
+                "createdAt": st.get("createdAt"),
+                "finishPath": st.get("finishPath"),
+                "notificationPath": st.get("notificationPath"),
+            })
+    items.sort(key=lambda x: int(x.get("updatedAt") or x.get("createdAt") or 0), reverse=True)
+    out = {
+        "type": "opencode-subtask-task-list",
+        "schemaVersion": ADAPTER_SCHEMA_VERSION,
+        "adapterVersion": ADAPTER_VERSION,
+        "timestamp": _now_ms(),
+        "ok": True,
+        "warnings": [],
+        "workdir": str(workdir),
+        "count": min(len(items), limit),
+        "tasks": items[:limit],
+    }
     sys.stdout.write(_json_line(out) + "\n")
-    return _judge_exit_code(out["verdict"])
-
+    return 0
 
 def cmd_ensure_server(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
@@ -6167,6 +7146,7 @@ def cmd_ensure_server(args: argparse.Namespace) -> int:
             wait_s=args.server_wait,
             env=env,
             auth=auth,
+            cors_origins=list(getattr(args, "server_cors", []) or []),
         )
         out = {
             "type": "opencode-subtask-server",
@@ -6300,6 +7280,12 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         help="Seconds to wait for server health",
     )
     p.add_argument(
+        "--server-cors",
+        action="append",
+        default=[],
+        help="Extra CORS origin passed to `opencode serve --cors`; repeatable.",
+    )
+    p.add_argument(
         "--stop-server-after-run",
         choices=["if-started", "always", "never"],
         default=DEFAULT_STOP_SERVER_AFTER_RUN,
@@ -6330,7 +7316,8 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         ),
     )
 
-    # Session continuity (optional). These map to `opencode run` flags and only affect the CLI engine.
+    # Session continuity (optional). --session maps to HTTP /session/:id/message and CLI --session.
+    # --continue remains CLI-only because the HTTP API requires an explicit session id.
     p.add_argument(
         "-c",
         "--continue",
@@ -6342,9 +7329,70 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         "-s",
         "--session",
         default=None,
-        help="(CLI engine) Continue a specific opencode session id.",
+        help="Continue a specific opencode session id (HTTP or CLI).",
     )
-    p.add_argument("--title", default=None, help="(CLI engine) Title for the session.")
+    p.add_argument(
+        "--task-id",
+        dest="task_id",
+        default=None,
+        help=(
+            "Caller-facing external task handle. Existing adapter task ids resume their "
+            "recorded OpenCode session and inject bounded task memory. Use --session "
+            "explicitly for raw OpenCode ses_* continuation."
+        ),
+    )
+    p.add_argument(
+        "--on-running-task",
+        choices=["fail", "start-new"],
+        default="fail",
+        help="When --task-id points at an already-running child: fail (default) or start-new.",
+    )
+    p.add_argument(
+        "--task-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Inject bounded adapter task memory/progress when continuing a known --task-id. (default: true)",
+    )
+    p.add_argument(
+        "--task-memory-max-chars",
+        type=int,
+        default=DEFAULT_TASK_MEMORY_MAX_CHARS,
+        help="Character budget for continuation memory injected into the child prompt.",
+    )
+    p.add_argument("--title", default=None, help="Session title for new sessions (HTTP) or CLI --title.")
+    p.add_argument(
+        "--description",
+        default=None,
+        help="Short delegated-task label; used for session title and ask metadata when --title is absent.",
+    )
+    p.add_argument(
+        "--acceptance",
+        action="append",
+        default=[],
+        help="Acceptance criterion / stop condition appended to the child-agent briefing. Repeatable.",
+    )
+    p.add_argument(
+        "--subtask-type",
+        default=DEFAULT_SUBTASK_TYPE,
+        help="Adapter child role: general|worker|fast-worker|thinker|explore|scout.",
+    )
+    p.add_argument(
+        "--subagent-type",
+        dest="subtask_type",
+        help="Alias for --subtask-type, matching OpenCode Task-tool terminology.",
+    )
+    p.add_argument(
+        "--allow-nested-subtasks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For read-only roles, permit OpenCode task/subagent delegation instead of adding the task deny rule.",
+    )
+    p.add_argument(
+        "--allow-child-todos",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For read-only roles, permit child todo bookkeeping instead of adding the todowrite deny rule.",
+    )
 
     p.add_argument("--agent", default=None, help="OpenCode agent name")
     p.add_argument("-m", "--model", default=None, help="Model id provider/model")
@@ -6390,7 +7438,7 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         "--quiet",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Quiet mode (stdout only final one-line JSON).",
+        help="Quiet mode (stdout only command result; streaming events stay in artifacts/stderr).",
     )
     p.add_argument(
         "--save-events",
@@ -6404,12 +7452,57 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         default=True,
         help="Save assistant.txt.",
     )
+    p.add_argument(
+        "--subagent-briefing",
+        dest="subagent_briefing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Append a small natural-language parent-agent boundary briefing "
+            "that asks the child to execute directly and keep its final report compact."
+        ),
+    )
+    p.add_argument(
+        "--final-answer-budget-chars",
+        type=int,
+        default=DEFAULT_FINAL_ANSWER_BUDGET_CHARS,
+        help="Target final-answer budget used by --subagent-briefing (0 => compact but no numeric budget).",
+    )
+    p.add_argument(
+        "--cli-prompt-transport",
+        choices=["stdin", "file"],
+        default=DEFAULT_CLI_PROMPT_TRANSPORT,
+        help=(
+            "How CLI engine passes the main prompt to `opencode run`. "
+            "stdin avoids attaching prompt.txt as a model-visible file; file is a fallback."
+        ),
+    )
 
     p.add_argument(
         "--permission-mode",
         choices=["inherit", "allow", "noninteractive"],
         default="inherit",
         help="Permission handling. HTTP engine auto-replies via API when possible.",
+    )
+    p.add_argument(
+        "--permission-approval",
+        choices=["once", "always"],
+        default="once",
+        help=(
+            "HTTP auto-reply used with --permission-mode allow. "
+            "noninteractive still rejects identified high-risk requests."
+        ),
+    )
+    p.add_argument(
+        "--http-deny-interactive-tools",
+        dest="http_deny_interactive_tools",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "For HTTP-created sessions, deny OpenCode question/plan_enter/plan_exit tools "
+            "so delegated runs do not stall waiting for an interactive parent. "
+            "Default: enabled for read-only roles, disabled for implementation roles."
+        ),
     )
     p.add_argument(
         "--execution-profile",
@@ -6461,24 +7554,10 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     )
 
     p.add_argument(
-        "--output-mode",
-        choices=["machine", "text"],
-        default="machine",
-        help=(
-            "machine: request authoritative nonce-bound JSON payload; "
-            "text: freeform assistant text only."
-        ),
-    )
-    p.add_argument(
-        "--diagnostics",
-        choices=["never", "on-failure", "always"],
-        default="on-failure",
-        help="Diagnostics sidecar emission policy.",
-    )
-    p.add_argument(
-        "--contract-nonce",
-        default=None,
-        help=argparse.SUPPRESS,
+        "--memory-friendly",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Record opencode-memory recovery hints for long audits.",
     )
 
     p.add_argument(
@@ -6529,6 +7608,98 @@ def main(argv: list[str] | None = None) -> int:
         )
         p_run.set_defaults(func=cmd_run)
 
+        p_task = sub.add_parser(
+            "task",
+            help="OpenCode Task-like external child-agent call; foreground prints final text, --background starts a task.",
+        )
+        _add_common_run_flags(p_task)
+        p_task.add_argument(
+            "--background",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Start in background and return task/run metadata instead of final text.",
+        )
+        p_task.add_argument(
+            "--ask-stdout-max-chars",
+            type=int,
+            default=DEFAULT_ASK_STDOUT_MAX_CHARS,
+            help=(
+                "Maximum characters printed by foreground task on stdout before adding a short "
+                "truncation note. 0 disables the cap; full text remains in assistant.txt."
+            ),
+        )
+        p_task.add_argument(
+            "--ask-metadata-to-stderr",
+            dest="ask_metadata_to_stderr",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "On successful foreground task, write one OPENCODE_SUBTASK_META JSON line "
+                "to stderr with runId/taskId/sessionId/artifact paths. Stdout remains final text only."
+            ),
+        )
+        p_task.add_argument(
+            "--ask-error-json-to-stderr",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="On foreground task failure, echo the control-plane JSON envelope to stderr for programmatic callers.",
+        )
+        p_task.add_argument(
+            "prompt",
+            nargs=argparse.REMAINDER,
+            help="Prompt args (use `--` before the prompt).",
+        )
+        p_task.set_defaults(
+            func=cmd_task,
+            persona_mode="off",
+            save_text=True,
+            quiet=True,
+            subagent_briefing=True,
+        )
+
+        p_ask = sub.add_parser(
+            "ask",
+            help="Run a subtask and print only the final assistant text to stdout.",
+        )
+        _add_common_run_flags(p_ask)
+        p_ask.add_argument(
+            "--ask-stdout-max-chars",
+            type=int,
+            default=DEFAULT_ASK_STDOUT_MAX_CHARS,
+            help=(
+                "Maximum characters printed by ask on stdout before adding a short "
+                "truncation note. 0 disables the cap; full text remains in assistant.txt."
+            ),
+        )
+        p_ask.add_argument(
+            "--ask-metadata-to-stderr",
+            dest="ask_metadata_to_stderr",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help=(
+                "On successful ask, write one OPENCODE_SUBTASK_META JSON line to stderr "
+                "with runId/taskId/sessionId/artifact paths. Stdout remains final text only."
+            ),
+        )
+        p_ask.add_argument(
+            "--ask-error-json-to-stderr",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="On ask failure, echo the control-plane JSON envelope to stderr for programmatic callers.",
+        )
+        p_ask.add_argument(
+            "prompt",
+            nargs=argparse.REMAINDER,
+            help="Prompt args (use `--` before the prompt).",
+        )
+        p_ask.set_defaults(
+            func=cmd_ask,
+            persona_mode="off",
+            save_text=True,
+            quiet=True,
+            subagent_briefing=True,
+        )
+
         p_start = sub.add_parser("start", help="Start a subtask in background.")
         _add_common_run_flags(p_start)
         p_start.add_argument(
@@ -6539,7 +7710,9 @@ def main(argv: list[str] | None = None) -> int:
         p_start.set_defaults(func=cmd_start)
 
         p_wait = sub.add_parser("wait", help="Wait for a background job finish.json.")
+        p_wait.add_argument("--workdir", default=".")
         p_wait.add_argument("--run-id", required=False, default=None)
+        p_wait.add_argument("--task-id", required=False, default=None)
         p_wait.add_argument("--artifacts-dir", required=False, default=None)
         p_wait.add_argument(
             "--wait-timeout",
@@ -6550,8 +7723,28 @@ def main(argv: list[str] | None = None) -> int:
         p_wait.add_argument("--poll-interval", type=float, default=0.5)
         p_wait.set_defaults(func=cmd_wait)
 
+        p_watch = sub.add_parser(
+            "watch",
+            help="Wait for a job while emitting compact progress notifications to stderr.",
+        )
+        p_watch.add_argument("--workdir", default=".")
+        p_watch.add_argument("--run-id", required=False, default=None)
+        p_watch.add_argument("--task-id", required=False, default=None)
+        p_watch.add_argument("--artifacts-dir", required=False, default=None)
+        p_watch.add_argument("--wait-timeout", type=float, default=DEFAULT_TIMEOUT_S)
+        p_watch.add_argument("--poll-interval", type=float, default=0.5)
+        p_watch.add_argument(
+            "--progress-interval",
+            type=float,
+            default=DEFAULT_WATCH_PROGRESS_INTERVAL_S,
+            help="Seconds between stderr OPENCODE_SUBTASK_PROGRESS lines when phase is unchanged.",
+        )
+        p_watch.set_defaults(func=cmd_watch)
+
         p_status = sub.add_parser("status", help="Show job status/progress.")
+        p_status.add_argument("--workdir", default=".")
         p_status.add_argument("--run-id", required=False, default=None)
+        p_status.add_argument("--task-id", required=False, default=None)
         p_status.add_argument("--artifacts-dir", required=False, default=None)
         p_status.set_defaults(func=cmd_status)
 
@@ -6559,7 +7752,9 @@ def main(argv: list[str] | None = None) -> int:
             "cancel",
             help="Cancel a job by killing worker and aborting session if known.",
         )
+        p_cancel.add_argument("--workdir", default=".")
         p_cancel.add_argument("--run-id", required=False, default=None)
+        p_cancel.add_argument("--task-id", required=False, default=None)
         p_cancel.add_argument("--artifacts-dir", required=False, default=None)
         p_cancel.add_argument(
             "--env",
@@ -6575,22 +7770,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         p_cancel.set_defaults(func=cmd_cancel)
 
-        p_judge = sub.add_parser(
-            "judge",
-            help="Apply a built-in policy preset to a finish.json envelope.",
-        )
-        p_judge.add_argument("--finish", required=True, help="Path to finish.json")
-        p_judge.add_argument(
-            "--policy",
-            choices=[
-                "execution-only",
-                "require-determinate",
-                "require-go-no-delta",
-            ],
-            required=True,
-        )
-        p_judge.set_defaults(func=cmd_judge)
-
         p_es = sub.add_parser(
             "ensure-server", help="Ensure a per-project opencode server."
         )
@@ -6599,9 +7778,15 @@ def main(argv: list[str] | None = None) -> int:
         p_es.add_argument("--server-hostname", default=DEFAULT_SERVER_HOSTNAME)
         p_es.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT)
         p_es.add_argument("--server-wait", type=float, default=DEFAULT_SERVER_WAIT_S)
+        p_es.add_argument("--server-cors", action="append", default=[])
         p_es.add_argument("--env", action="append", default=[])
         p_es.add_argument("--env-file", action="append", default=[])
         p_es.set_defaults(func=cmd_ensure_server)
+
+        p_lt = sub.add_parser("list-tasks", help="List adapter task handles for a workdir.")
+        p_lt.add_argument("--workdir", default=".")
+        p_lt.add_argument("--limit", type=int, default=50)
+        p_lt.set_defaults(func=cmd_list_tasks)
 
         p_ss = sub.add_parser(
             "stop-server", help="Stop the per-project opencode server."

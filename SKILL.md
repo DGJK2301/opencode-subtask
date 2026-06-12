@@ -1,46 +1,106 @@
 ---
 name: opencode-subtask
-description: Run an OpenCode subtask as an isolated sub-agent executor and policy judge (run/start/status/wait/cancel/judge). Prints exactly one JSON line to stdout and writes full artifacts to disk; prefers HTTP server API with CLI fallback for non-timeout failures. Use when delegating a single well-scoped coding task to OpenCode. Not for task decomposition or orchestration (use subtask-orchestrator). 用 OpenCode 跑一个子任务并返回稳定 JSON。
+description: Run OpenCode as an external child-agent task runtime for Codex/Claude. Use `task` for native Task-like delegation with `--subagent-type`, `--task-id`, optional `--background`, text stdout, and stderr metadata; use `ask` for lower-level text-only foreground calls. Lifecycle commands provide local JSON, artifacts, progress, watch, cancellation, and task listing. Not for decomposition; use subtask-orchestrator first when planning is needed.
 ---
 
 # OpenCode Subtask Adapter
 
-`opencode-subtask` is a facts-only executor plus a separate policy judge.
-
-- `run/start/status/wait/cancel` produce execution facts and artifacts.
-- `judge` consumes `finish.json` and returns a policy verdict.
-- Public machine protocol trusts only the nonce-bound sentinel payload.
-- Heuristic extraction is debug-only and stays in `diagnostics.json`.
+`opencode-subtask` is a thin adapter around OpenCode. It should not force the child model to speak an adapter-specific result format. Give OpenCode a normal prompt, let it answer normally, and keep adapter JSON limited to local execution facts.
 
 ## Core Contract
 
-### Stdout contract
+### Surfaces
 
-Exactly one JSON line is printed to stdout.
-
-| Command | Stdout `type` |
+| Need | Command |
 |---|---|
-| `run` | `opencode-subtask-finish` on normal terminal completion; `opencode-subtask-error` on preflight or finish-persistence failure |
-| `start` | `opencode-subtask-start` on successful launch; `opencode-subtask-error` on preflight or launch failure |
-| `status` | `opencode-subtask-status` or `opencode-subtask-finish` |
-| `wait` | `opencode-subtask-status` or `opencode-subtask-finish` |
-| `cancel` | `opencode-subtask-cancel` |
-| `judge` | `opencode-subtask-judgment` |
-| arg/command errors | `opencode-subtask-error` |
+| Native Task-like call from Codex/Claude | `task` |
+| Parent agent delegates one task and wants the child final answer | `ask` |
+| Foreground run with execution metadata | `run` |
+| Long/background run | `start` then `watch`, `wait`, or `status` |
+| Stream compact progress notifications | `watch` |
+| Resume/inspect external child task handles | `--task-id`, `list-tasks` |
+| Stop a background run | `cancel` |
+| Manage a per-project OpenCode server | `ensure-server`, `stop-server` |
+| Clean old local run artifacts | `prune-cache` |
 
-### `finish.json` shape
+### Stdout
 
-`finish.json` is the only authoritative terminal envelope.
+| Command | Stdout |
+|---|---|
+| `task` | Foreground: final assistant text on success. With `--background`: exactly one `opencode-subtask-start` JSON line. |
+| `ask` | Final assistant text on success. No adapter JSON envelope. |
+| `run` | Exactly one JSON line: `opencode-subtask-finish` or `opencode-subtask-error`. |
+| `start` | Exactly one JSON line: `opencode-subtask-start` or `opencode-subtask-error`. |
+| `status` | Exactly one JSON line: `opencode-subtask-status` or `opencode-subtask-finish`. |
+| `wait` | Exactly one JSON line: `opencode-subtask-status` or `opencode-subtask-finish`. |
+| `watch` | Exactly one JSON line on stdout, plus optional `OPENCODE_SUBTASK_PROGRESS {json}` lines on stderr. |
+| `cancel` | Exactly one JSON line: `opencode-subtask-cancel`. |
+| `list-tasks` | Exactly one JSON line listing adapter task handles for the workdir. |
+| server/cache commands | Exactly one JSON line with command facts. |
+
+`ask` writes concise human-readable failures to stderr. When available, it includes the `finish.json` path so the parent can inspect full execution details without polluting stdout.
+
+`ask` is not a read-only review mode. It is the natural sub-agent execution path: the prompt may ask OpenCode to inspect, implement, edit files, run tests, or produce a report. Workspace writes are controlled by the OpenCode agent permissions and the prompt, not by an adapter-level result protocol.
+
+By default, `ask` appends a short natural-language parent-agent boundary briefing. It is plain task guidance: execute directly, avoid unnecessary clarification loops, and keep the final report focused on outcome, changed files, verification, and blockers. This is designed to make Codex/OpenAI-style parent agents consume the child result with minimal context cost.
+
+`ask` also caps stdout through `--ask-stdout-max-chars` (default: 12000). The full answer remains in `assistant.txt`; stdout receives a short truncation note with that path when the child produces an oversized final response.
+
+When the parent needs traceability without polluting stdout, pass `--ask-metadata-to-stderr`. Successful `ask` then emits one `OPENCODE_SUBTASK_META {json}` line to stderr containing `runId`, `taskId`, `sessionId`, child role, changed files, and artifact paths. Stdout remains the final assistant text only. On failure, `--ask-error-json-to-stderr` can echo the control-plane envelope to stderr for programmatic callers. The `task` command enables both metadata flags by default for foreground calls.
+
+### Child Roles
+
+This adapter is not invoking OpenCode's internal Task tool. It launches OpenCode's primary agent as an external child process/session for Codex, Claude, or another parent agent. Still, it mirrors OpenCode child-agent ergonomics through adapter-level roles:
+
+| `--subtask-type` | Default OpenCode agent | Profile | Workspace policy | Typical use |
+|---|---|---|---|---|
+| `general` | OpenCode default | `hybrid` | follows OpenCode permissions | normal delegated task |
+| `worker` | `build` | `checkpoint` | can edit/run tests | implementation or repair |
+| `fast-worker` | `build` | `latency` | can edit/run focused checks | small patch or quick fix |
+| `thinker` | `plan` | `checkpoint` | read-only envelope | design, risk analysis, review |
+| `explore` | `plan` | `latency` | read-only envelope | fast codebase exploration |
+| `scout` | `plan` | `latency` | read-only envelope | docs/dependency/API research |
+
+Implementation-capable roles (`general`, `worker`, `fast-worker`) do not receive adapter-added deny rules by default. They need the full OpenCode permission surface to finish real edit/test work; project OpenCode config and `--permission-mode` still govern what is allowed. Read-only roles (`thinker`, `explore`, `scout`) add an adapter read-only envelope: deny `edit` and `bash`, and deny `todowrite`/`task` unless `--allow-child-todos` or `--allow-nested-subtasks` is explicitly set. `--subagent-type` is accepted as an alias for `--subtask-type`.
+
+### External Task Handles
+
+`--task-id` is the caller-facing external child-agent handle. This mirrors OpenCode Task-tool ergonomics, but it is implemented by the adapter because Codex/Claude are outside OpenCode's runtime. A task id records the latest `runId`, `sessionId`, artifacts, child role, progress file, notification file, and final outcome under the adapter cache.
+
+Use explicit task ids for resumable or background work:
+
+```bash
+python scripts/opencode_subtask.py ask \
+  --workdir . \
+  --task-id task_auth_refactor \
+  --subtask-type worker \
+  --permission-mode allow \
+  -- "Continue the auth refactor. Run the targeted tests and report blockers."
+```
+
+When a known task id is continued, the adapter reuses the recorded OpenCode `sessionId` unless `--session` is explicitly supplied. It also injects a bounded continuation-memory block derived from `progress.md` and task state, similar in spirit to MiMo-Code's task progress/checkpoint reconstruction. Disable with `--no-task-memory`; tune with `--task-memory-max-chars`.
+
+`--task-id` is only the external adapter task handle. It no longer doubles as a raw OpenCode `ses_...` session shortcut; use explicit `--session` when you intentionally want to attach to a known OpenCode session. By default, starting the same live task id twice returns `TaskAlreadyRunning`; pass `--on-running-task start-new` only when duplicate work is intentional.
+
+### No Model Result Protocol
+
+Do not ask the child model to return adapter-owned JSON just so this wrapper can parse it. If the parent needs a structured final answer, say that naturally in the prompt, for example: "Return a short Markdown report with Findings and Next steps." The adapter will still treat the result as assistant text.
+
+Local JSON is allowed only for deterministic control-plane facts produced by the adapter: process state, exit codes, engine selection, artifact paths, warnings, and workspace changes.
+
+## `finish.json` V3
+
+`finish.json` is the authoritative terminal record for lifecycle commands. It records execution facts, not model semantics.
 
 ```json
 {
   "type": "opencode-subtask-finish",
-  "schemaVersion": 2,
-  "adapterVersion": "0.6.0",
+  "schemaVersion": 3,
+  "adapterVersion": "0.11.0",
   "timestamp": 0,
   "runId": "run_...",
+  "taskId": "task_...",
   "workdir": "...",
-  "outputMode": "machine|text",
   "outcome": "completed|failed|timed_out|cancelled|internal_error",
   "execution": {
     "exitCode": 0,
@@ -49,16 +109,6 @@ Exactly one JSON line is printed to stdout.
     "sessionId": null,
     "error": null,
     "warnings": []
-  },
-  "payload": {
-    "status": "validated|not_requested|missing|malformed|ambiguous|persist_failed",
-    "schema": "opencode-subtask-payload-v2|null",
-    "artifact": {"path": "payload.json|null", "digest": "sha256|null"},
-    "errors": []
-  },
-  "decision": {
-    "status": "determinate|abstained|unavailable|not_requested",
-    "route": "GO_NO_DELTA|MANDATORY_DELTA|null"
   },
   "workspace": {
     "changedFiles": [],
@@ -74,168 +124,33 @@ Exactly one JSON line is printed to stdout.
     "assistantPath": "assistant.txt|null",
     "eventsPath": "events.ndjson|null",
     "wrapperLogPath": "wrapper.log|null",
-    "payloadPath": "payload.json|null",
-    "diagnosticsPath": "diagnostics.json|null"
+    "progressPath": "progress.md|null",
+    "notificationPath": "notification.json|null"
+  },
+  "subtask": {
+    "taskId": "task_...",
+    "type": "general|worker|fast-worker|thinker|explore|scout",
+    "description": "...|null",
+    "readOnly": false,
+    "acceptance": [],
+    "taskStatePath": "...",
+    "taskProgressPath": ".../progress.md",
+    "permissionRules": []
   }
 }
 ```
 
-### Writer invariants
+V3 intentionally has no model-semantic top-level fields. The assistant's answer is in `assistant.txt`, and `ask` is the command that prints it directly.
 
-- `outputMode="machine"` never emits `payload.status="not_requested"`.
-- `outputMode="text"` requires `payload.status="not_requested"`, `decision.status="not_requested"`, and `payload.artifact.path/digest=null`.
-- `payload.status="validated"` requires:
-  - `payload.schema == "opencode-subtask-payload-v2"`
-  - `payload.artifact.path != null`
-  - `payload.artifact.digest != null`
-  - `decision.status in {"determinate", "abstained"}`
-- Non-validated payloads keep `payload.artifact.path/digest=null`.
-- `decision.route` is non-null only when `decision.status="determinate"`.
+### Invariants
+
 - `outcome="completed"` requires `execution.error=null`.
-
-### Frozen machine vocabulary
-
-#### `execution.engine.selected`
-
-| Value | Meaning |
-|---|---|
-| `cli` | Foreground/background worker used the OpenCode CLI engine. |
-| `http` | Run completed on the OpenCode HTTP server path. |
-| `none` | Adapter failed before any engine run could start. |
-| `watchdog` | Terminal finish was synthesized by stale-run watchdog recovery. |
-| `cancel` | Terminal finish was synthesized by `cancel`. |
-
-#### `execution.engine.fallbackFrom`
-
-| Value | Meaning |
-|---|---|
-| `null` | No engine fallback occurred. |
-| `http` | Initial HTTP attempt failed and adapter reran on CLI. |
-
-#### `payload.errors[].code`
-
-| Code | Meaning |
-|---|---|
-| `PAYLOAD_MISSING` | No authoritative nonce-bound payload was produced. |
-| `SENTINEL_MULTIPLE` | Multiple authoritative sentinel candidates were found. |
-| `SENTINEL_TRAILING_TEXT` | Non-whitespace text appeared after the terminal sentinel. |
-| `NONCE_MISMATCH` | Payload nonce did not match the run contract. |
-| `PAYLOAD_JSON_INVALID` | Sentinel block did not parse into a JSON object. |
-| `PAYLOAD_SCHEMA_INVALID` | JSON parsed, but payload fields failed schema validation. |
-| `DECISION_INVALID` | `decision` field was present but outside the allowed enum. |
-| `PAYLOAD_PERSIST_FAILED` | Canonical `payload.json` write failed after validation. |
-
-### Authoritative machine payload
-
-Machine mode requires a single nonce-bound terminal sentinel block:
-
-```text
-BEGIN_OC_SUBTASK_JSON_<nonce>
-{"protocol":"opencode-subtask-payload-v2","nonce":"<nonce>",...}
-END_OC_SUBTASK_JSON_<nonce>
-```
-
-Payload schema:
-
-```json
-{
-  "protocol": "opencode-subtask-payload-v2",
-  "nonce": "<nonce>",
-  "decision": "GO_NO_DELTA|MANDATORY_DELTA|UNDETERMINED",
-  "summary": "string",
-  "evidence": ["string"],
-  "changes": ["string"],
-  "next_steps": ["string"]
-}
-```
-
-`payload.json` is canonical JSON written by the adapter after validation. `assistant.txt` keeps the raw text trace. `diagnostics.json` is optional debug output and never part of the public decision contract.
-
-## Machine Vocabulary
-
-### `finish.outcome`
-
-| Value | Meaning |
-|---|---|
-| `completed` | Execution completed without execution-layer error. |
-| `failed` | Execution failed but was not a timeout. |
-| `timed_out` | Execution timed out. |
-| `cancelled` | Run was cancelled. |
-| `internal_error` | Adapter synthesized or reported an internal failure. |
-
-### `payload.status`
-
-| Value | Meaning |
-|---|---|
-| `validated` | Authoritative payload validated and `payload.json` persisted. |
-| `not_requested` | `outputMode=text`; no machine payload expected. |
-| `missing` | No authoritative sentinel payload found. |
-| `malformed` | Sentinel candidate found but JSON/schema/nonce was invalid. |
-| `ambiguous` | Multiple candidates or ambiguous sentinel extraction. |
-| `persist_failed` | Payload validated but `payload.json` could not be written. |
-
-### `decision.status`
-
-| Value | Meaning |
-|---|---|
-| `determinate` | Business route is available in `decision.route`. |
-| `abstained` | Payload explicitly returned `UNDETERMINED`. |
-| `unavailable` | No usable decision is available. |
-| `not_requested` | `outputMode=text`; no decision requested. |
-
-### `decision.route`
-
-| Value | Meaning |
-|---|---|
-| `GO_NO_DELTA` | No code change required. |
-| `MANDATORY_DELTA` | Code or artifact delta is required. |
-
-### `payload.errors[].code`
-
-| Code | Meaning |
-|---|---|
-| `PAYLOAD_MISSING` | No authoritative payload found. |
-| `SENTINEL_MULTIPLE` | Multiple sentinel candidates were found. |
-| `SENTINEL_TRAILING_TEXT` | Non-whitespace content followed the terminal sentinel. |
-| `NONCE_MISMATCH` | Payload nonce did not match the expected contract nonce. |
-| `PAYLOAD_JSON_INVALID` | Payload body was not valid JSON. |
-| `PAYLOAD_SCHEMA_INVALID` | Payload JSON shape was invalid. |
-| `DECISION_INVALID` | `decision` was a string, but outside the allowed enum. |
-| `PAYLOAD_PERSIST_FAILED` | `payload.json` write failed after validation. |
-
-### `judge.verdict`
-
-| Value | Meaning |
-|---|---|
-| `accept` | Accept the run result. |
-| `reroute` | Route elsewhere but do not retry the same run. |
-| `retry` | Retry is appropriate. |
-| `block` | Do not continue. |
-
-### `judge.reasonCode` (frozen)
-
-| Code | Meaning |
-|---|---|
-| `FINISH_UNREADABLE` | The provided finish file could not be read or parsed. |
-| `FINISH_INVALID` | The provided finish file failed V2 validation. |
-| `UNKNOWN_POLICY` | Unsupported policy name. |
-| `FINISH_NOT_FOUND` | The finish file does not exist at the provided path. |
-| `PAYLOAD_DIGEST_MISMATCH` | `payload.json` digest does not match `finish.json`. |
-| `EXECUTION_COMPLETED` | Execution-only policy accepted a completed run. |
-| `EXECUTION_FAILED` | Execution failed. |
-| `EXECUTION_TIMED_OUT` | Execution timed out. |
-| `EXECUTION_INTERNAL_ERROR` | Adapter reported an internal error. |
-| `EXECUTION_CANCELLED` | Execution was cancelled. |
-| `EXECUTION_UNKNOWN` | Unknown execution state. |
-| `OUTPUT_NOT_MACHINE` | Policy required machine output but run used text mode. |
-| `PAYLOAD_MISSING` | Policy blocked/retried because payload was missing. |
-| `PAYLOAD_MALFORMED` | Policy blocked/retried because payload was malformed. |
-| `PAYLOAD_AMBIGUOUS` | Policy blocked/retried because payload was ambiguous. |
-| `PAYLOAD_PERSIST_FAILED` | Policy blocked/retried because canonical payload write failed. |
-| `DECISION_GO_NO_DELTA` | Validated decision accepted. |
-| `DECISION_MANDATORY_DELTA` | Validated mandatory-delta decision. |
-| `DECISION_UNDETERMINED` | Validated payload abstained. |
-| `DECISION_UNAVAILABLE` | No usable decision available. |
+- `execution.engine.selected` is one of `cli`, `http`, `none`, `watchdog`, or `cancel`.
+- `execution.engine.fallbackFrom` is either `null` or `http`, and only applies when the selected engine is `cli`.
+- `workspace.patchPath` is the adapter-created `changes.patch` name when git detects a diff.
+- `artifacts.dir` is the directory that contains all relative artifact paths.
+- `subtask` records adapter-level child-role and task-handle metadata. It is execution metadata, not child-authored result content.
+- `taskId` is stable across runs of the same external child task; `runId` is per invocation.
 
 ## Operations
 
@@ -243,229 +158,197 @@ Payload schema:
 
 - Python 3.10+.
 - OpenCode installed and reachable in `PATH`, or pass `--opencode <path>`.
-- `git` is optional but recommended if you want `workspace.changedFiles`, `workspace.untrackedFiles`, and `changes.patch`.
-- Windows users can call the wrapper at `scripts/opencode-subtask.cmd`; other platforms can call `python scripts/opencode_subtask.py`.
+- `git` is optional but recommended if the caller wants `workspace.changedFiles`, `workspace.untrackedFiles`, and `changes.patch`.
+- Windows users can call `scripts/opencode-subtask.cmd`; other platforms can call `python scripts/opencode_subtask.py`.
 
 ### Boundary
 
-This skill is an executor plus policy judge, not a planner.
+This skill is an executor, not a planner.
 
 - Use it to run one well-scoped subtask and record stable artifacts.
-- Use `judge` to turn a finished run into `accept|reroute|retry|block`.
-- Do not use it to decompose goals, assign expert roles, or invent acceptance criteria for a large project. Feed it a single prepared prompt instead.
+- Use `subtask-orchestrator` first when the work still needs decomposition, role assignment, or acceptance criteria.
+- Keep prompts explicit about the desired work, files, verification, and final answer style.
 
-### Command selection
+### Recommended Default
 
-| Need | Command |
-|---|---|
-| Foreground subtask with immediate terminal result | `run` |
-| Long-running review or refactor you want to poll | `start` + `status`/`wait` |
-| Stop a running job and force a terminal record | `cancel` |
-| Apply a routing policy to an existing finish artifact | `judge` |
-| Pre-warm or explicitly manage a per-project HTTP server | `ensure-server` / `stop-server` |
-| Clean old run artifacts | `prune-cache` |
+Use `task` for new Codex/Claude integrations. It mirrors OpenCode's Task-tool surface most closely: `--subagent-type`, `--task-id`, `--description`, optional `--background`, text-only foreground stdout, and metadata on stderr. `ask` remains the lower-level text-only foreground call when you do not want default metadata.
 
-### Minimal commands
+```bash
+python scripts/opencode_subtask.py task \
+  --workdir . \
+  --task-id task_parser_fix \
+  --subagent-type worker \
+  --description "Fix parser regression" \
+  --permission-mode allow \
+  --permission-approval once \
+  --acceptance "pytest tests/test_parser.py passes" \
+  -- "Fix the failing parser test in tests/test_parser.py, make the smallest correct change, run the targeted test, and summarize changed files plus the test result."
+```
+
+Use `ask` when the parent specifically wants no default stderr metadata. This includes code-changing work; ask for implementation explicitly and choose the permission mode that matches the task.
+
+```bash
+python scripts/opencode_subtask.py ask \
+  --workdir . \
+  --engine auto \
+  --subtask-type worker \
+  --permission-mode allow \
+  --permission-approval once \
+  --ask-metadata-to-stderr \
+  -- "Act as a senior software engineer. Fix the failing parser test in tests/test_parser.py, make the smallest correct change, run pytest tests/test_parser.py, and summarize changed files plus the test result."
+```
+
+`ask` still writes `job.json`, `finish.json`, `assistant.txt`, `stderr.log`, optional `events.ndjson`, and optional `changes.patch`. It just keeps stdout clean for the assistant's final text. For parent agents, the normal read path is: consume stdout first; if stdout reports truncation or failure, inspect `assistant.txt`, `finish.json`, and `changes.patch` by path.
+
+### Foreground Lifecycle Run
+
+Use `run` when a parent needs machine-readable execution facts, artifact paths, or the final outcome code.
 
 ```bash
 python scripts/opencode_subtask.py run \
   --workdir . \
   --engine auto \
-  --execution-profile hybrid \
-  --output-mode machine \
-  --diagnostics on-failure \
   --permission-mode allow \
-  -- "Act as a senior software engineer. Review src/foo.py and return a machine payload."
+  -- "Run the targeted tests and summarize failures."
 ```
+
+`run` prints one JSON line. Read `artifacts.assistantPath` for the assistant text.
+
+### Background Work
+
+Use `task --background` or `start` for long work that should not occupy the parent context while running.
 
 ```bash
-python scripts/opencode_subtask.py start --workdir . --engine auto --execution-profile checkpoint --output-mode machine -- "Act as a senior software engineer. Review the diff."
-python scripts/opencode_subtask.py status --run-id <runId>
-python scripts/opencode_subtask.py wait --run-id <runId>
-python scripts/opencode_subtask.py cancel --run-id <runId>
-python scripts/opencode_subtask.py judge --finish <artifacts-dir>/finish.json --policy require-determinate
+python scripts/opencode_subtask.py task --background \
+  --workdir . \
+  --task-id task_large_refactor \
+  --subagent-type worker \
+  --description "Large refactor" \
+  --engine auto \
+  --permission-mode allow \
+  -- "Implement the requested change and run the relevant tests."
 ```
 
-### Quick start
-
-Windows wrapper from any directory:
-
-```bat
-%USERPROFILE%\.claude\skills\opencode-subtask\scripts\opencode-subtask.cmd run ^
-  --workdir C:\path\to\project ^
-  --engine auto ^
-  --execution-profile hybrid ^
-  --output-mode machine ^
-  --permission-mode allow ^
-  -- "Act as a senior software engineer. Review the diff and return a machine payload."
-```
-
-Background review with explicit wait window:
+Then poll, watch, or block. Prefer `--task-id` for parent-agent orchestration because it survives per-run artifact rotation:
 
 ```bash
-python scripts/opencode_subtask.py start --workdir . --engine auto --execution-profile checkpoint --output-mode machine --run-timeout 1800 -- \
-  "Act as a senior software engineer. Review the current patch and return GO_NO_DELTA or MANDATORY_DELTA."
-
-python scripts/opencode_subtask.py wait --run-id <runId> --wait-timeout 300
-python scripts/opencode_subtask.py judge --finish <artifacts-dir>/finish.json --policy require-go-no-delta
+python scripts/opencode_subtask.py status --task-id <taskId>
+python scripts/opencode_subtask.py watch  --task-id <taskId> --wait-timeout 600
+python scripts/opencode_subtask.py wait   --task-id <taskId> --wait-timeout 600
 ```
 
-Notes:
+`watch` is the closest external equivalent to native task notifications. Stdout remains a single terminal JSON object, while stderr can stream compact `OPENCODE_SUBTASK_PROGRESS {json}` lines containing `taskId`, `runId`, phase, last event/tool, idle time, and artifacts directory. Use it when Codex/Claude wants progress without ingesting `events.ndjson`.
 
-- `run` blocks until terminal state.
-- `wait` returns `opencode-subtask-finish` if the job completes inside the wait window; otherwise it returns `opencode-subtask-status` with `waitExpired=true`.
-- `judge` is the only public policy surface. Do not infer routing policy from raw `finish` fields alone.
+`status.progress.summary` provides a lightweight phase snapshot such as `initializing`, `thinking`, `editing`, `testing`, `waiting_permission`, `answering`, `completed_like`, or `error`, derived from recent OpenCode events and artifact state.
 
-### Key flags
+List known child handles for the current project:
 
-| Flag | Default | Notes |
-|---|---|---|
-| `--workdir` | `.` | Project root to execute in. |
-| `--engine` | `auto` | `auto` prefers HTTP when available and falls back to CLI on non-timeout failures. |
-| `--attach` | unset | Explicit server URL. |
-| `--attach-server` | `true` | Attach to or ensure a per-project server where applicable. |
-| `--model` / `--variant` | provider default | Passed through to OpenCode. |
-| `--permission-mode` | `inherit` | Use `allow` for unattended reviews; `noninteractive` auto-responds with a conservative policy. |
-| `--persona-mode` | `require` | Prompt hygiene policy. `require` rejects prompts whose literal first line is not `Act as ...` (no leading blank lines); use `prepend`, `warn`, or `off` to relax it. |
-| `--persona-line` | `Act as a senior software engineer.` | Persona line used by `--persona-mode prepend`, and a good default first line when writing prompts manually. |
-| `--execution-profile` | `hybrid` | `hybrid`: short tasks prefer HTTP; `latency`: prefer HTTP + lighter artifacts; `checkpoint`: prefer CLI + full artifacts. |
-| `--output-mode` | `machine` | `machine` expects authoritative sentinel JSON; `text` disables payload/decision extraction. |
-| `--diagnostics` | `on-failure` | `never|on-failure|always` for `diagnostics.json`. |
-| `--run-timeout` | `600` | Worker runtime timeout in seconds. |
-| `--wait-timeout` | `600` | Wait window for `wait` in seconds. |
-| `--max-artifact-bytes` | `20000000` | Hard cap across watched artifacts; breach becomes `OutputTooLarge`. |
-| `--retry-empty-output` | `true` | Retries one empty successful run when no tracked changes were made. |
-| `--continue` / `--session` | unset | CLI session reuse only; increases context bleed risk. |
+```bash
+python scripts/opencode_subtask.py list-tasks --workdir .
+```
 
-### Permission modes
+Cancel if needed:
 
-| Mode | Behavior |
+```bash
+python scripts/opencode_subtask.py cancel --task-id <taskId>
+```
+
+## Engine Behavior
+
+`--engine auto` is the normal setting. It prefers an existing OpenCode HTTP server when useful and falls back to the CLI on non-timeout failures. Timeouts do not fall back because retrying a possibly still-running task can duplicate work.
+
+HTTP mode targets the current OpenCode server API surface as verified against local OpenCode 1.17.4 `/doc`: health is checked through `/global/health`, sessions are created through `POST /session`, existing sessions can be continued with `--session` or `--task-id` through `POST /session/:id/message`, and messages are sent as normal text parts. `--title` and `--description` are used when creating a new HTTP session. HTTP session creation also passes `agent`, session-scoped model defaults, and role-derived permission rules when any exist. `--http-deny-interactive-tools` controls deny rules for `question`, `plan_enter`, and `plan_exit`; by default it is enabled only for read-only roles and disabled for implementation-capable roles. Re-run the HTTP schema tests after upgrading OpenCode because server APIs may evolve.
+
+HTTP model shape follows OpenCode's current boundary: session creation uses `{ providerID, id, variant? }`, while message sending uses `{ providerID, modelID }` plus a top-level `variant` when supplied. The user-facing flags remain `--model provider/model` and `--variant <name>`.
+
+CLI mode uses `opencode run --format json`. It is still the correct path for `--file` and `--continue`, because those are native `opencode run` flags and are not equivalent to the HTTP message endpoint.
+
+For CLI mode, the main prompt is passed through stdin by default (`--cli-prompt-transport stdin`). `prompt.txt` is still written as an adapter artifact, but it is not attached as a model-visible OpenCode `--file`. This keeps the prompt transport close to `opencode run`'s native non-interactive input path and avoids wasting child-agent context on an artificial prompt attachment. Use `--cli-prompt-transport file` only when stdin transport is unsuitable for a specific OpenCode CLI invocation.
+
+Assistant text extraction follows current OpenCode event flow. The adapter listens for `message.updated` / `message.part.updated`-style events, tracks assistant message ids, ignores user echoes, reasoning/tool/file/patch parts, and de-duplicates cumulative text snapshots. HTTP mode can also use the SSE stream as a final-text fallback when the synchronous message response has no extracted assistant text. This keeps `assistant.txt` and `ask` stdout aligned with the child's final assistant answer instead of the transport stream.
+
+### Permissions
+
+`--permission-mode inherit` leaves OpenCode permission handling untouched.
+
+`--permission-mode allow` auto-replies to HTTP permission requests. By default it replies `once`; pass `--permission-approval always` only when you want OpenCode's server to approve matching future requests as well.
+
+`--permission-mode noninteractive` is unattended but less permissive: it replies `once` for ordinary requests and `reject` for detected high-risk classes such as broad task/skill delegation, external-directory access, doom-loop requests, or `.env`-style secret reads.
+
+HTTP auto-permission uses the latest server reply shape: `POST /permission/:requestID/reply` with `{ "reply": "once" | "always" | "reject" }`. It does not use the old session-scoped permission endpoint.
+
+Use `--engine cli` for the most faithful OpenCode permission behavior when you rely on OpenCode's local TUI/CLI prompts or project-specific permission configuration.
+
+## Artifact Policy
+
+Artifacts keep detail out of parent context.
+
+| Artifact | Purpose |
 |---|---|
-| `inherit` | Leave permission handling to the surrounding OpenCode environment. |
-| `allow` | Maximize forward progress for unattended runs; HTTP auto-replies where possible and CLI uses permissive `OPENCODE_PERMISSION`. |
-| `noninteractive` | Avoid hangs on permission prompts with a conservative deterministic allow/deny preset. Prefer this over `allow` when you need unattended execution but still want some guardrails. |
+| `prompt.txt` | Exact prompt sent to OpenCode. |
+| `assistant.txt` | Assistant text collected from OpenCode events or HTTP response. |
+| `events.ndjson` | Optional raw OpenCode event stream for diagnostics. |
+| `stderr.log` | OpenCode process/server error text. |
+| `changes.patch` | Git diff captured after the run, when present. |
+| `job.json` | Non-terminal local job state. |
+| `finish.json` | Terminal execution record. |
+| `wrapper.log` | Background worker stdout/stderr for `start`. |
+| `progress.md` | Adapter-generated task progress/checkpoint notes for `--task-id` continuation. |
+| `notification.json` | Terminal compact notification summary for parent agents/background watchers. |
 
-### Engine and profile guidance
+Prefer reading only `assistant.txt`, `finish.json`, and `changes.patch` unless deeper debugging is necessary.
 
-Engine selection:
+## Prompt Guidance
 
-| Setting | Use when | Notes |
-|---|---|---|
-| `--engine auto` | Default choice for most callers | Prefers HTTP when a server is available and falls back to CLI on non-timeout HTTP failures. |
-| `--engine cli` | Isolation, session reuse, or full artifact trace matter most | No shared server state; best for long audits and reproducible transcripts. |
-| `--engine http` | You explicitly want server-backed execution | Requires a server via `--attach` or `ensure-server`; no CLI fallback on HTTP timeout. |
+Good prompts are ordinary OpenCode prompts.
 
-Execution profiles:
-
-| Profile | Use when | Behavior |
-|---|---|---|
-| `hybrid` | Mixed workloads or unknown task shape | Short tasks prefer HTTP + lighter artifacts; longer/heavier tasks prefer CLI + fuller artifacts. |
-| `latency` | Quick probes, connectivity checks, or disposable asks | Bias toward HTTP and lighter artifact collection. |
-| `checkpoint` | Long-chain reviews, auditable runs, or anything you may need to resume/debug | Bias toward CLI and full artifact retention. |
-
-Guidance:
-
-- `auto` + `hybrid` is the general default.
-- `checkpoint` is the safer choice for long Opus review lanes or anything you may need to audit later.
-- `latency` is appropriate for tiny probes, not for evidence-heavy review work.
-- `auto` fallback does not occur on HTTP timeouts; if timeout sensitivity matters, set `--run-timeout` explicitly and choose `checkpoint`/`cli` when needed.
-
-### Runtime guidance
-
-- `run --run-timeout` and `start --run-timeout` are hard runtime caps for the worker.
-- `wait --wait-timeout` only caps how long the caller waits; it does not extend worker runtime.
-- The adapter does not auto-extend runtime based on heartbeats or artifact growth.
-- The empty-output guard is real: by default the adapter retries one “successful but empty” run when no tracked changes were produced.
-- Use `status.progress.idleForSeconds` together with artifact growth (`events.ndjson`, `assistant.txt`, `stderr.log`) before deciding a run is stuck.
-- `--max-artifact-bytes` is enforced by a supervisor across watched artifacts. If you see `OutputTooLarge`, either reduce output volume or raise the cap deliberately.
-
-### Session reuse
-
-Session reuse is CLI-only and trades isolation for continuity.
-
-Use it when:
-
-- You are doing a review -> fix -> verify chain on the same narrow task.
-- Later prompts need the model to remember earlier findings.
-- You want to avoid reloading the same code context repeatedly.
-
-Avoid it when:
-
-- The task should be isolated from prior model state.
-- You are running parallel subtasks.
-- You need the strongest auditability or reproducibility.
-
-Practical rules:
-
-- Prefer `--session <id>` when you want explicit control.
-- Use `--continue` only for short local chains where “last session” ambiguity is acceptable.
-- In V2 `sessionId` lives under `finish.execution.sessionId`, not at the top level.
-
-### Utility commands
-
-```bash
-python scripts/opencode_subtask.py ensure-server --workdir .
-python scripts/opencode_subtask.py stop-server --workdir .
-python scripts/opencode_subtask.py prune-cache --keep-last 200
-python scripts/opencode_subtask.py prune-cache --keep-last 200 --apply
+```text
+Act as a senior software engineer.
+Task: Fix the failing parser test in tests/test_parser.py.
+Constraints: Make the smallest correct change. Do not modify unrelated files.
+Verification: Run pytest tests/test_parser.py.
+Final answer: Summarize the cause, changed files, and test result in Markdown.
 ```
 
-Use these when:
+For stricter child stopping behavior, pass repeatable acceptance criteria. These are appended to the child briefing, not parsed from model output:
 
-- `ensure-server`: you want a per-project HTTP server running before a batch of HTTP or `auto` tasks.
-- `stop-server`: you want to explicitly tear down the per-project server and clear its in-memory session state.
-- `prune-cache`: you want to inspect or reclaim old artifacts. It is dry-run by default; add `--apply` to delete.
+```bash
+python scripts/opencode_subtask.py ask \
+  --workdir . \
+  --subtask-type worker \
+  --acceptance "pytest tests/test_parser.py passes" \
+  --acceptance "No unrelated files changed" \
+  -- "Fix the parser regression."
+```
 
-### `judge` policies
+For `ask`, `--persona-mode` defaults to `off` so parent agents can pass terse delegation prompts. For `run` and `start`, the default persona policy still requires a first-line `Act as ...` prompt unless you override it.
 
-| Policy | Accepts | Other outcomes |
-|---|---|---|
-| `execution-only` | `outcome=completed` | `retry` on `failed/timed_out/internal_error`; `block` on `cancelled` |
-| `require-determinate` | validated `GO_NO_DELTA` | `reroute` on `MANDATORY_DELTA` or `UNDETERMINED`; `retry` on invalid payload/execution failure; `block` on text output or cancel |
-| `require-go-no-delta` | validated `GO_NO_DELTA` | `block` on `MANDATORY_DELTA`, `UNDETERMINED`, text output, or cancel; `retry` on invalid payload/execution failure |
+Useful child-agent tuning flags:
 
-### Exit codes
+| Flag | Default | Use |
+|---|---:|---|
+| `task --background` | false | Use the Task-like command as a background external child task. |
+| `--subagent-briefing` | on for `ask`, off for `run/start` | Append the compact parent-agent boundary briefing. |
+| `--final-answer-budget-chars` | 1600 | Tell the child how compact the final report should be. |
+| `--ask-stdout-max-chars` | 12000 | Keep parent stdout small while preserving full `assistant.txt`. |
+| `--cli-prompt-transport stdin|file` | `stdin` | Use stdin as the native prompt channel; `file` attaches `prompt.txt` as fallback. |
+| `--http-deny-interactive-tools` | role-based | Deny `question`, `plan_enter`, `plan_exit` for HTTP-created sessions; default on for read-only roles, off for implementation roles. |
+| `--subtask-type` | `general` | Select adapter child role/preset. |
+| `--task-id` | null | Stable external child task handle; resumes recorded OpenCode session and bounded memory when known. |
+| `--on-running-task fail|start-new` | `fail` | Prevent duplicate live child work for the same task id. |
+| `--task-memory` | true | Inject compact task state/progress on continuation. |
+| `--acceptance` | repeatable | Add stop conditions to the child-agent briefing. |
+| `--ask-metadata-to-stderr` | false | Emit one parseable metadata line on stderr while preserving text-only stdout. |
 
-#### `run` and terminal `wait`
+## Exit Codes
 
 | Outcome | Exit code |
-|---|---|
-| `completed` | `0` |
-| `failed` | `3` |
-| `timed_out` | `124` |
-| `cancelled` | `130` |
-| `internal_error` | `1` |
+|---|---:|
+| `completed` | 0 |
+| `failed` | 3 |
+| `timed_out` | 124 |
+| `cancelled` | 130 |
+| `internal_error` | 1 |
+| argument/config error | 2 |
 
-If `finish.json` cannot be written, stdout is `opencode-subtask-error` with `error.name="FinishWriteFailed"` and the process exits `1`.
-
-#### `judge`
-
-| Verdict | Exit code |
-|---|---|
-| `accept` | `0` |
-| `reroute` | `10` |
-| `retry` | `11` |
-| `block` | `12` |
-
-## Practical Notes
-
-- Prompt hygiene is enforced by default. `--persona-mode require` rejects prompts unless the literal first line is a persona such as `Act as a senior software engineer.` Leading blank lines are not tolerated. Use `--persona-mode off` only if you explicitly want to disable that guard.
-- `start` always creates `wrapper.log` as an internal background-worker log artifact. It is not a public policy input.
-- `status`, `wait`, `cancel`, and `judge` only trust strict V2 `finish.json`. Invalid finish files are quarantined and ignored by lifecycle commands.
-- `auto` engine fallback does not occur on HTTP timeouts.
-- Provider/runtime failures should surface as classified execution errors, not protocol redesign. Treat Gemini instability as an operations risk unless the adapter is misclassifying it.
-- `--env KEY=VALUE` values are visible in process arguments. Use `--env-file KEY=PATH` for secrets.
-- If you attach WIP files or diffs for review, attach them explicitly; do not assume a clean review worktree can see uncommitted local files.
-
-### Troubleshooting
-
-| Symptom | Check |
-|---|---|
-| `opencode-subtask-error` with `MissingPrompt` / `PromptConflict` / `PromptFileReadError` | Fix prompt input shape: use exactly one of positional prompt, `--prompt`, or `--prompt-file`. |
-| `PersonaMissing` | The literal first line was not `Act as ...`. Remove leading blank lines or switch to `--persona-mode prepend` / `off`. |
-| `wait` returns status instead of finish | The wait window expired. Inspect `waitExpired`, then keep polling with `status`/`wait` or `cancel` if the run is no longer making progress. |
-| `payload.status` is `missing`, `malformed`, or `ambiguous` | Check `diagnostics.json`, `assistant.txt`, and the contract prompt; the run did not produce a usable authoritative machine payload. |
-| `judge` returns `FINISH_INVALID` / `FINISH_UNREADABLE` | The provided `finish.json` is not a valid V2 terminal envelope. Use the lifecycle commands to regenerate or quarantine it instead of hand-editing. |
-| `execution.error.name=OutputTooLarge` | Lower output volume or increase `--max-artifact-bytes`. |
-| `status.progress.idleForSeconds` keeps growing and artifacts stop changing | Treat it as a stuck run candidate. Confirm lack of growth in `assistant.txt`, `events.ndjson`, and `stderr.log`, then `cancel`. |
-| HTTP runs keep failing before useful work starts | Try `--engine cli` or `--execution-profile checkpoint`, or pre-warm with `ensure-server` and inspect server health separately. |
+`ask` exits 0 only when it can print non-empty assistant text from a completed run.
