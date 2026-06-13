@@ -2,7 +2,7 @@
 
 A thin adapter that runs [OpenCode](https://opencode.ai) as an **external child-agent task runtime** for Codex, Claude, or any parent agent that needs delegated execution.
 
-> **Not a planner.** Use [`subtask-orchestrator`](https://github.com/search?q=subtask-orchestrator) first when you need decomposition or role assignment. `opencode-subtask` is a precise executor that records stable artifacts and keeps parent context clean.
+> **Not a planner.** When you need task decomposition or role assignment, run a dedicated orchestration layer first. `opencode-subtask` is a precise executor that records stable artifacts and keeps parent context clean.
 
 ---
 
